@@ -1,0 +1,18 @@
+/target/
+**/*.rs.bk
+*.swp
+*.bak
+
+# OpenClaw agent metadata & memory
+/IDENTITY.md
+/SOUL.md
+/USER.md
+/DREAMS.md
+/memory/
+/memory
+/avatars/
+/avatars
+
+# Test & local vault artifacts
+.cloak/
+*.vault
