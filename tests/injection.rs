@@ -93,6 +93,22 @@ fn passphrase_is_not_leaked_to_child() {
 }
 
 #[test]
+fn vault_cannot_reintroduce_passphrase_vars() {
+    let env = Env::init();
+    env.set("CLOAKENV_PASSPHRASE", "from-vault");
+    env.set("CLOAKENV_PASSPHRASE_FILE", "from-vault-file");
+    env.set("KEEP", "yes");
+    let out = env.ok(&[
+        "run",
+        "--",
+        "sh",
+        "-c",
+        r#"printf '%s' "${CLOAKENV_PASSPHRASE-unset}|${CLOAKENV_PASSPHRASE_FILE-unset}|$KEEP""#,
+    ]);
+    assert_eq!(stdout(&out), "unset|unset|yes");
+}
+
+#[test]
 fn passphrase_file_is_supported() {
     let env = Env::new();
     let keyfile = env.path().join("machine.key");

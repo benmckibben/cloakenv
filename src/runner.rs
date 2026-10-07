@@ -197,10 +197,12 @@ pub fn run(command: &[OsString], vault: &Vault, shield: bool) -> Result<ExitStat
     };
 
     let mut cmd = Command::new(program);
+    // Removals come after `envs` so a vault entry cannot put the passphrase
+    // variables back. `Command` applies these mutations in call order.
     cmd.args(args)
+        .envs(vault.iter())
         .env_remove(PASSPHRASE_ENV)
         .env_remove(PASSPHRASE_FILE_ENV)
-        .envs(vault.iter())
         .stdin(Stdio::inherit());
     if shield {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());

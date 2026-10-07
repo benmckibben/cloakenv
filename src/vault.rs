@@ -391,9 +391,10 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 /// Parses `.env`-style content into `(KEY, value)` pairs.
 ///
 /// Supported syntax: blank lines, `# comments`, an optional `export ` prefix,
-/// unquoted values (trailing ` # comment` stripped), single-quoted literal
-/// values and double-quoted values with `\n \r \t \\ \"` escapes. Multi-line
-/// values are not supported. Errors reference line numbers only, never content.
+/// unquoted values (the earliest trailing ` #` or `\t#` comment is stripped),
+/// single-quoted literal values and double-quoted values with `\n \r \t \\ \"`
+/// escapes. Multi-line values are not supported. Errors reference line numbers
+/// only, never content.
 pub fn parse_dotenv(content: &str) -> Result<Vec<(String, Zeroizing<String>)>, VaultError> {
     let mut out = Vec::new();
     for (idx, raw) in content.lines().enumerate() {
@@ -458,7 +459,9 @@ pub fn parse_dotenv(content: &str) -> Result<Vec<(String, Zeroizing<String>)>, V
             }
             value
         } else {
-            let value = match rest.find(" #").or_else(|| rest.find("\t#")) {
+            // Earliest marker wins. `or_else` would ignore a leading `\t#`
+            // whenever a later ` #` is also present.
+            let value = match rest.find(" #").into_iter().chain(rest.find("\t#")).min() {
                 Some(i) => &rest[..i],
                 None => rest,
             };
@@ -566,6 +569,23 @@ mod tests {
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect();
         assert_eq!(parsed(input), want);
+    }
+
+    #[test]
+    fn unquoted_comment_uses_earliest_marker() {
+        let cases = [
+            ("TAB=val\t# comment\n", "TAB", "val"),
+            ("BOTH=val\t#comment #note\n", "BOTH", "val"),
+            ("SPACE_FIRST=val #note\t#later\n", "SPACE_FIRST", "val"),
+            ("HASH=abc#def\n", "HASH", "abc#def"),
+        ];
+        for (input, key, value) in cases {
+            assert_eq!(
+                parsed(input),
+                vec![(key.to_owned(), value.to_owned())],
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
