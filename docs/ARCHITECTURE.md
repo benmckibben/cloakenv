@@ -50,6 +50,15 @@ Writes go to a sibling `.vault.bin.tmp-<random>` created `O_EXCL` with mode
 0600, are fsynced, then `rename`d over the target (and the directory fsynced).
 Only ciphertext is ever written.
 
+Writers (`init`, `set`, `unset`, `import`) hold an exclusive `flock(2)` on a
+sibling `.vault.bin.lock` (empty, mode 0600, never deleted) for the whole
+load → modify → save cycle, so concurrent updates are serialised instead of
+silently overwriting each other. The lock lives on a separate file because the
+vault inode is replaced on every save. Readers (`list`, `run`) take no lock;
+the atomic rename already guarantees they see a complete vault. Passphrase and
+value prompts happen *before* the lock is taken, so an idle prompt never
+blocks other writers.
+
 ## Invariants and how they are enforced
 
 1. **Zero plaintext on disk.** Decryption happens into memory; secrets reach

@@ -31,11 +31,25 @@ fn no_stray_files_left_behind() {
     env.set("API_KEY", SECRET);
     env.ok(&["run", "--", "sh", "-c", "true"]);
     env.ok(&["run", "--shield", "--", "sh", "-c", "echo $API_KEY"]);
-    let entries: Vec<_> = std::fs::read_dir(env.path().join(".cloak"))
+    let mut entries: Vec<_> = std::fs::read_dir(env.path().join(".cloak"))
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert_eq!(entries, vec![std::ffi::OsString::from("vault.bin")]);
+    entries.sort();
+    // The (empty) writer lock file is persistent by design; no temp files.
+    assert_eq!(
+        entries,
+        vec![
+            std::ffi::OsString::from(".vault.bin.lock"),
+            std::ffi::OsString::from("vault.bin"),
+        ]
+    );
+    assert_eq!(
+        std::fs::metadata(env.path().join(".cloak/.vault.bin.lock"))
+            .unwrap()
+            .len(),
+        0
+    );
     let top: Vec<_> = std::fs::read_dir(env.path())
         .unwrap()
         .map(|e| e.unwrap().file_name())
