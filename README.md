@@ -59,6 +59,7 @@ updates.
 | `run`: vault/passphrase/shield failure         | 125           |
 | `run`: command not executable / not found      | 126 / 127     |
 | other subcommands: any failure                 | 1             |
+| invalid command line (arguments never echoed)  | 2             |
 | usage error                                    | 2             |
 
 ## Security model
