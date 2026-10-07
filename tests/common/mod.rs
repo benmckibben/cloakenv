@@ -77,12 +77,7 @@ impl Env {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn cloakenv");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        feed(&mut child, input);
         child.wait_with_output().unwrap()
     }
 
@@ -104,13 +99,7 @@ impl Env {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn cloakenv");
-        // Dropping stdin after the write closes it, so the child sees EOF.
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(value.as_bytes())
-            .unwrap();
+        feed(&mut child, value);
         child
     }
 
@@ -122,6 +111,17 @@ impl Env {
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+}
+
+/// Writes `input` to the child's stdin and closes it. A child that fails
+/// before reading stdin (e.g. a refused key) closes the pipe first; that
+/// broken pipe is expected and ignored.
+fn feed(child: &mut Child, input: &str) {
+    let mut stdin = child.stdin.take().unwrap();
+    match stdin.write_all(input.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        other => other.unwrap(),
     }
 }
 
