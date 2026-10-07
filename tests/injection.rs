@@ -110,7 +110,7 @@ fn passphrase_is_not_leaked_to_child() {
 fn cli_refuses_to_store_passphrase_vars() {
     let env = Env::init();
     for key in ["CLOAKENV_PASSPHRASE", "CLOAKENV_PASSPHRASE_FILE"] {
-        let out = env.run(&["set", key, "nope"]);
+        let out = env.run_stdin(&["set", key], "nope");
         assert!(!out.status.success(), "set {key} should fail");
         let err = stderr(&out);
         assert!(err.contains(key) && err.contains("reserved"), "{err}");
@@ -166,7 +166,10 @@ fn passphrase_file_is_supported() {
             .unwrap()
     };
     assert!(run(&["init"]).status.success());
-    assert!(run(&["set", "K", "v"]).status.success());
+    let mut set = env.cmd(None);
+    set.env("CLOAKENV_PASSPHRASE_FILE", &keyfile)
+        .args(["set", "K"]);
+    assert!(Env::output_with_stdin(set, "v").status.success());
     let out = run(&["run", "--", "sh", "-c", r#"printf %s "$K""#]);
     assert_eq!(stdout(&out), "v");
     // Trailing newline is stripped, so the env var form is equivalent.
@@ -319,8 +322,13 @@ fn import_errors_do_not_echo_content() {
 #[test]
 fn swapped_key_and_value_does_not_echo_secret() {
     let env = Env::init();
-    let out = env.run(&["set", SECRET, "API_KEY"]);
+    // The value on stdin, but the secret typed where the key goes.
+    let out = env.run_stdin(&["set", SECRET], "API_KEY");
     assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("invalid variable name"));
+    assert!(!contains(&out.stderr, SECRET));
+    // Rejected before the value is even read.
+    let out = env.cmd(None).args(["set", SECRET]).output().unwrap();
     assert!(stderr(&out).contains("invalid variable name"));
     assert!(!contains(&out.stderr, SECRET));
 }
@@ -331,7 +339,8 @@ fn vault_path_override() {
     let custom = env.path().join("elsewhere").join("my.vault");
     let custom = custom.to_str().unwrap();
     env.ok(&["--vault", custom, "init"]);
-    env.ok(&["--vault", custom, "set", "K", "v"]);
+    let out = env.run_stdin(&["--vault", custom, "set", "K"], "v");
+    assert!(out.status.success(), "{}", stderr(&out));
     assert!(!env.vault().exists());
     let out = env
         .cmd(Some(PASS))

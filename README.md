@@ -15,8 +15,8 @@ transcripts, CI logs or terminal scrollback.
 cargo install --path .
 
 cloakenv init                          # prompts for a passphrase
-cloakenv set DATABASE_URL              # value read from a hidden prompt / stdin
-cloakenv set API_KEY sk-live-...       # or inline (lands in shell history!)
+cloakenv set DATABASE_URL              # value read from a hidden prompt
+pass show api | cloakenv set API_KEY   # ...or piped on stdin (never as an argument)
 cloakenv import .env && rm .env        # migrate an existing .env file
 cloakenv list                          # names only, never values
 
