@@ -8,6 +8,9 @@ repository = "https://github.com/benmckibben/cloakenv"
 readme = "README.md"
 keywords = ["secrets", "security", "vault", "env", "cli"]
 categories = ["command-line-utilities", "development-tools"]
+# Explicit allow-list: keeps local agent persona symlinks and other workspace
+# files out of the published crate.
+include = ["/src", "/tests", "/docs", "/README.md", "/LICENSE*", "/Cargo.toml", "/Cargo.lock"]
 
 [lib]
 name = "cloakenv"
