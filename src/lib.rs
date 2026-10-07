@@ -27,3 +27,10 @@ pub const PASSPHRASE_ENV: &str = "CLOAKENV_PASSPHRASE";
 /// Environment variable naming a file whose contents are the vault passphrase
 /// (e.g. a machine-local random key file). Also stripped from children.
 pub const PASSPHRASE_FILE_ENV: &str = "CLOAKENV_PASSPHRASE_FILE";
+
+/// True for the names cloakenv reads its own passphrase from. They are always
+/// stripped from child environments, so the CLI refuses to store them: a
+/// vault entry under either name would be silently dropped at `run` time.
+pub fn is_reserved_key(key: &str) -> bool {
+    key == PASSPHRASE_ENV || key == PASSPHRASE_FILE_ENV
+}

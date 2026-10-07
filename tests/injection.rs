@@ -93,11 +93,42 @@ fn passphrase_is_not_leaked_to_child() {
 }
 
 #[test]
-fn vault_cannot_reintroduce_passphrase_vars() {
+fn cli_refuses_to_store_passphrase_vars() {
     let env = Env::init();
-    env.set("CLOAKENV_PASSPHRASE", "from-vault");
-    env.set("CLOAKENV_PASSPHRASE_FILE", "from-vault-file");
-    env.set("KEEP", "yes");
+    for key in ["CLOAKENV_PASSPHRASE", "CLOAKENV_PASSPHRASE_FILE"] {
+        let out = env.run(&["set", key, "nope"]);
+        assert!(!out.status.success(), "set {key} should fail");
+        let err = stderr(&out);
+        assert!(err.contains(key) && err.contains("reserved"), "{err}");
+        assert!(!err.contains("nope"), "value must not be echoed: {err}");
+    }
+    // A .env import containing one is refused as a whole: nothing is stored.
+    std::fs::write(
+        env.path().join("in.env"),
+        "KEEP=yes\nCLOAKENV_PASSPHRASE=nope\n",
+    )
+    .unwrap();
+    let out = env.run(&["import", "in.env"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("reserved"), "{}", stderr(&out));
+    assert_eq!(stdout(&env.ok(&["list"])), "");
+}
+
+#[test]
+fn vault_cannot_reintroduce_passphrase_vars() {
+    // The CLI refuses these names, so build the vault through the library, as
+    // a vault written by another tool or an older cloakenv could be. `run`
+    // must still strip them.
+    let env = Env::init();
+    let mut vault = cloakenv::vault::Vault::load(&env.vault(), PASS.as_bytes()).unwrap();
+    for (k, v) in [
+        ("CLOAKENV_PASSPHRASE", "from-vault"),
+        ("CLOAKENV_PASSPHRASE_FILE", "from-vault-file"),
+        ("KEEP", "yes"),
+    ] {
+        vault.set(k, zeroize::Zeroizing::new(v.to_owned())).unwrap();
+    }
+    vault.save(&env.vault(), PASS.as_bytes()).unwrap();
     let out = env.ok(&[
         "run",
         "--",

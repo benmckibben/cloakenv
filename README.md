@@ -34,7 +34,8 @@ In order of precedence:
    `head -c 32 /dev/urandom | base64 > ~/.config/cloakenv.key && chmod 600 ~/.config/cloakenv.key`.
 3. Interactive prompt (only when stdin is a terminal).
 
-Both variables are always stripped from the child's environment.
+Both variables are always stripped from the child's environment, and
+`cloakenv set` / `cloakenv import` refuse to store secrets under either name.
 
 ## Vault location
 

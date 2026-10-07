@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use cloakenv::vault::{Vault, parse_dotenv};
-use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, runner};
+use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, is_reserved_key, runner};
 
 /// Lightweight encrypted local secret vault and zero-leak process injection engine.
 ///
@@ -110,6 +110,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             eprintln!("cloakenv: initialized vault at {}", path.display());
         }
         Cmd::Set { key, value } => {
+            refuse_reserved(&key)?;
             let pass = passphrase(false)?;
             let mut vault = load(path, &pass)?;
             let value = match value {
@@ -135,6 +136,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     .with_context(|| format!("cannot read {}", file.display()))?,
             );
             let pairs = parse_dotenv(&content)?;
+            for (key, _) in &pairs {
+                refuse_reserved(key)?;
+            }
             let pass = passphrase(false)?;
             let mut vault = load(path, &pass)?;
             let count = pairs.len();
@@ -164,6 +168,18 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Fails before any passphrase prompt or vault write if `key` is one of
+/// cloakenv's own passphrase variables. Naming the key is safe: it can only be
+/// one of two fixed names, never a misplaced secret.
+fn refuse_reserved(key: &str) -> Result<()> {
+    if is_reserved_key(key) {
+        bail!(
+            "{key} is reserved for cloakenv's own passphrase and is never passed to commands; store the secret under another name"
+        );
+    }
+    Ok(())
 }
 
 fn load(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
