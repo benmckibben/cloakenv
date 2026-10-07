@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use cloakenv::vault::{Vault, VaultLock, parse_dotenv};
-use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, is_reserved_key, runner};
+use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, hardening, is_reserved_key, runner};
 
 /// Lightweight encrypted local secret vault and zero-leak process injection engine.
 ///
@@ -83,6 +83,13 @@ const RUN_FAILURE: u8 = 125;
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let is_run = matches!(cli.command, Cmd::Run { .. });
+    let failure = ExitCode::from(if is_run { RUN_FAILURE } else { 1 });
+    // Before reading the passphrase, decrypting anything or spawning a child:
+    // stop same-user processes from reading our /proc environ, memory and fds.
+    if let Err(err) = hardening::harden_process() {
+        eprintln!("cloakenv: error: cannot harden process (PR_SET_DUMPABLE): {err}");
+        return failure;
+    }
     match dispatch(cli) {
         Ok(code) => code,
         Err(err) => {
@@ -90,7 +97,7 @@ fn main() -> ExitCode {
             if let Some(run_err) = err.downcast_ref::<runner::RunError>() {
                 return ExitCode::from(run_err.exit_code() as u8);
             }
-            ExitCode::from(if is_run { RUN_FAILURE } else { 1 })
+            failure
         }
     }
 }

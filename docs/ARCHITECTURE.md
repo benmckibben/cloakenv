@@ -73,6 +73,17 @@ blocks other writers.
 5. **No secret bleed in errors.** Error types carry no values. Invalid variable
    names are not echoed (a swapped `set VALUE KEY` would otherwise print the
    secret), and `.env` parse errors report the line number only.
+6. **No same-user introspection (Linux).** Right after argument parsing, and
+   before the passphrase is read or anything is decrypted or spawned,
+   `cloakenv` calls `prctl(PR_SET_DUMPABLE, 0)` (fatal if it fails). The
+   kernel then denies other processes of the same user — including the command
+   `run` spawns — access to `/proc/<pid>/environ` (passphrase or passphrase
+   file path), `/proc/<pid>/mem`/`ptrace` (decrypted secrets) and
+   `/proc/<pid>/fd/*` (which would let a child write straight to cloakenv's
+   stdout and bypass `--shield`), and no core dump is written on a crash.
+   `execve` resets the flag, so children run normally. Tests run probes from
+   inside `cloakenv run` and check they fail. Not covered: root /
+   `CAP_SYS_PTRACE`, and non-Linux platforms (no-op there for now).
 
 ## `--shield` streaming redaction
 
