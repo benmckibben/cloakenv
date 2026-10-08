@@ -570,3 +570,56 @@ fn the_exec_ed_command_is_dumpable_again_and_holds_no_passphrase() {
     assert!(!contains(&environ, "CLOAKENV_PASSPHRASE"));
     assert!(!contains(&environ, PASS));
 }
+
+/// cloakenv lowers its own soft core-file limit to 0 while it holds secrets;
+/// the command gets back the limit it would have had without cloakenv.
+#[cfg(target_os = "linux")]
+#[test]
+fn core_limit_is_zero_for_cloakenv_and_restored_for_the_command() {
+    const WANT: u64 = 1_234_567;
+    fn core_soft(limits: &str) -> String {
+        let line = limits
+            .lines()
+            .find(|l| l.starts_with("Max core file size"))
+            .unwrap();
+        line.split_whitespace().nth(4).unwrap().to_owned()
+    }
+    let env = env_with_secret();
+    for (mode, label) in MODES {
+        let mut run = Running::start_with(
+            &env,
+            mode,
+            &format!(
+                "grep '^Max core file size' /proc/self/limits > {d}/limits.txt; echo $$ > {d}/pid.tmp && mv {d}/pid.tmp {d}/pid; sleep 5",
+                d = env.path().display()
+            ),
+            |cmd| unsafe {
+                // SAFETY: setrlimit(2) is async-signal-safe.
+                cmd.pre_exec(|| {
+                    let mut rl = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    libc::getrlimit(libc::RLIMIT_CORE, &mut rl);
+                    rl.rlim_cur = WANT.min(rl.rlim_max);
+                    libc::setrlimit(libc::RLIMIT_CORE, &rl);
+                    Ok(())
+                });
+            },
+        );
+        run.command_pid("pid");
+        let cmd_limits = fs::read_to_string(env.path().join("limits.txt")).unwrap();
+        fs::remove_file(env.path().join("limits.txt")).unwrap();
+        let hard = cmd_limits.split_whitespace().nth(5).unwrap().to_owned();
+        let want = if hard == "unlimited" {
+            WANT.to_string()
+        } else {
+            WANT.min(hard.parse().unwrap()).to_string()
+        };
+        assert_eq!(core_soft(&cmd_limits), want, "{label}: command's limit");
+        if !mode.is_empty() {
+            let own = fs::read_to_string(format!("/proc/{}/limits", run.child.id())).unwrap();
+            assert_eq!(core_soft(&own), "0", "{label}: cloakenv's own limit");
+        }
+    }
+}

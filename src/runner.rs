@@ -308,6 +308,8 @@ pub fn exec_replace(command: &[OsString], vault: Vault) -> RunError {
     };
     let mut cmd = build_command(program, args, &vault);
     drop(vault);
+    // The command keeps the core-dump limit it would have had without us.
+    crate::hardening::restore_core_limit();
     let err = cmd.exec();
     spawn_error(err, program)
 }

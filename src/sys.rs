@@ -7,12 +7,15 @@
 //!   ignored for the command instead of being turned into a forwarded one.
 //! * [`arm_child`]: a `pre_exec` hook, run in the forked child just before
 //!   `execve`, that asks the kernel to kill the command if cloakenv dies
-//!   (`PR_SET_PDEATHSIG`, Linux).
+//!   (`PR_SET_PDEATHSIG`, Linux) and gives the command back the core-dump limit
+//!   cloakenv lowered for itself.
 
 use std::io;
 use std::os::raw::c_int;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+
+use crate::hardening;
 
 /// True if `sig` is currently set to `SIG_IGN`. Never modifies anything.
 #[allow(unsafe_code)]
@@ -27,20 +30,21 @@ pub fn signal_is_ignored(sig: c_int) -> bool {
 }
 
 /// Makes `cmd` die with cloakenv (Linux only: `PR_SET_PDEATHSIG` with
-/// `SIGKILL`).
+/// `SIGKILL`) and restores the core-dump limit to what cloakenv inherited.
 ///
 /// Must be called on the thread that will call `spawn` and that outlives the
 /// child, because the kernel ties the death signal to that *thread* (cloakenv
 /// spawns from its main thread, which only ends with the process).
 #[allow(unsafe_code)]
 pub fn arm_child(cmd: &mut Command) {
+    let core = hardening::saved_core_limit();
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let parent = rustix::process::getpid();
     // SAFETY: the closure runs between fork and exec in the child, where only
     // async-signal-safe calls are allowed. It makes nothing but raw syscalls
     // through rustix (prctl, getppid, setrlimit): no allocation, no locks, no
-    // access to any state shared with other threads. `parent` is a plain
-    // `Copy` value moved in.
+    // access to any state shared with other threads. `core` and `parent` are
+    // plain `Copy` values moved in.
     unsafe {
         cmd.pre_exec(move || {
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -52,6 +56,9 @@ pub fn arm_child(cmd: &mut Command) {
                 if getppid() != Some(parent) {
                     return Err(io::Error::from(io::ErrorKind::BrokenPipe));
                 }
+            }
+            if let Some(limit) = core {
+                rustix::process::setrlimit(rustix::process::Resource::Core, limit)?;
             }
             Ok(())
         });
