@@ -5,6 +5,7 @@
 | module          | responsibility                                                          |
 |-----------------|-------------------------------------------------------------------------|
 | `src/main.rs`   | clap CLI, passphrase acquisition, exit-code mapping                     |
+| `src/passphrase.rs` | the passphrase rules (what each source yields; line-break and length checks) |
 | `src/input.rs`  | reading secret text (stdin value, passphrase file) into one wiped, size-capped buffer |
 | `src/crypto.rs` | Argon2id key derivation, XChaCha20-Poly1305 seal/open, OS RNG           |
 | `src/vault.rs`  | vault file format, in-memory map, atomic writes (0600 on Unix), `.env` parser |
@@ -42,6 +43,21 @@
   ids, KDF parameters, salt, nonce). Flipping any header bit fails decryption.
 * Key material, passphrases and decrypted values are held in
   `zeroize::Zeroizing` buffers and wiped on drop. `Debug` impls never print them.
+
+## Passphrase rules
+
+One passphrase, three sources (`CLOAKENV_PASSPHRASE`, `CLOAKENV_PASSPHRASE_FILE`,
+the prompt), defined in `src/passphrase.rs` and README "Exactly what counts as
+the passphrase". Each source yields exactly the text supplied, except that a
+file loses **one** trailing `\n` or `\r\n` and the prompt loses the Enter key;
+nothing is trimmed. A source that is set but unusable is an error, never a
+silent fallback to the next one (a non-UTF-8 `CLOAKENV_PASSPHRASE` used to be
+skipped). The only passphrases two sources could disagree on are those ending
+in `\n` or `\r`, so `init` refuses them (a vault created with one could be
+opened only through the source that made it), while unlocking never rejects
+anything: existing vaults keep opening exactly as before, and a failed unlock
+with a trailing line break adds a hint. Short passphrases (under 12
+characters) get an advisory warning at `init` only, from every source.
 
 ## Vault format (v1)
 

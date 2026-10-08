@@ -40,10 +40,49 @@ afterwards; see "Memory hygiene" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.m
 In order of precedence:
 
 1. `CLOAKENV_PASSPHRASE` environment variable.
-2. `CLOAKENV_PASSPHRASE_FILE` — path to a file holding the passphrase (one
-   trailing newline is stripped). Handy for a machine-local key:
+2. `CLOAKENV_PASSPHRASE_FILE` — path to a file holding the passphrase (at most
+   64 KiB). Handy for a machine-local key:
    `head -c 32 /dev/urandom | base64 > ~/.config/cloakenv.key && chmod 600 ~/.config/cloakenv.key`.
 3. Interactive prompt (only when stdin is a terminal).
+
+### Exactly what counts as the passphrase
+
+The passphrase is the text you supply, byte for byte, with one exception per
+source:
+
+| source | what is used |
+|--------|--------------|
+| `CLOAKENV_PASSPHRASE` | the value, exactly as it is |
+| `CLOAKENV_PASSPHRASE_FILE` | the file's contents minus **one** trailing `\n` or `\r\n` |
+| interactive prompt | what you typed, without the Enter key |
+
+Nothing else is trimmed or normalised: leading and trailing spaces, a lone
+trailing `\r` and a *second* trailing newline are all part of the passphrase.
+It must be valid UTF-8 and not empty. A source that is set but unusable (a
+non-UTF-8 `CLOAKENV_PASSPHRASE`, an unreadable file) is an error; cloakenv never
+quietly falls back to the next source.
+
+The one thing two sources cannot agree on is a passphrase that ends in a line
+break: a file containing `x` and two newlines is the passphrase `x\n`, whereas
+`CLOAKENV_PASSPHRASE="$(cat file)"` is `x`. So **`init` refuses a passphrase that
+ends in `\n` or `\r`**, with an error that does not show it, rather than let you
+create a vault you could not open the same way later. (`echo x > file` and
+`printf %s x > file` are both fine.) Vaults that already exist are not
+affected: every source yields exactly what it did before, and if an unlock
+fails with a passphrase that ends in a line break cloakenv adds a `hint:` line
+saying so, without showing it.
+
+**Short passphrases.** A vault file can be attacked offline: anyone who gets a
+copy can try guesses at the cost of one Argon2id run each. At `init`, a
+passphrase shorter than **12 characters** (characters, not bytes), from any
+source, draws this warning on stderr; nothing is refused, no exit code changes,
+and the passphrase is never echoed:
+
+```
+cloakenv: warning: the passphrase is shorter than 12 characters; anyone who obtains the vault file can guess it offline, so a short passphrase is easy to crack. Use a longer one (4 or more random words, or 20 or more random characters). There is no command to change the passphrase later: `cloakenv init --force` starts over (and erases the vault's contents)
+```
+
+A machine-local key file from `/dev/urandom` (above) never triggers it.
 
 Both variables are always stripped from the child's environment, and
 `cloakenv set` / `cloakenv import` refuse to store secrets under either name.

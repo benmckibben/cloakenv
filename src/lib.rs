@@ -29,6 +29,7 @@ pub mod crypto;
 pub mod diag;
 pub mod hardening;
 pub mod input;
+pub mod passphrase;
 pub mod perms;
 pub mod runner;
 #[cfg(unix)]

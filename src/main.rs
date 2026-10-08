@@ -10,8 +10,9 @@ use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::Zeroizing;
 
-use cloakenv::crypto::KdfParams;
+use cloakenv::crypto::{CryptoError, KdfParams};
 use cloakenv::input::{self, InputError};
+use cloakenv::passphrase as rules;
 use cloakenv::vault::{
     Vault, VaultError, VaultLock, is_valid_key, parse_dotenv, read_env_file, vault_dir,
     write_gitignore,
@@ -130,6 +131,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 );
             }
             let pass = passphrase(true)?;
+            check_new_passphrase(&pass)?;
             let dir_preexisted = vault_dir(path).is_dir();
             let _lock = lock(path)?;
             // Re-check under the lock: another init may have won the race.
@@ -426,12 +428,48 @@ fn load_raw(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
     // Advisory only; goes to our own stderr before anything is decrypted or
     // spawned, so it can never end up inside a shielded child stream.
     perms::emit(&perms::vault_warnings(path, true));
-    Ok(Vault::load(path, pass.as_bytes())?)
+    Vault::load(path, pass.as_bytes()).map_err(|err| {
+        // A passphrase that ends in a line break and does not unlock the
+        // vault is most likely one with a stray newline (a file or variable
+        // written with an extra `echo`). Say so, without showing it.
+        if matches!(err, VaultError::Crypto(CryptoError::Decrypt))
+            && rules::ends_with_line_break(pass)
+        {
+            elog!(
+                "cloakenv: hint: the passphrase you supplied ends with a line break (a trailing \\n or \\r); if the vault was created without one, remove it. {PASSPHRASE_ENV} is used exactly as set, {PASSPHRASE_FILE_ENV} has one trailing newline removed"
+            );
+        }
+        err.into()
+    })
+}
+
+/// Checks a passphrase that is about to protect a *new* vault. The rules are
+/// in [`cloakenv::passphrase`]. Refuses one that ends in a line break, which
+/// the other passphrase sources could not reproduce (a lock-out later);
+/// merely warns about a short one, without ever showing it.
+fn check_new_passphrase(pass: &str) -> Result<()> {
+    if rules::ends_with_line_break(pass) {
+        bail!(
+            "the passphrase ends with a line break, which cannot be reproduced the same way everywhere: a passphrase file has exactly one trailing newline removed, and shells drop all of them, so you could be locked out of the vault later; remove the trailing newline(s) (`printf %s 'passphrase' > file` writes none, `echo` exactly one)"
+        );
+    }
+    if rules::is_weak(pass) {
+        elog!(
+            "cloakenv: warning: the passphrase is shorter than {} characters; anyone who obtains the vault file can guess it offline, so a short passphrase is easy to crack. Use a longer one (4 or more random words, or 20 or more random characters). There is no command to change the passphrase later: `cloakenv init --force` starts over (and erases the vault's contents)",
+            rules::WEAK_BELOW_CHARS
+        );
+    }
+    Ok(())
 }
 
 fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
-    let pass = if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
-        Zeroizing::new(p)
+    let pass = if let Some(p) = std::env::var_os(PASSPHRASE_ENV) {
+        // Used exactly as set (see `cloakenv::passphrase`). A value that is not
+        // text is an error, not a reason to quietly try another source.
+        Zeroizing::new(
+            p.into_string()
+                .map_err(|_| anyhow!("{PASSPHRASE_ENV} is not valid UTF-8"))?,
+        )
     } else if let Some(file) = std::env::var_os(PASSPHRASE_FILE_ENV) {
         perms::emit(&perms::passphrase_file_warnings(Path::new(&file)));
         read_passphrase_file(Path::new(&file))?
