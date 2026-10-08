@@ -26,6 +26,7 @@
 #![deny(unsafe_code)]
 
 pub mod crypto;
+pub mod diag;
 pub mod hardening;
 pub mod input;
 pub mod perms;

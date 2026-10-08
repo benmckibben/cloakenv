@@ -17,6 +17,7 @@ use cloakenv::vault::{
     write_gitignore,
 };
 use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, hardening, is_reserved_key, perms, runner};
+use cloakenv::{diag, elog};
 
 /// Lightweight encrypted local secret vault and zero-leak process injection engine.
 ///
@@ -103,13 +104,13 @@ fn main() -> ExitCode {
     // Before reading the passphrase, decrypting anything or spawning a child:
     // stop same-user processes from reading our /proc environ, memory and fds.
     if let Err(err) = hardening::harden_process() {
-        eprintln!("cloakenv: error: cannot harden process (PR_SET_DUMPABLE): {err}");
+        elog!("cloakenv: error: cannot harden process (PR_SET_DUMPABLE): {err}");
         return failure;
     }
     match dispatch(cli) {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("cloakenv: error: {err:#}");
+            elog!("cloakenv: error: {err:#}");
             if let Some(run_err) = err.downcast_ref::<runner::RunError>() {
                 return ExitCode::from(run_err.exit_code() as u8);
             }
@@ -141,13 +142,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             // already safely written.
             if let Err(err) = write_gitignore(path, dir_preexisted) {
                 let dir = vault_dir(path);
-                eprintln!(
+                elog!(
                     "cloakenv: warning: could not write {}: {err}; add {}/ to your project's .gitignore so the vault is not committed",
                     dir.join(".gitignore").display(),
                     dir.display()
                 );
             }
-            eprintln!("cloakenv: initialized vault at {}", path.display());
+            elog!("cloakenv: initialized vault at {}", path.display());
         }
         Cmd::Set { key, value } => {
             if value.is_some() {
@@ -173,7 +174,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let mut update = load_for_update(path, &pass)?;
             update.vault.set(&key, value)?;
             update.save(path, &pass)?;
-            eprintln!("cloakenv: set {key}");
+            elog!("cloakenv: set {key}");
         }
         Cmd::Unset { key } => {
             require_vault(path)?;
@@ -185,7 +186,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 bail!("no such key in vault");
             }
             update.save(path, &pass)?;
-            eprintln!("cloakenv: removed {key}");
+            elog!("cloakenv: removed {key}");
         }
         Cmd::Import { file } => {
             require_vault(path)?;
@@ -207,14 +208,17 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 update.vault.set(&key, value)?;
             }
             update.save(path, &pass)?;
-            eprintln!("cloakenv: imported {count} key(s) from {}", file.display());
+            elog!("cloakenv: imported {count} key(s) from {}", file.display());
         }
         Cmd::List => {
             let pass = passphrase(false)?;
             let vault = load(path, &pass)?;
-            for key in vault.keys() {
-                println!("{key}");
-            }
+            // A reader that exits early (`| head -1`) is not an error; a real
+            // write failure is.
+            diag::stdout_until_closed(|out| {
+                vault.keys().try_for_each(|key| writeln!(out, "{key}"))
+            })
+            .context("cannot write to stdout")?;
         }
         Cmd::Run { shield, command } => {
             // Fail closed: the vault is fully authenticated and decrypted
@@ -256,7 +260,7 @@ fn warn_short_values(vault: &Vault) {
     } else {
         ("values of", "are")
     };
-    eprintln!(
+    elog!(
         "cloakenv: warning: --shield: the {noun} {} {verb} shorter than {} bytes; short values are redacted everywhere they occur (bloating and garbling the output) and the redaction marker confirms a guessed string, so they act as a guessing oracle; keep short, non-secret settings out of the vault",
         keys.join(", "),
         runner::SHORT_VALUE_LEN
@@ -281,7 +285,7 @@ fn usage_error(err: &clap::Error) -> ExitCode {
         let _ = err.print();
         return ExitCode::from(u8::try_from(err.exit_code()).unwrap_or(USAGE_FAILURE));
     }
-    eprint!("{}", sanitized_usage_error(err));
+    diag::stderr_text(&sanitized_usage_error(err));
     ExitCode::from(USAGE_FAILURE)
 }
 
@@ -337,7 +341,7 @@ fn lock(path: &Path) -> Result<VaultLock> {
     if let Some(lock) = VaultLock::try_acquire(path)? {
         return Ok(lock);
     }
-    eprintln!("cloakenv: waiting for another cloakenv process to release the vault lock...");
+    elog!("cloakenv: waiting for another cloakenv process to release the vault lock...");
     Ok(VaultLock::acquire(path)?)
 }
 
@@ -347,7 +351,7 @@ fn load(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
     let vault = load_raw(path, pass)?;
     let p = vault.params();
     if !p.meets_min() {
-        eprintln!(
+        elog!(
             "cloakenv: warning: vault key-derivation settings (memory {} KiB, iterations {}, lanes {}) are weaker than the recommended minimum (memory {} KiB, iterations {}, lanes {}); they are upgraded the next time you run `cloakenv set`, `unset` or `import`",
             p.m_cost_kib,
             p.t_cost,
@@ -376,9 +380,14 @@ impl Update {
         self.vault.save(path, pass.as_bytes())?;
         if let Some(before) = self.upgraded_from {
             let p = self.vault.params();
-            eprintln!(
+            elog!(
                 "cloakenv: upgraded the vault's key-derivation settings from memory {} KiB, iterations {}, lanes {} to memory {} KiB, iterations {}, lanes {}",
-                before.m_cost_kib, before.t_cost, before.p_cost, p.m_cost_kib, p.t_cost, p.p_cost
+                before.m_cost_kib,
+                before.t_cost,
+                before.p_cost,
+                p.m_cost_kib,
+                p.t_cost,
+                p.p_cost
             );
         }
         Ok(())

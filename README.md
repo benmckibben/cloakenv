@@ -279,6 +279,17 @@ above.
 Exit codes are 0–255 on Unix. A child exit status above 255 (possible on
 Windows only, which is unsupported) is reported as `1`.
 
+**Output closed early.** If whatever reads cloakenv's output goes away
+(`cloakenv list | head -1`), cloakenv stops quietly with exit status 0, the way
+`cat` ends quietly: no panic, no message. Under `run --shield` it stops reading
+the command's output too, so the command gets `SIGPIPE` on its next write and
+cloakenv exits with the command's status (`128 + 13` if that is what ended it).
+Without `--shield` the command writes to your pipe directly, and is ended by
+`SIGPIPE` like any other command. cloakenv's own messages on stderr are
+best-effort: a closed stderr never changes an exit status. A genuine write
+failure on stdout (a full disk, say) is still an error: `cloakenv: error:
+cannot write to stdout: ...`, exit 1.
+
 ## What `--shield` does and doesn't do
 
 `--shield` pipes the child's stdout and stderr through an in-memory filter that
