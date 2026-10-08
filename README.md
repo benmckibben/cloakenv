@@ -36,6 +36,10 @@ In order of precedence:
 
 Both variables are always stripped from the child's environment, and
 `cloakenv set` / `cloakenv import` refuse to store secrets under either name.
+On Linux, cloakenv also marks itself non-dumpable at startup, so neither the
+commands it runs nor other processes of your user can read the passphrase out
+of `/proc/<pid>/environ`, inspect its memory, or write around `--shield` via
+`/proc/<pid>/fd`; it never leaves a core dump.
 
 ## Vault location
 
