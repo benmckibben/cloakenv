@@ -85,12 +85,14 @@ injected=$(ce run -- sh -c 'printf %s "$SMOKE_SECRET"')
 leaked=$(ce run -- sh -c 'printf %s "${CLOAKENV_PASSPHRASE-unset}"')
 [ "$leaked" = "unset" ] || fail "CLOAKENV_PASSPHRASE reached the command"
 
-# --shield redacts the value from stdout and stderr.
-out=$(ce run --shield -- sh -c 'echo "out:$SMOKE_SECRET"; echo "err:$SMOKE_SECRET" >&2' 2>&1)
-echo "$out"
-case "$out" in *"$secret"*) fail "--shield let the secret through" ;; esac
-case "$out" in *"out:[REDACTED_BY_CLOAKENV]"*) ;; *) fail "--shield did not redact stdout" ;; esac
-case "$out" in *"err:[REDACTED_BY_CLOAKENV]"*) ;; *) fail "--shield did not redact stderr" ;; esac
+# --shield redacts the value from stdout and from stderr. The two streams are
+# filtered by separate threads (their relative order is not guaranteed), so
+# capture them separately.
+ce run --shield -- sh -c 'echo "out:$SMOKE_SECRET"; echo "err:$SMOKE_SECRET" >&2' >shield.out 2>shield.err
+cat shield.out shield.err
+if grep -qF -e "$secret" shield.out shield.err; then fail "--shield let the secret through"; fi
+[ "$(cat shield.out)" = "out:[REDACTED_BY_CLOAKENV]" ] || fail "--shield did not redact stdout"
+[ "$(cat shield.err)" = "err:[REDACTED_BY_CLOAKENV]" ] || fail "--shield did not redact stderr"
 
 # Exit codes pass through, with and without --shield.
 rc=0
