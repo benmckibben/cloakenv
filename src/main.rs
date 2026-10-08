@@ -167,19 +167,20 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             // blocks other writers.
             let value = read_value(&key)?;
             let _lock = lock(path)?;
-            let mut vault = load_for_update(path, &pass)?;
-            vault.set(&key, value)?;
-            vault.save(path, pass.as_bytes())?;
+            let mut update = load_for_update(path, &pass)?;
+            update.vault.set(&key, value)?;
+            update.save(path, &pass)?;
             eprintln!("cloakenv: set {key}");
         }
         Cmd::Unset { key } => {
             let pass = passphrase(false)?;
             let _lock = lock(path)?;
-            let mut vault = load_for_update(path, &pass)?;
-            if !vault.remove(&key) {
+            let mut update = load_for_update(path, &pass)?;
+            if !update.vault.remove(&key) {
+                // Nothing is saved, so nothing is announced either.
                 bail!("no such key in vault");
             }
-            vault.save(path, pass.as_bytes())?;
+            update.save(path, &pass)?;
             eprintln!("cloakenv: removed {key}");
         }
         Cmd::Import { file } => {
@@ -195,12 +196,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             let pass = passphrase(false)?;
             let _lock = lock(path)?;
-            let mut vault = load_for_update(path, &pass)?;
+            let mut update = load_for_update(path, &pass)?;
             let count = pairs.len();
             for (key, value) in pairs {
-                vault.set(&key, value)?;
+                update.vault.set(&key, value)?;
             }
-            vault.save(path, pass.as_bytes())?;
+            update.save(path, &pass)?;
             eprintln!("cloakenv: imported {count} key(s) from {}", file.display());
         }
         Cmd::List => {
@@ -355,21 +356,43 @@ fn load(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
     Ok(vault)
 }
 
+/// A vault loaded for modification by `set`, `unset` or `import`.
+struct Update {
+    vault: Vault,
+    /// The key-derivation settings it was loaded with, if they were raised.
+    upgraded_from: Option<KdfParams>,
+}
+
+impl Update {
+    /// Saves the vault, and only then says that its key-derivation settings
+    /// were upgraded: a command that fails before saving (an unknown key to
+    /// `unset`, a failed write) must not claim an upgrade that never reached
+    /// the disk.
+    fn save(self, path: &Path, pass: &Zeroizing<String>) -> Result<()> {
+        self.vault.save(path, pass.as_bytes())?;
+        if let Some(before) = self.upgraded_from {
+            let p = self.vault.params();
+            eprintln!(
+                "cloakenv: upgraded the vault's key-derivation settings from memory {} KiB, iterations {}, lanes {} to memory {} KiB, iterations {}, lanes {}",
+                before.m_cost_kib, before.t_cost, before.p_cost, p.m_cost_kib, p.t_cost, p.p_cost
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Loads the vault for a command that is about to save it again. The
 /// passphrase is already in hand, so raising old or weak key-derivation
 /// settings to (at least) the defaults costs only the one KDF run that the
 /// save performs anyway.
-fn load_for_update(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
+fn load_for_update(path: &Path, pass: &Zeroizing<String>) -> Result<Update> {
     let mut vault = load_raw(path, pass)?;
     let before = vault.params();
-    if vault.upgrade_kdf_params() {
-        let p = vault.params();
-        eprintln!(
-            "cloakenv: upgraded the vault's key-derivation settings from memory {} KiB, iterations {}, lanes {} to memory {} KiB, iterations {}, lanes {}",
-            before.m_cost_kib, before.t_cost, before.p_cost, p.m_cost_kib, p.t_cost, p.p_cost
-        );
-    }
-    Ok(vault)
+    let upgraded = vault.upgrade_kdf_params();
+    Ok(Update {
+        vault,
+        upgraded_from: upgraded.then_some(before),
+    })
 }
 
 fn load_raw(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
