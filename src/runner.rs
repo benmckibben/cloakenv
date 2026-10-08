@@ -2,8 +2,11 @@
 //! `--shield` streaming redactor.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, Write};
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(not(unix))]
+use std::io::Read;
+use std::io::{self, Write};
+use std::process::{Command, ExitStatus, Stdio};
+#[cfg(not(unix))]
 use std::thread;
 
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -15,7 +18,7 @@ use crate::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV};
 /// Replacement text written in place of any secret value under `--shield`.
 pub const REDACTION: &[u8] = b"[REDACTED_BY_CLOAKENV]";
 
-const CHUNK: usize = 8 * 1024;
+pub(crate) const CHUNK: usize = 8 * 1024;
 
 /// Under `--shield`, values shorter than this many bytes are flagged by the
 /// CLI. Redaction matches literal substrings, so a short value (`1`, `80`,
@@ -52,14 +55,17 @@ pub enum RunError {
     NotFound { program: String },
     #[error("{program}: permission denied")]
     PermissionDenied { program: String },
-    #[error("failed to spawn {program}: {source}")]
+    // The OS error is the `source`; `{:#}` prints the chain.
+    #[error("failed to spawn {program}")]
     Spawn {
         program: String,
         #[source]
         source: io::Error,
     },
-    #[error("failed to wait for child process: {0}")]
+    #[error("failed to wait for child process")]
     Wait(#[source] io::Error),
+    #[error("failed to install signal handlers")]
+    Signals(#[source] io::Error),
 }
 
 impl RunError {
@@ -178,8 +184,9 @@ where
     Ok(out)
 }
 
-/// Copies `reader` to `writer` through a redactor, flushing after each
-/// chunk so interactive output is not delayed more than necessary.
+/// Blocking copy of `reader` to `writer` through a redactor, flushing after each
+/// chunk. Only used where there is no supervising poll loop (non-Unix).
+#[cfg(not(unix))]
 fn pump<R: Read, W: Write>(mut reader: R, mut writer: W, mut redactor: Redactor) {
     let mut buf = vec![0u8; CHUNK];
     loop {
@@ -191,8 +198,6 @@ fn pump<R: Read, W: Write>(mut reader: R, mut writer: W, mut redactor: Redactor)
                     .and_then(|()| writer.flush())
                     .is_err()
                 {
-                    // Parent stream is gone (e.g. EPIPE). Stop reading so the
-                    // child observes a broken pipe too.
                     return;
                 }
             }
@@ -203,12 +208,41 @@ fn pump<R: Read, W: Write>(mut reader: R, mut writer: W, mut redactor: Redactor)
     let _ = redactor.finish(&mut writer).and_then(|()| writer.flush());
 }
 
+/// Builds the command with every vault entry injected into its environment
+/// and the cloakenv passphrase variables removed.
+fn build_command(program: &OsStr, args: &[OsString], vault: &Vault) -> Command {
+    let mut cmd = Command::new(program);
+    // Removals come after `envs` so a vault entry cannot put the passphrase
+    // variables back. `Command` applies these mutations in call order.
+    cmd.args(args)
+        .envs(vault.iter())
+        .env_remove(PASSPHRASE_ENV)
+        .env_remove(PASSPHRASE_FILE_ENV)
+        .stdin(Stdio::inherit());
+    cmd
+}
+
 /// Spawns `command[0]` with `command[1..]` as arguments and every vault entry
 /// injected into its environment, then waits for it to exit.
 ///
 /// The cloakenv passphrase variables are removed from the child's
 /// environment. When `shield` is set, the child's stdout and stderr are piped
 /// through a [`Redactor`] before reaching our own stdout and stderr.
+///
+/// On Unix, cloakenv stays the child's parent for the whole run and
+///
+/// * forwards `SIGTERM`, `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGUSR1` and `SIGUSR2` to it
+///   (a signal that was ignored when cloakenv started stays ignored, and
+///   the child inherits that, as with `nohup`);
+/// * on Linux, has the kernel kill the child if cloakenv itself dies
+///   (`PR_SET_PDEATHSIG`);
+/// * reports the child's own exit status (see [`exit_code`]);
+/// * with `shield`, stops pumping output a short grace period after the
+///   command exits even if a leftover background process still holds the
+///   pipes open (see `DRAIN_IDLE` / `DRAIN_MAX` in the supervisor).
+///
+/// The CLI only uses this for `--shield`; without it, it replaces itself with
+/// the command via [`exec_replace`].
 pub fn run(command: &[OsString], vault: &Vault, shield: bool) -> Result<ExitStatus, RunError> {
     let (program, args) = command.split_first().ok_or(RunError::NoCommand)?;
 
@@ -220,44 +254,75 @@ pub fn run(command: &[OsString], vault: &Vault, shield: bool) -> Result<ExitStat
         None
     };
 
-    let mut cmd = Command::new(program);
-    // Removals come after `envs` so a vault entry cannot put the passphrase
-    // variables back. `Command` applies these mutations in call order.
-    cmd.args(args)
-        .envs(vault.iter())
-        .env_remove(PASSPHRASE_ENV)
-        .env_remove(PASSPHRASE_FILE_ENV)
-        .stdin(Stdio::inherit());
+    let mut cmd = build_command(program, args, vault);
     if shield {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
 
-    let mut child = spawn(&mut cmd, program)?;
-
-    let Some((out_redactor, err_redactor)) = redactors else {
-        return child.wait().map_err(RunError::Wait);
-    };
-
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let out_thread = thread::spawn(move || pump(stdout, io::stdout(), out_redactor));
-    let err_thread = thread::spawn(move || pump(stderr, io::stderr(), err_redactor));
-    let status = child.wait().map_err(RunError::Wait);
-    // Pumps finish once every holder of the pipes' write ends has exited.
-    let _ = out_thread.join();
-    let _ = err_thread.join();
-    status
+    #[cfg(unix)]
+    {
+        crate::supervise::run(cmd, program, redactors)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut child = cmd.spawn().map_err(|e| spawn_error(e, program))?;
+        let Some((out_redactor, err_redactor)) = redactors else {
+            return child.wait().map_err(RunError::Wait);
+        };
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let out_thread = thread::spawn(move || pump(stdout, io::stdout(), out_redactor));
+        let err_thread = thread::spawn(move || pump(stderr, io::stderr(), err_redactor));
+        let status = child.wait().map_err(RunError::Wait);
+        let _ = out_thread.join();
+        let _ = err_thread.join();
+        status
+    }
 }
 
-fn spawn(cmd: &mut Command, program: &OsStr) -> Result<Child, RunError> {
-    cmd.spawn().map_err(|source| {
-        let program = program.to_string_lossy().into_owned();
-        match source.kind() {
-            io::ErrorKind::NotFound => RunError::NotFound { program },
-            io::ErrorKind::PermissionDenied => RunError::PermissionDenied { program },
-            _ => RunError::Spawn { program, source },
-        }
-    })
+/// Replaces the cloakenv process with `command` (`execve`), with every vault
+/// entry in its environment and the passphrase variables removed. Used for
+/// `cloakenv run` without `--shield` on Unix.
+///
+/// On success this never returns: there is no cloakenv process left, so
+/// nothing is orphaned, every signal goes straight to the command, the exit
+/// status is the command's own, and neither cloakenv's memory (including
+/// the passphrase and its copy of the secrets) nor its environment block
+/// outlives the call. The vault is taken by value and wiped (`Zeroizing`)
+/// before the exec; the copies inside [`Command`] cannot be wiped from here but
+/// vanish with the old address space. Stdin, stdout, stderr, the
+/// controlling terminal, the working directory and the process id are all
+/// inherited unchanged.
+///
+/// It only returns if the exec failed, with the error to report (127 for a
+/// missing command, 126 for one that cannot be executed, 125 otherwise).
+/// After a failed exec the process environment must not be read again: std
+/// has pointed `environ` at the command's environment block, which it frees on
+/// return. Callers should just report the error and exit.
+#[cfg(unix)]
+pub fn exec_replace(command: &[OsString], vault: Vault) -> RunError {
+    use std::os::unix::process::CommandExt;
+
+    let Some((program, args)) = command.split_first() else {
+        return RunError::NoCommand;
+    };
+    let mut cmd = build_command(program, args, &vault);
+    drop(vault);
+    // The command keeps the core-dump limit it would have had without us.
+    crate::hardening::restore_core_limit();
+    let err = cmd.exec();
+    spawn_error(err, program)
+}
+
+/// Classifies a failure to start (or exec) `program`: 127 for a missing command,
+/// 126 for one that cannot be executed, 125 for anything else.
+pub(crate) fn spawn_error(source: io::Error, program: &OsStr) -> RunError {
+    let program = program.to_string_lossy().into_owned();
+    match source.kind() {
+        io::ErrorKind::NotFound => RunError::NotFound { program },
+        io::ErrorKind::PermissionDenied => RunError::PermissionDenied { program },
+        _ => RunError::Spawn { program, source },
+    }
 }
 
 /// Maps a child's exit status to our own exit code (`128 + signal` for

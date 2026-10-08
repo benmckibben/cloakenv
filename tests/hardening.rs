@@ -1,6 +1,10 @@
-//! Linux process hardening: commands spawned by `cloakenv run` (and any other
-//! same-user process) must not be able to reach into cloakenv through
-//! `/proc/<pid>` to steal the passphrase or bypass `--shield`.
+//! Linux process hardening: commands spawned by `cloakenv run --shield` (and
+//! any other same-user process) must not be able to reach into cloakenv
+//! through `/proc/<pid>` to steal the passphrase or bypass `--shield`.
+//!
+//! Without `--shield` there is no cloakenv process left to probe: it replaces
+//! itself with the command (see `tests/supervision.rs`), so the probes below
+//! run with `--shield`, where cloakenv remains the parent.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -46,6 +50,7 @@ fn child_cannot_read_passphrase_from_parent_environ() {
     env.set("API_KEY", SECRET);
     let out = env.ok(&[
         "run",
+        "--shield",
         "--",
         "sh",
         "-c",
@@ -72,6 +77,7 @@ fn child_cannot_read_passphrase_file_path_from_parent_environ() {
         .env("CLOAKENV_PASSPHRASE_FILE", &pass_file)
         .args([
             "run",
+            "--shield",
             "--",
             "sh",
             "-c",

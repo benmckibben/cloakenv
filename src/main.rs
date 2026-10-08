@@ -12,7 +12,8 @@ use zeroize::Zeroizing;
 
 use cloakenv::crypto::KdfParams;
 use cloakenv::vault::{
-    Vault, VaultError, VaultLock, is_valid_key, parse_dotenv, vault_dir, write_gitignore,
+    Vault, VaultError, VaultLock, is_valid_key, parse_dotenv, read_env_file, vault_dir,
+    write_gitignore,
 };
 use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, hardening, is_reserved_key, perms, runner};
 
@@ -161,43 +162,50 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 return Err(VaultError::InvalidKey.into());
             }
             refuse_reserved(&key)?;
+            // No vault, no prompts and no lock file or directory created.
+            require_vault(path)?;
             let pass = passphrase(false)?;
             // Gather input before taking the lock so a pending prompt never
             // blocks other writers.
             let value = read_value(&key)?;
             let _lock = lock(path)?;
-            let mut vault = load_for_update(path, &pass)?;
-            vault.set(&key, value)?;
-            vault.save(path, pass.as_bytes())?;
+            let mut update = load_for_update(path, &pass)?;
+            update.vault.set(&key, value)?;
+            update.save(path, &pass)?;
             eprintln!("cloakenv: set {key}");
         }
         Cmd::Unset { key } => {
+            require_vault(path)?;
             let pass = passphrase(false)?;
             let _lock = lock(path)?;
-            let mut vault = load_for_update(path, &pass)?;
-            if !vault.remove(&key) {
+            let mut update = load_for_update(path, &pass)?;
+            if !update.vault.remove(&key) {
+                // Nothing is saved, so nothing is announced either.
                 bail!("no such key in vault");
             }
-            vault.save(path, pass.as_bytes())?;
+            update.save(path, &pass)?;
             eprintln!("cloakenv: removed {key}");
         }
         Cmd::Import { file } => {
-            let content = Zeroizing::new(
-                std::fs::read_to_string(&file)
-                    .with_context(|| format!("cannot read {}", file.display()))?,
-            );
-            let pairs = parse_dotenv(&content)?;
+            require_vault(path)?;
+            // Regular files only, at most 16 MiB, read into a buffer that is
+            // wiped on drop (and never reallocated, so no stray copy stays
+            // behind).
+            let content = read_env_file(&file)?;
+            let text =
+                std::str::from_utf8(&content).map_err(|_| VaultError::NotUtf8(file.clone()))?;
+            let pairs = parse_dotenv(text)?;
             for (key, _) in &pairs {
                 refuse_reserved(key)?;
             }
             let pass = passphrase(false)?;
             let _lock = lock(path)?;
-            let mut vault = load_for_update(path, &pass)?;
+            let mut update = load_for_update(path, &pass)?;
             let count = pairs.len();
             for (key, value) in pairs {
-                vault.set(&key, value)?;
+                update.vault.set(&key, value)?;
             }
-            vault.save(path, pass.as_bytes())?;
+            update.save(path, &pass)?;
             eprintln!("cloakenv: imported {count} key(s) from {}", file.display());
         }
         Cmd::List => {
@@ -215,6 +223,15 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             drop(pass);
             if shield {
                 warn_short_values(&vault);
+            }
+            // Without --shield there is nothing to supervise: on Unix cloakenv
+            // replaces itself with the command, so no cloakenv process (and no
+            // in-memory copy of the secrets) remains, signals reach the
+            // command directly and its exit status is ours. This only comes
+            // back if the exec itself failed.
+            #[cfg(unix)]
+            if !shield {
+                return Err(runner::exec_replace(&command, vault).into());
             }
             let status = runner::run(&command, &vault, shield)?;
             drop(vault);
@@ -343,30 +360,60 @@ fn load(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
     Ok(vault)
 }
 
+/// A vault loaded for modification by `set`, `unset` or `import`.
+struct Update {
+    vault: Vault,
+    /// The key-derivation settings it was loaded with, if they were raised.
+    upgraded_from: Option<KdfParams>,
+}
+
+impl Update {
+    /// Saves the vault, and only then says that its key-derivation settings
+    /// were upgraded: a command that fails before saving (an unknown key to
+    /// `unset`, a failed write) must not claim an upgrade that never reached
+    /// the disk.
+    fn save(self, path: &Path, pass: &Zeroizing<String>) -> Result<()> {
+        self.vault.save(path, pass.as_bytes())?;
+        if let Some(before) = self.upgraded_from {
+            let p = self.vault.params();
+            eprintln!(
+                "cloakenv: upgraded the vault's key-derivation settings from memory {} KiB, iterations {}, lanes {} to memory {} KiB, iterations {}, lanes {}",
+                before.m_cost_kib, before.t_cost, before.p_cost, p.m_cost_kib, p.t_cost, p.p_cost
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Loads the vault for a command that is about to save it again. The
 /// passphrase is already in hand, so raising old or weak key-derivation
 /// settings to (at least) the defaults costs only the one KDF run that the
 /// save performs anyway.
-fn load_for_update(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
+fn load_for_update(path: &Path, pass: &Zeroizing<String>) -> Result<Update> {
     let mut vault = load_raw(path, pass)?;
     let before = vault.params();
-    if vault.upgrade_kdf_params() {
-        let p = vault.params();
-        eprintln!(
-            "cloakenv: upgraded the vault's key-derivation settings from memory {} KiB, iterations {}, lanes {} to memory {} KiB, iterations {}, lanes {}",
-            before.m_cost_kib, before.t_cost, before.p_cost, p.m_cost_kib, p.t_cost, p.p_cost
-        );
-    }
-    Ok(vault)
+    let upgraded = vault.upgrade_kdf_params();
+    Ok(Update {
+        vault,
+        upgraded_from: upgraded.then_some(before),
+    })
 }
 
-fn load_raw(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
+/// Fails with the usual "no vault" error if there is no vault yet, before
+/// anything is prompted for or created (taking the write lock creates the
+/// vault directory and a lock file).
+fn require_vault(path: &Path) -> Result<()> {
     if !path.exists() {
         bail!(
             "no vault found at {} (run `cloakenv init` first)",
             path.display()
         );
     }
+    Ok(())
+}
+
+fn load_raw(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
+    require_vault(path)?;
     // Advisory only; goes to our own stderr before anything is decrypted or
     // spawned, so it can never end up inside a shielded child stream.
     perms::emit(&perms::vault_warnings(path, true));

@@ -6,8 +6,10 @@
 //! * [`crypto`]: Argon2id key derivation and XChaCha20-Poly1305 AEAD.
 //! * [`vault`]: the on-disk vault format, in-memory key/value storage and
 //!   `.env` import parsing.
-//! * [`runner`]: spawning child processes with secrets injected straight into
-//!   their environment, plus the `--shield` streaming redactor.
+//! * [`runner`]: running commands with secrets injected straight into their
+//!   environment (replacing cloakenv with the command via `exec`, or, under
+//!   `--shield`, supervising it as a child with signal forwarding), plus the
+//!   `--shield` streaming redactor.
 //! * [`hardening`]: process-level protections (non-dumpable on Linux) applied
 //!   before any secret is handled.
 //! * [`perms`]: advisory warnings about loose permissions on the vault, its
@@ -17,12 +19,18 @@
 //! (wrapped in [`zeroize::Zeroizing`]) and in the child's environment block.
 //! They are never written to disk, and never included in error messages.
 
-#![forbid(unsafe_code)]
+// `unsafe` is denied crate-wide; the two calls that need it live in `sys`
+// (Unix only), each with a SAFETY comment.
+#![deny(unsafe_code)]
 
 pub mod crypto;
 pub mod hardening;
 pub mod perms;
 pub mod runner;
+#[cfg(unix)]
+mod supervise;
+#[cfg(unix)]
+mod sys;
 pub mod vault;
 
 /// Environment variable consulted for the vault passphrase.

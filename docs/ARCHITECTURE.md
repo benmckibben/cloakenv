@@ -8,8 +8,10 @@
 | `src/crypto.rs` | Argon2id key derivation, XChaCha20-Poly1305 seal/open, OS RNG           |
 | `src/vault.rs`  | vault file format, in-memory map, atomic writes (0600 on Unix), `.env` parser |
 | `src/perms.rs`  | advisory permission/symlink warnings for the vault and passphrase file (Unix) |
-| `src/hardening.rs` | process hardening (`PR_SET_DUMPABLE`, Linux only)                    |
-| `src/runner.rs` | child spawning with env injection, `--shield` streaming redactor        |
+| `src/hardening.rs` | process hardening (`PR_SET_DUMPABLE` on Linux, zero soft core limit on Unix) |
+| `src/runner.rs` | env injection: `exec` into the command, or spawn it; `--shield` streaming redactor |
+| `src/supervise.rs` | (Unix) `--shield` supervision: signal forwarding, race-free reaping, output pumps |
+| `src/sys.rs`    | (Unix) the crate's only `unsafe`: `sigaction` read, `pre_exec` hook (`PDEATHSIG`, core limit) |
 | `src/lib.rs`    | re-exports the above so integration tests can exercise them directly    |
 
 ## Cryptography
@@ -74,6 +76,16 @@ followed through a symlink) when the vault directory is named `.cloak` or was
 created by that `init`, so the vault cannot be committed with `git add .`;
 failure to write it is a warning, not an error.
 
+Before taking the lock, `set`/`unset`/`import` check that the vault exists, so a
+mistyped `--vault` path creates no directory or lock file. The lock file is
+opened like every file in Rust, close-on-exec, so no command can inherit it; a
+symlink at the lock path is followed (the lock directory has the same trust
+level as the vault itself).
+
+`import` reads its `.env` file with the same open-once/`fstat`-the-handle
+discipline as the vault: regular files only, at most 16 MiB, into one buffer
+sized up front (never reallocated, so no stray copy) that is wiped on drop.
+
 Writers (`init`, `set`, `unset`, `import`) hold an exclusive `flock(2)` on a
 sibling `.vault.bin.lock` (empty, mode 0600, never deleted) for the whole
 load → modify → save cycle, so concurrent updates are serialised instead of
@@ -101,13 +113,63 @@ modes, never change exit codes and never chmod anything. A loose passphrase
 file is deliberately a warning, not an error: Docker/Kubernetes secret mounts
 are routinely 0444/0644 and rely on the container boundary.
 
+## Process model of `cloakenv run`
+
+* **No `--shield` (Unix): `exec`.** After the vault is authenticated and
+  decrypted, `runner::exec_replace` builds the `Command` (vault entries via
+  `envs`, then `env_remove` of both passphrase variables, so a vault entry
+  cannot resurrect them), drops the `Vault` and the passphrase (both are
+  `Zeroizing`), restores the core-file limit cloakenv lowered for itself and
+  calls `CommandExt::exec`. On success the whole address space, including
+  std's own non-wipeable copies of the environment that `Command` made, the
+  process's original environment block and the stacks of every thread, is
+  replaced by the kernel; nothing of cloakenv survives. Only file descriptors
+  not marked close-on-exec do, and cloakenv opens none (Rust opens everything
+  `O_CLOEXEC`; the write lock is not even held for `run`). `exec` failures
+  come back as the same `RunError`s as spawn failures (`ENOENT` → 127,
+  `EACCES` → 126, anything else → 125), printed by cloakenv in the same style.
+  After a failed exec the environment must not be read again (std has pointed
+  `environ` at memory it then frees); the error path only formats and exits.
+  Because the kernel resets `PR_SET_DUMPABLE` at exec, the command is
+  dumpable and its `/proc/<pid>/environ` (holding the secrets, by design,
+  and no passphrase) is readable by same-user processes. That is no change
+  from when cloakenv was its parent; the difference is that there is no
+  parent whose environment, memory or file descriptors (the `--shield`
+  bypass) could be probed, and nothing to orphan, signal or wait for.
+* **`--shield` (Unix): supervised child** (`src/supervise.rs`). Handlers for
+  `SIGTERM`, `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2` are installed
+  (`signal-hook`, iterator mode: the handler only writes to a self-pipe, a
+  thread forwards with `kill(2)`) *before* the child is spawned, so an early
+  signal is queued rather than lost; signals that were `SIG_IGN` on entry are
+  not caught, so the command inherits the ignore. The main thread waits with
+  `waitid(WEXITED | WNOWAIT)`, takes the mutex the forwarder holds across
+  every `kill`, marks the child gone, and only then reaps it, so a signal can
+  never reach a recycled pid. On Linux a `pre_exec` hook sets
+  `PR_SET_PDEATHSIG = SIGKILL` (checking `getppid` afterwards to close the
+  fork-to-prctl race); the death signal is tied to the *thread* that spawned
+  the child, which is the main thread and lives as long as the process. It is
+  cleared by `exec` of a set-uid binary and only reaches the direct child.
+  The same hook gives the child back the original core-file limit. Exit
+  status mapping is unchanged (`128 + N`).
+* **Output pumps and leftover holders.** The pumps `poll` their pipe with a
+  50 ms tick instead of blocking in `read`. After the command has exited
+  they end at EOF, or once the pipe has been silent for 250 ms, or 3 seconds
+  after the exit (not counting time blocked writing to our own stdout), and
+  flush their redactor either way. Leftover processes are not killed.
+* `unsafe` is denied crate-wide and allowed in `src/sys.rs` only, for two
+  calls with no safe wrapper (`sigaction` read-only query, `pre_exec`).
+  Each has a SAFETY comment; the `pre_exec` closure only makes raw syscalls.
+
 ## Platform support
 
 Linux and macOS are supported and tested in CI. Windows is unsupported and
 untested (not built in CI; integration tests are `cfg(unix)`). Unix-only
 pieces: file modes 0600/0700, directory fsync, `flock`, permission warnings,
-signal exit codes (`128 + N`; on other platforms any exit status above 255
-becomes 1). `PR_SET_DUMPABLE` is Linux only (see invariant 6).
+`exec` into the command, signal forwarding and exit codes (`128 + N`; on other
+platforms any exit status above 255 becomes 1). `PR_SET_DUMPABLE` and
+`PR_SET_PDEATHSIG` are Linux only (see invariant 6): on macOS `exec` and signal
+forwarding behave the same, but a `SIGKILL` of cloakenv under `--shield` leaves
+the command running.
 
 ## Invariants and how they are enforced
 
@@ -141,7 +203,10 @@ becomes 1). `PR_SET_DUMPABLE` is Linux only (see invariant 6).
    `/proc/<pid>/fd/*` (which would let a child write straight to cloakenv's
    stdout and bypass `--shield`), and no core dump is written on a crash.
    `execve` resets the flag, so children run normally. Tests run probes from
-   inside `cloakenv run` and check they fail. Not covered: root /
+   inside `cloakenv run --shield` and check they fail (without `--shield` there
+   is no cloakenv process left to probe). cloakenv also sets its soft
+   `RLIMIT_CORE` to 0 (every Unix), covering `fs.suid_dumpable=2` and macOS; the
+   original limit is restored for the command. Not covered: root /
    `CAP_SYS_PTRACE`, and **non-Linux platforms**: the call is
    `cfg(linux/android)`-gated and a no-op elsewhere, so on macOS other
    processes of the same user may be able to read cloakenv's environment
@@ -194,7 +259,11 @@ tests check every chunk size from 1 to the input length.
 * Empty values are never matched.
 * Redaction only applies to the child's stdout/stderr pipes; anything the
   child writes to files, sockets or `/dev/tty` directly is not filtered.
-* The pumps run until the pipes close, so a daemonised grandchild that keeps
-  stdout open keeps `cloakenv` alive.
+* A daemonised grandchild that keeps stdout open no longer keeps `cloakenv`
+  alive: once the command itself has exited the pumps stop after a short
+  quiet period (250 ms) or 3 seconds, whichever comes first, and anything the
+  leftover prints afterwards is never shown.
+* A Ctrl-C at a terminal reaches the command twice (once from the terminal,
+  once forwarded); see "Process model".
 * The child process itself obviously has the plaintext secrets; `cloakenv` is
   not a sandbox.

@@ -51,6 +51,8 @@ const AEAD_XCHACHA20POLY1305: u8 = 1;
 pub const HEADER_LEN: usize = 64;
 /// Upper bound on vault file size we are willing to read (16 MiB).
 pub const MAX_VAULT_LEN: u64 = 16 * 1024 * 1024;
+/// Upper bound on the size of a `.env` file `import` will read (16 MiB).
+pub const MAX_ENV_FILE_LEN: u64 = 16 * 1024 * 1024;
 
 /// Errors produced by the vault layer. Secret values are never included;
 /// keys (variable names) and line numbers may be.
@@ -67,6 +69,15 @@ pub enum VaultError {
     #[error("vault file is too large (the limit is 16 MiB)")]
     TooLarge,
     #[error(
+        "{} is not a regular file (it is a directory, device, pipe or socket); refusing to import it",
+        .0.display()
+    )]
+    EnvNotRegularFile(PathBuf),
+    #[error(".env file {} is too large (the limit is 16 MiB)", .0.display())]
+    EnvTooLarge(PathBuf),
+    #[error("{} is not valid UTF-8", .0.display())]
+    NotUtf8(PathBuf),
+    #[error(
         "{} is not a regular file (it is a directory, device, pipe or socket); refusing to read it as a vault",
         .0.display()
     )]
@@ -81,7 +92,9 @@ pub enum VaultError {
     Dotenv { line: usize, reason: &'static str },
     #[error(transparent)]
     Crypto(#[from] CryptoError),
-    #[error("{action} {path}: {source}")]
+    // The cause is the `source`, not part of this message, so `{:#}` (which
+    // walks the chain) does not print it twice.
+    #[error("{action} {path}")]
     Io {
         action: &'static str,
         path: PathBuf,
@@ -310,10 +323,48 @@ impl Vault {
     }
 }
 
-/// Opens `path` once and reads at most [`MAX_VAULT_LEN`] bytes from it, after
-/// checking on the open handle that it is a regular file.
-fn read_vault_file(path: &Path) -> Result<Vec<u8>, VaultError> {
-    let io_err = |e| VaultError::io("cannot read vault", path, e);
+/// Which kind of file is being opened, for its limits and error messages.
+#[derive(Clone, Copy)]
+enum FileKind {
+    Vault,
+    EnvFile,
+}
+
+impl FileKind {
+    fn limit(self) -> u64 {
+        match self {
+            FileKind::Vault => MAX_VAULT_LEN,
+            FileKind::EnvFile => MAX_ENV_FILE_LEN,
+        }
+    }
+
+    fn io(self, path: &Path, source: io::Error) -> VaultError {
+        let action = match self {
+            FileKind::Vault => "cannot read vault",
+            FileKind::EnvFile => "cannot read",
+        };
+        VaultError::io(action, path, source)
+    }
+
+    fn not_regular(self, path: &Path) -> VaultError {
+        match self {
+            FileKind::Vault => VaultError::NotRegularFile(path.to_path_buf()),
+            FileKind::EnvFile => VaultError::EnvNotRegularFile(path.to_path_buf()),
+        }
+    }
+
+    fn too_large(self, path: &Path) -> VaultError {
+        match self {
+            FileKind::Vault => VaultError::TooLarge,
+            FileKind::EnvFile => VaultError::EnvTooLarge(path.to_path_buf()),
+        }
+    }
+}
+
+/// Opens `path` once and, on the open handle (no check-then-open race),
+/// checks that it is a regular file within the size limit for `kind`.
+/// Returns the handle and its size.
+fn open_regular(path: &Path, kind: FileKind) -> Result<(fs::File, u64), VaultError> {
     let mut opts = fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -325,20 +376,56 @@ fn read_vault_file(path: &Path) -> Result<Vec<u8>, VaultError> {
         // controlling terminal. Both are irrelevant for a regular file.
         opts.custom_flags((OFlags::NONBLOCK | OFlags::NOCTTY).bits() as i32);
     }
-    let file = opts.open(path).map_err(io_err)?;
-    let meta = file.metadata().map_err(io_err)?;
+    let file = opts.open(path).map_err(|e| kind.io(path, e))?;
+    let meta = file.metadata().map_err(|e| kind.io(path, e))?;
     if !meta.is_file() {
-        return Err(VaultError::NotRegularFile(path.to_path_buf()));
+        return Err(kind.not_regular(path));
     }
-    if meta.len() > MAX_VAULT_LEN {
-        return Err(VaultError::TooLarge);
+    if meta.len() > kind.limit() {
+        return Err(kind.too_large(path));
     }
+    Ok((file, meta.len()))
+}
+
+/// Opens `path` once and reads at most [`MAX_VAULT_LEN`] bytes from it, after
+/// checking on the open handle that it is a regular file.
+fn read_vault_file(path: &Path) -> Result<Vec<u8>, VaultError> {
+    let (file, _) = open_regular(path, FileKind::Vault)?;
     // The size above can be stale (a file that grows) or untrue, so the read
     // is bounded independently.
     read_capped(file, MAX_VAULT_LEN).map_err(|e| match e {
         CapError::TooLarge => VaultError::TooLarge,
-        CapError::Io(e) => io_err(e),
+        CapError::Io(e) => FileKind::Vault.io(path, e),
     })
+}
+
+/// Reads a `.env` file for `import`: it must be a regular file (checked on
+/// the open handle, so `/dev/zero`, a FIFO or a directory is refused without
+/// being read) of at most [`MAX_ENV_FILE_LEN`] bytes.
+///
+/// The contents are plaintext secrets, so they are read straight into one
+/// buffer allocated up front for exactly the size seen on the handle (plus
+/// one byte to notice growth) and wiped on drop. Never growing the buffer
+/// means no reallocation, and so no stray, unwiped copy of the file.
+pub fn read_env_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    let (file, len) = open_regular(path, FileKind::EnvFile)?;
+    let cap = usize::try_from(len).map_err(|_| FileKind::EnvFile.too_large(path))?;
+    let mut buf = Zeroizing::new(Vec::with_capacity(cap + 1));
+    (&file)
+        .take(len + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| FileKind::EnvFile.io(path, e))?;
+    if buf.len() > cap {
+        // Grew between fstat and read: refuse rather than reallocate.
+        return Err(FileKind::EnvFile.io(
+            path,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file changed while it was being read",
+            ),
+        ));
+    }
+    Ok(buf)
 }
 
 enum CapError {
@@ -955,6 +1042,48 @@ mod tests {
         assert!(VaultLock::try_acquire(&vault).unwrap().is_none());
         drop(second);
         assert!(VaultLock::try_acquire(&vault).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_fd_is_close_on_exec() {
+        // A command started while a lock is held (or any child of a writer)
+        // must not inherit the lock: it would keep the vault locked after
+        // cloakenv exits.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = VaultLock::acquire(&dir.path().join("vault.bin")).unwrap();
+        let flags = rustix::io::fcntl_getfd(&lock._file).unwrap();
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+    }
+
+    #[test]
+    fn env_file_reads_are_bounded_and_regular_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("a.env");
+        fs::write(&ok, "A=1\n").unwrap();
+        assert_eq!(&**read_env_file(&ok).unwrap(), b"A=1\n");
+        let empty = dir.path().join("empty.env");
+        fs::write(&empty, "").unwrap();
+        assert!(read_env_file(&empty).unwrap().is_empty());
+        assert!(matches!(
+            read_env_file(dir.path()),
+            Err(VaultError::EnvNotRegularFile(_))
+        ));
+        assert!(matches!(
+            read_env_file(&dir.path().join("missing")),
+            Err(VaultError::Io { .. })
+        ));
+        // One byte over the limit is refused from the size alone, one byte
+        // under is read (sparse files keep this cheap).
+        let big = dir.path().join("big.env");
+        let f = fs::File::create(&big).unwrap();
+        f.set_len(MAX_ENV_FILE_LEN + 1).unwrap();
+        assert!(matches!(
+            read_env_file(&big),
+            Err(VaultError::EnvTooLarge(_))
+        ));
+        f.set_len(MAX_ENV_FILE_LEN).unwrap();
+        assert_eq!(read_env_file(&big).unwrap().len() as u64, MAX_ENV_FILE_LEN);
     }
 
     #[test]

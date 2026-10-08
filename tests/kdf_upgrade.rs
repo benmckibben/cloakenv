@@ -196,3 +196,87 @@ fn a_vault_below_the_hard_floor_is_rejected() {
         stderr(&out)
     );
 }
+
+/// The upgrade notice is only true once the new settings are on disk.
+#[test]
+fn a_failed_unset_does_not_claim_an_upgrade() {
+    let env = Env::new();
+    write_vault_with(&env, WEAK, &[("A", "1")]);
+    let before = std::fs::read(env.vault()).unwrap();
+    let out = env.run(&["unset", "NO_SUCH_KEY"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("no such key in vault"), "{err}");
+    assert!(
+        !err.contains("upgraded"),
+        "claimed an upgrade it never saved: {err}"
+    );
+    assert_eq!(
+        std::fs::read(env.vault()).unwrap(),
+        before,
+        "nothing was saved"
+    );
+    assert_eq!(header_params(&env), WEAK);
+}
+
+#[test]
+fn a_failed_set_does_not_claim_an_upgrade() {
+    let env = Env::new();
+    write_vault_with(&env, WEAK, &[("A", "1")]);
+    let before = std::fs::read(env.vault()).unwrap();
+    // A NUL byte cannot live in an environment: refused after the vault was
+    // loaded, before anything is saved.
+    let out = env.run_stdin(&["set", "B"], "a\0b");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("NUL"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("upgraded"), "{}", stderr(&out));
+    assert_eq!(std::fs::read(env.vault()).unwrap(), before);
+}
+
+#[test]
+fn the_upgrade_notice_follows_the_save_it_describes() {
+    let env = Env::new();
+    write_vault_with(&env, WEAK, &[("A", "1"), ("B", "2")]);
+    let out = env.run(&["unset", "A"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    let upgraded = err
+        .find("upgraded the vault's key-derivation settings")
+        .unwrap();
+    let removed = err.find("removed A").unwrap();
+    assert!(upgraded < removed, "{err}");
+    assert_eq!(header_params(&env), KdfParams::DEFAULT);
+}
+
+/// C1 + C14: writers queued on the lock while the first one upgrades a weak
+/// vault all see a consistent vault: no update is lost, the file ends up with
+/// the upgraded settings, and only the writer that actually upgraded says so.
+#[test]
+fn queued_writers_and_a_kdf_upgrade_do_not_lose_updates() {
+    let env = Env::new();
+    write_vault_with(&env, WEAK, &[("OLD", "dummy-old")]);
+    let children: Vec<_> = (0..6)
+        .map(|i| env.spawn_set(&format!("KEY_{i}"), &format!("dummy-{i}")))
+        .collect();
+    let mut notices = 0;
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+        notices += stderr(&out)
+            .matches("upgraded the vault's key-derivation")
+            .count();
+    }
+    assert_eq!(notices, 1, "exactly one writer performs the upgrade");
+    assert_eq!(header_params(&env), KdfParams::DEFAULT);
+    let want: Vec<String> = std::iter::once("OLD".to_owned())
+        .chain((0..6).map(|i| format!("KEY_{i}")))
+        .collect();
+    let mut got: Vec<String> = stdout(&env.ok(&["list"]))
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    got.sort();
+    let mut want = want;
+    want.sort();
+    assert_eq!(got, want);
+}
