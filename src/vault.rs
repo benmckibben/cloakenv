@@ -33,7 +33,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -64,8 +64,13 @@ pub enum VaultError {
     UnsupportedAlgorithm { kdf: u8, aead: u8 },
     #[error("vault file is truncated or malformed")]
     Malformed,
-    #[error("vault file is too large")]
+    #[error("vault file is too large (the limit is 16 MiB)")]
     TooLarge,
+    #[error(
+        "{} is not a regular file (it is a directory, device, pipe or socket); refusing to read it as a vault",
+        .0.display()
+    )]
+    NotRegularFile(PathBuf),
     // The rejected name is deliberately not echoed: a user who swaps the
     // KEY and VALUE arguments would otherwise see their secret in the error.
     #[error("invalid variable name: must match [A-Za-z_][A-Za-z0-9_]*")]
@@ -267,12 +272,15 @@ impl Vault {
     }
 
     /// Reads and decrypts a vault file.
+    ///
+    /// The file is opened once and every check is made on that open handle
+    /// (no check-then-open race): it must be a regular file no larger than
+    /// [`MAX_VAULT_LEN`], and the read itself is capped at that size too.
+    /// Symbolic links are followed. Devices, pipes, sockets and directories
+    /// are refused without being read, so `--vault /dev/zero` or a FIFO fails
+    /// closed instead of exhausting memory or hanging.
     pub fn load(path: &Path, passphrase: &[u8]) -> Result<Self, VaultError> {
-        let meta = fs::metadata(path).map_err(|e| VaultError::io("cannot read vault", path, e))?;
-        if meta.len() > MAX_VAULT_LEN {
-            return Err(VaultError::TooLarge);
-        }
-        let bytes = fs::read(path).map_err(|e| VaultError::io("cannot read vault", path, e))?;
+        let bytes = read_vault_file(path)?;
         Self::open(&bytes, passphrase)
     }
 
@@ -284,6 +292,56 @@ impl Vault {
         let bytes = self.seal(passphrase)?;
         write_atomic_private(path, &bytes)
     }
+}
+
+/// Opens `path` once and reads at most [`MAX_VAULT_LEN`] bytes from it, after
+/// checking on the open handle that it is a regular file.
+fn read_vault_file(path: &Path) -> Result<Vec<u8>, VaultError> {
+    let io_err = |e| VaultError::io("cannot read vault", path, e);
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use rustix::fs::OFlags;
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK: opening a FIFO for reading must not wait for a writer.
+        // O_NOCTTY: opening a terminal device must not make it our
+        // controlling terminal. Both are irrelevant for a regular file.
+        opts.custom_flags((OFlags::NONBLOCK | OFlags::NOCTTY).bits() as i32);
+    }
+    let file = opts.open(path).map_err(io_err)?;
+    let meta = file.metadata().map_err(io_err)?;
+    if !meta.is_file() {
+        return Err(VaultError::NotRegularFile(path.to_path_buf()));
+    }
+    if meta.len() > MAX_VAULT_LEN {
+        return Err(VaultError::TooLarge);
+    }
+    // The size above can be stale (a file that grows) or untrue, so the read
+    // is bounded independently.
+    read_capped(file, MAX_VAULT_LEN).map_err(|e| match e {
+        CapError::TooLarge => VaultError::TooLarge,
+        CapError::Io(e) => io_err(e),
+    })
+}
+
+enum CapError {
+    TooLarge,
+    Io(io::Error),
+}
+
+/// Reads `reader` to the end, failing if it yields more than `max` bytes
+/// (without ever buffering more than `max + 1`).
+fn read_capped(reader: impl Read, max: u64) -> Result<Vec<u8>, CapError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(CapError::Io)?;
+    if bytes.len() as u64 > max {
+        return Err(CapError::TooLarge);
+    }
+    Ok(bytes)
 }
 
 fn encode_header(
@@ -627,6 +685,24 @@ fn trailing_ok(rest: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_is_capped_even_for_an_endless_stream() {
+        // An endless reader (what /dev/zero would be) stops at max + 1 bytes.
+        assert!(matches!(
+            read_capped(io::repeat(0), 1000),
+            Err(CapError::TooLarge)
+        ));
+        assert_eq!(
+            read_capped(&[7u8; 1000][..], 1000).ok().unwrap().len(),
+            1000
+        );
+        assert!(matches!(
+            read_capped(&[7u8; 1001][..], 1000),
+            Err(CapError::TooLarge)
+        ));
+        assert!(read_capped(io::empty(), 1000).ok().unwrap().is_empty());
+    }
 
     #[test]
     fn key_validation() {

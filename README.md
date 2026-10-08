@@ -107,6 +107,19 @@ New vaults use 64 MiB / 3 passes / 1 lane, well inside the limit. There is no
 flag or variable to raise it. It only matters if you created a vault through
 the library API with stronger-than-default settings above the cap.
 
+The vault path must also be an ordinary file of at most 16 MiB. cloakenv opens
+it once, checks the open handle (not the path) and reads with a hard size cap,
+so `--vault /dev/zero`, a FIFO, a directory or a huge file is refused
+immediately (exit 125 for `run`, nothing spawned) instead of exhausting memory
+or hanging:
+
+```
+cloakenv: error: /dev/zero is not a regular file (it is a directory, device, pipe or socket); refusing to read it as a vault
+cloakenv: error: vault file is too large (the limit is 16 MiB)
+```
+
+A symbolic link to a regular file keeps working (with the warning above).
+
 ## Exit codes
 
 | situation                                      | code          |

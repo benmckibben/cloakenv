@@ -75,6 +75,15 @@ the atomic rename already guarantees they see a complete vault. Passphrase and
 value prompts happen *before* the lock is taken, so an idle prompt never
 blocks other writers. `flock` is Unix only; elsewhere the lock is a no-op.
 
+**Reading the vault is bounded.** `Vault::load` opens the path once
+(`O_NONBLOCK | O_NOCTTY` on Unix, so opening a FIFO or terminal cannot block
+or steal a controlling terminal), runs `fstat` on the *open handle*, and
+refuses anything that is not a regular file or is larger than 16 MiB before
+reading a byte; the read itself is additionally capped at 16 MiB + 1 byte, so a
+file that grows or lies about its size cannot cause unbounded allocation.
+Symlinks are followed (and warned about); a symlink to `/dev/zero` is refused
+because the check is on what it resolves to.
+
 **Permission checks (Unix, advisory).** When a command opens the vault,
 `src/perms.rs` warns on stderr if the vault directory is group/world-writable,
 the vault file is group/world-readable or writable, either is a symlink, or
