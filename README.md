@@ -39,9 +39,26 @@ Both variables are always stripped from the child's environment, and
 On Linux, cloakenv also marks itself non-dumpable at startup
 (`prctl(PR_SET_DUMPABLE, 0)`), so neither the commands it runs nor other
 processes of your user can read the passphrase out of `/proc/<pid>/environ`,
-inspect its memory, or write around `--shield` via `/proc/<pid>/fd`; it never
-leaves a core dump. This is **Linux only**; see [Platform support](#platform-support)
+inspect its memory (`ptrace`, `/proc/<pid>/mem`), or write around `--shield`
+via `/proc/<pid>/fd`; it never leaves a core dump. On every Unix (Linux and
+macOS) it additionally lowers its own soft core-file size limit to 0, which
+also covers systems with `fs.suid_dumpable=2` (where the kernel would
+otherwise write a root-readable core for a non-dumpable process) and macOS,
+which has no dumpable flag; the command you run gets its original limit back.
+The dumpable flag is **Linux only**; see [Platform support](#platform-support)
 for what that means on macOS.
+
+These protections last for as long as cloakenv exists. Without `--shield`
+that is only until it starts your command, because `cloakenv run` then
+*replaces itself* with the command (see [How `run` starts your
+command](#how-run-starts-your-command)); the passphrase is gone from memory
+and from the process's environment at that moment. The one unprotected window
+is the instant between the kernel starting the cloakenv process and its first
+instructions setting the flag: a same-user process that polls `/proc` fast
+enough could read `CLOAKENV_PASSPHRASE` from a freshly started cloakenv, so
+if your threat model includes that, use the interactive prompt or a
+`CLOAKENV_PASSPHRASE_FILE` rather than the variable (an exported variable is
+also readable in your shell's own environment).
 
 If the passphrase file is readable or writable by group or others, cloakenv
 warns (see [Permission warnings](#permission-warnings)) but still uses it.
@@ -54,7 +71,14 @@ with mode `0600`, inside a `0700` directory if cloakenv has to create it (an
 existing directory is left as it is). Commands that modify the vault
 serialise on an advisory lock file next to it (`.cloak/.vault.bin.lock`), so
 concurrent `cloakenv set` calls never lose updates (Unix only; see
-[Platform support](#platform-support)).
+[Platform support](#platform-support)). A writer holds the lock for its whole
+load-modify-save cycle, which includes two key derivations (a fraction of a
+second each at the default settings), so simultaneous writers queue up (the
+ones that have to wait say so on stderr); reads (`list`, `run`) never take it
+and always see a complete vault. The lock dies with its process, so a killed
+writer cannot leave it stuck. On a filesystem where `flock` does not work (an
+NFS mount without lock support, say) writers refuse to run with `cannot lock
+vault <path>: <OS error>` rather than go ahead unprotected.
 
 ### Keeping the vault out of git
 
@@ -131,6 +155,19 @@ cloakenv: upgraded the vault's key-derivation settings from memory 8192 KiB, ite
 
 A header below 8 MiB / 1 pass / 1 lane is rejected as unsupported.
 
+### Importing a `.env` file
+
+`cloakenv import <file>` reads the file the same careful way: it opens it once
+and checks the open handle, refuses anything that is not a regular file (a
+directory, `/dev/zero`, a FIFO, a socket) and anything over 16 MiB, and reads
+into a single buffer that is wiped afterwards. Symbolic links to regular files
+keep working. Invalid UTF-8 is refused without echoing any of it.
+
+```
+cloakenv: error: /dev/zero is not a regular file (it is a directory, device, pipe or socket); refusing to import it
+cloakenv: error: .env file big.env is too large (the limit is 16 MiB)
+```
+
 ### Reading the vault
 
 The vault path must also be an ordinary file of at most 16 MiB. cloakenv opens
@@ -146,12 +183,82 @@ cloakenv: error: vault file is too large (the limit is 16 MiB)
 
 A symbolic link to a regular file keeps working (with the warning above).
 
+## How `run` starts your command
+
+**Without `--shield` (Unix): cloakenv replaces itself with the command**
+(`execve`). After the vault is decrypted, the passphrase and every decrypted
+value are wiped from cloakenv's memory, the command's environment is built
+(the vault's entries, minus `CLOAKENV_PASSPHRASE` and
+`CLOAKENV_PASSPHRASE_FILE`), and the process image is swapped. There is no
+cloakenv process left, so:
+
+- the command keeps cloakenv's process id, its parent is whatever started
+  cloakenv, and `ps` shows the command, not cloakenv;
+- signals (`kill`, Ctrl-C, `docker stop`, a service manager) reach the command
+  directly; nothing can be orphaned;
+- the exit status is the command's own: a normal exit code, or, if it is killed
+  by a signal, the signal death itself (a shell reports it as `128 + N`, a
+  program using `waitpid` sees `WIFSIGNALED`, which is not an exit code);
+- stdin, stdout, stderr, the controlling terminal, the working directory and
+  open descriptors are inherited unchanged (cloakenv opens nothing that survives
+  the exec: the vault, passphrase file and lock file are all close-on-exec or
+  closed);
+- cloakenv's environment block, with the passphrase in it, no longer exists
+  anywhere: there is nothing left for another process to read, however it asks.
+
+Nothing about the command's own exposure changes: its environment holds the
+vault's secrets by design, and the kernel resets the dumpable flag on `exec`,
+so `/proc/<pid>/environ` of your command is readable by other processes of
+your user (and by root), exactly as it was when cloakenv was its parent. It
+holds no passphrase. If that matters, don't put the secret in an environment
+variable the command can't be trusted with. Failures to start the command are
+reported by cloakenv before it is gone, with the same exit codes and messages
+as always: 127 `command not found`, 126 `permission denied`, 125 anything
+else; a failed exec leaves no secret in the message.
+
+**With `--shield` (Unix): cloakenv stays the parent**, because it has to
+filter the output. It then
+
+- **forwards `SIGTERM`, `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGUSR1` and `SIGUSR2`** to
+  the command and keeps waiting, so `kill <cloakenv>`, `docker stop` etc. stop
+  the command instead of orphaning it, and cloakenv exits with the command's
+  status, `128 + N` if the signal killed it (a command that catches the signal
+  and exits 0 gives 0). A signal that arrives while the command is starting is
+  delivered as soon as it exists, and one that arrives after it exited is
+  dropped, never sent to a recycled pid. A signal that was *ignored* when
+  cloakenv started (`nohup`, a background job of a non-interactive shell) stays
+  ignored for the command too;
+- on Linux, has the kernel kill the command (`SIGKILL`, `PR_SET_PDEATHSIG`) if
+  cloakenv itself dies, including by `SIGKILL` or the OOM killer, which cannot
+  be forwarded. This covers the command's own process only, not processes it
+  spawned. On macOS there is no equivalent: if cloakenv is killed with
+  `SIGKILL` the command keeps running (its next write to the closed output pipe
+  ends it with `SIGPIPE`, if it ever writes);
+- delivers a Ctrl-C **twice** to the command at a terminal: the terminal sends
+  `SIGINT` to the whole foreground process group (cloakenv and the command), and
+  cloakenv forwards its copy as well. Telling the two apart needs the signal's
+  sender, which cloakenv has no portable way to see, and dropping the forwarded
+  copy would swallow a `kill -INT` aimed at cloakenv alone. Programs that treat
+  a second Ctrl-C as "abort now" will abort;
+- ends its output pumps shortly after the command exits even if a leftover
+  background process still holds the output pipes open (`cmd &`, a daemon):
+  it keeps draining until the pipes have been quiet for 250 ms or 3 seconds
+  have passed (time spent blocked on its own stdout does not count), flushes
+  what it has and exits with the command's status. Leftover processes are not
+  killed; they lose their output pipe and get `SIGPIPE` on their next write.
+  Before this change a leftover held cloakenv (and so, say, a CI step) up for as
+  long as it lived.
+
+Windows is unsupported: there `run` is a plain spawn-and-wait with none of the
+above.
+
 ## Exit codes
 
 | situation                                      | code          |
 |------------------------------------------------|---------------|
-| `run`: child exited normally                   | child's code  |
-| `run`: child killed by signal N                | 128 + N       |
+| `run`: command exited normally                 | command's code |
+| `run --shield`: command killed by signal N     | 128 + N       |
+| `run` (no shield): command killed by signal N  | the signal death itself (shells show `128 + N`) |
 | `run`: vault/passphrase/shield failure         | 125           |
 | `run`: command not executable / not found      | 126 / 127     |
 | other subcommands: any failure                 | 1             |
@@ -202,6 +309,10 @@ What it does **not** catch:
   ```
 
   Redaction itself is unchanged and still applies to such values.
+- **Output after the command has exited.** Once the command itself is gone,
+  `--shield` stops waiting for background processes that kept the pipes open
+  (see [How `run` starts your command](#how-run-starts-your-command)): what
+  they print after the grace period is not shown at all, filtered or not.
 - **A partial secret at the end of the output.** To match across chunk
   boundaries the filter holds back the last (longest secret − 1) bytes of each
   stream. If the stream ends in the middle of what *would* have been a match
@@ -226,11 +337,18 @@ Several protections described above are implemented with Unix-only APIs
   cloakenv creates;
 - the directory `fsync` after the atomic rename (durability across power loss);
 - the advisory `flock` that serialises concurrent writers;
+- replacing cloakenv with the command (`exec`) without `--shield`, and signal
+  forwarding with it (neither exists on Windows);
 - the permission warnings (symlink warnings do apply);
 - `128 + N` exit codes for a child killed by a signal.
 
 On Windows, cloakenv would use default inherited ACLs, would not prevent
 concurrent `set` calls from losing updates, and has not been checked at all.
+
+**`PR_SET_DUMPABLE` and `PR_SET_PDEATHSIG` are Linux only.** `exec` without
+`--shield`, signal forwarding with it and the zero core-file limit work the same
+on macOS; killing cloakenv with `SIGKILL` under `--shield` leaves the command
+running there (see above).
 
 **`PR_SET_DUMPABLE` is Linux only.** The hardening that keeps same-user
 processes from reading cloakenv's `/proc/<pid>/environ`, memory and file
