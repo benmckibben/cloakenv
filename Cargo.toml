@@ -6,12 +6,25 @@ rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 description = "Lightweight encrypted local secret vault and zero-leak process injection engine"
 repository = "https://github.com/benmckibben/cloakenv"
+documentation = "https://github.com/benmckibben/cloakenv#readme"
 readme = "README.md"
 keywords = ["secrets", "security", "vault", "env", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-# Explicit allow-list: keeps local agent persona symlinks and other workspace
-# files out of the published crate.
-include = ["/src", "/tests", "/docs", "/README.md", "/LICENSE*", "/Cargo.toml", "/Cargo.lock"]
+# Only what is needed to build, test and understand the crate. Every pattern is
+# anchored to the package root ("/..."), so nested files with the same name
+# (a README or LICENSE in a subdirectory, say) never match. Check the result
+# with `cargo package --list --locked`.
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/docs/*.md",
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+]
 
 [lib]
 name = "cloakenv"

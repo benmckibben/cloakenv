@@ -9,11 +9,26 @@ child's stdout/stderr are streamed through a redactor that replaces any secret
 value with `[REDACTED_BY_CLOAKENV]`, so credentials don't end up in AI agent
 transcripts, CI logs or terminal scrollback.
 
+## Install
+
+cloakenv has no release yet: build it from source (Rust 1.87 or newer; Linux or
+macOS, see [Platform support](#platform-support)).
+
+```sh
+git clone https://github.com/benmckibben/cloakenv
+cd cloakenv
+cargo install --path . --locked    # installs `cloakenv` into ~/.cargo/bin
+# or: cargo build --release --locked   # binary at target/release/cloakenv
+```
+
+The name `cloakenv` on crates.io is reserved by a placeholder (version `0.0.0`)
+that contains no functionality, so `cargo install cloakenv` does **not** give you
+this program. Release archives are built by CI but nothing is published yet; see
+[CONTRIBUTING.md](CONTRIBUTING.md#releasing-maintainer).
+
 ## Quick start
 
 ```sh
-cargo install --path .
-
 cloakenv init                          # prompts for a passphrase
 cloakenv set DATABASE_URL              # value read from a hidden prompt
 pass show api | cloakenv set API_KEY   # ...or piped on stdin (never as an argument)
@@ -25,6 +40,22 @@ cloakenv run --shield -- ./debug.sh    # ...and redacted from its output
 ```
 
 What this does and does not protect against is in the [Threat model](#threat-model).
+
+## Commands
+
+| command | what it does |
+|---------|--------------|
+| `cloakenv init [--force]` | create an empty vault; refuses to overwrite an existing one unless `--force` (which erases its contents) |
+| `cloakenv set KEY` | store or replace one value, from a hidden prompt or stdin (never from the command line) |
+| `cloakenv unset KEY` | remove one entry (an error if there is no such key) |
+| `cloakenv import FILE` | add or replace the entries of a `.env` file, see [Importing a `.env` file](#importing-a-env-file) |
+| `cloakenv list` | print the names, one per line, never the values |
+| `cloakenv run [--shield] -- COMMAND [ARGS...]` | run a command with the vault in its environment |
+
+Every command takes `--vault <path>` (or `CLOAKENV_VAULT`), see
+[Vault location](#vault-location); `--help` and `--version` work everywhere.
+Variable names must match `[A-Za-z_][A-Za-z0-9_]*`; `CLOAKENV_PASSPHRASE` and
+`CLOAKENV_PASSPHRASE_FILE` are reserved. Exit codes are in [Exit codes](#exit-codes).
 
 ## Values you store
 
@@ -209,6 +240,13 @@ A header below 8 MiB / 1 pass / 1 lane is rejected as unsupported.
 
 ### Importing a `.env` file
 
+The syntax is blank lines, `# comments`, an optional `export ` prefix, `KEY=value`
+(an unquoted value ends at the first trailing ` #` comment), `KEY='literal'` and
+`KEY="text"` with the escapes `\n \r \t \\ \"`. Multi-line values are not supported. A
+line that does not parse stops the import with its line number (never its
+content) and nothing is imported; existing entries with the same name are
+overwritten.
+
 `cloakenv import <file>` reads the file the same careful way: it opens it once
 and checks the open handle, refuses anything that is not a regular file (a
 directory, `/dev/zero`, a FIFO, a socket) and anything over 16 MiB, and reads
@@ -383,7 +421,7 @@ What it does **not** catch:
   held-back prefix is flushed as is, in clear.
 
 These are known limitations, documented here rather than fixed in this
-release; see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#--shield-streaming-redaction).
+version; see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#--shield-streaming-redaction).
 
 ## Platform support
 
@@ -495,6 +533,12 @@ the sections it links to and in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the vault format,
 cryptography, memory hygiene and the precise guarantees (and non-guarantees) of
 `--shield`.
+
+## Security, contributing, changes
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md). To build, test or
+contribute, see [CONTRIBUTING.md](CONTRIBUTING.md). What changed is in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
