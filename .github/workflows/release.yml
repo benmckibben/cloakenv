@@ -216,7 +216,9 @@ jobs:
           done
 
           # Belt and braces: look inside the packaged files for things that
-          # shouldn't ship (local paths, agent tooling, credentials).
+          # shouldn't ship (local paths, agent tooling, credentials). The token
+          # patterns need a realistic length: the tests deliberately contain
+          # dummy secrets shaped like tokens but cut short (ghp_ta…ue42).
           version=$(cargo metadata --no-deps --locked --format-version 1 \
             | jq -r '.packages[] | select(.name == "cloakenv") | .version')
           crate="target/package/cloakenv-$version.crate"
@@ -224,7 +226,7 @@ jobs:
           sha256sum "$crate"
           mkdir unpacked
           tar -xzf "$crate" -C unpacked
-          if grep -rInE '/home/|/Users/|openclaw|ghp_[A-Za-z0-9]|github_pat_|gh[osu]_[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|CARGO_REGISTRY_TOKEN|cio[A-Za-z0-9]{30}' unpacked; then
+          if grep -rInE '/home/|/Users/|openclaw|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|CARGO_REGISTRY_TOKEN|cio[A-Za-z0-9]{30}' unpacked; then
             echo "::error::the package contains something that looks like a local path, agent file or credential (see above)"
             exit 1
           fi
