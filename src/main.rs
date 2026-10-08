@@ -162,6 +162,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 return Err(VaultError::InvalidKey.into());
             }
             refuse_reserved(&key)?;
+            // No vault, no prompts and no lock file or directory created.
+            require_vault(path)?;
             let pass = passphrase(false)?;
             // Gather input before taking the lock so a pending prompt never
             // blocks other writers.
@@ -173,6 +175,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             eprintln!("cloakenv: set {key}");
         }
         Cmd::Unset { key } => {
+            require_vault(path)?;
             let pass = passphrase(false)?;
             let _lock = lock(path)?;
             let mut update = load_for_update(path, &pass)?;
@@ -184,6 +187,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             eprintln!("cloakenv: removed {key}");
         }
         Cmd::Import { file } => {
+            require_vault(path)?;
             // Regular files only, at most 16 MiB, read into a buffer that is
             // wiped on drop (and never reallocated, so no stray copy stays
             // behind).
@@ -395,13 +399,21 @@ fn load_for_update(path: &Path, pass: &Zeroizing<String>) -> Result<Update> {
     })
 }
 
-fn load_raw(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
+/// Fails with the usual "no vault" error if there is no vault yet, before
+/// anything is prompted for or created (taking the write lock creates the
+/// vault directory and a lock file).
+fn require_vault(path: &Path) -> Result<()> {
     if !path.exists() {
         bail!(
             "no vault found at {} (run `cloakenv init` first)",
             path.display()
         );
     }
+    Ok(())
+}
+
+fn load_raw(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
+    require_vault(path)?;
     // Advisory only; goes to our own stderr before anything is decrypted or
     // spawned, so it can never end up inside a shielded child stream.
     perms::emit(&perms::vault_warnings(path, true));

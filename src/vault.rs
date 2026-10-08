@@ -92,7 +92,9 @@ pub enum VaultError {
     Dotenv { line: usize, reason: &'static str },
     #[error(transparent)]
     Crypto(#[from] CryptoError),
-    #[error("{action} {path}: {source}")]
+    // The cause is the `source`, not part of this message, so `{:#}` (which
+    // walks the chain) does not print it twice.
+    #[error("{action} {path}")]
     Io {
         action: &'static str,
         path: PathBuf,
