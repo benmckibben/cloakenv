@@ -254,6 +254,56 @@ described here:
   and, for `set`, a refused VALUE (which is already in the kernel's
   `/proc/<pid>/cmdline` by then): no secret is ever read from argv by design.
 
+## Rollback and replacement (limit, with a design proposal)
+
+**What is true today.** Every vault file is authenticated (header as AAD plus
+the AEAD tag), so nobody can *forge* or edit one without the passphrase. But a
+valid file is not tied to a point in time. Anyone who can write the vault's
+directory can put an **older valid vault** back (a copy they took earlier, a
+backup, an old git commit): values that were rotated come back as their old
+(possibly leaked) versions, removed keys reappear, and nothing complains. The
+same goes for swapping in any vault made with the same passphrase. `run` cannot
+notice without a record of what it has seen before, and cloakenv keeps no state
+outside the vault. This is documented in the README threat model as a limit; the
+mitigations that do work today are filesystem permissions (a private vault
+directory, which cloakenv warns about), and not storing the vault where an
+attacker can write.
+
+**Proposal (not implemented; needs a format version bump).** A monotonic,
+authenticated generation counter:
+
+1. *Counter.* A `u64 generation` in the vault, increased by one on every
+   save (under the write lock, so concurrent writers cannot repeat a value).
+   It must be authenticated: either in the header (which is AAD) or at the start
+   of the encrypted payload. The v1 header has no room (byte 11 is reserved and
+   must be zero; the payload decoder rejects trailing data), so this is a
+   **version 2** format. Old binaries refuse version 2 with the existing
+   "unsupported vault format version" error (fail closed, no mis-parse); new
+   binaries read version 1 as generation 0 and write version 2, so migration is
+   automatic but one-way (a downgrade needs the new binary to export). It is
+   deliberately not part of this change for that reason.
+2. *High-water mark.* A counter inside the file proves nothing on its own: the
+   attacker restores a file with a smaller number and it is perfectly valid. The
+   check needs a place the attacker cannot write: a small state file outside the
+   vault directory, e.g. `$XDG_STATE_HOME/cloakenv/<hash of the canonical vault
+   path>` (0600), holding the highest generation this machine has seen.
+   Every command that opens the vault compares: a smaller generation is
+   refused with a clear error (fail closed, nothing spawned), unless the user
+   explicitly accepts it (`cloakenv accept-rollback`, after restoring a backup on
+   purpose); an equal or larger one raises the mark.
+3. *Limits that stay.* An attacker who can write the state file too (the same
+   user, on the same account) defeats it, so it protects against attackers
+   confined to the vault directory or its transport (a shared volume, a sync
+   service, a restored backup, a repository), not against code running as you.
+   A new machine or a fresh clone has no mark (trust on first use). Losing the
+   state file silently re-opens the hole. Two machines syncing one vault would
+   trip the check on every hand-over and need the explicit accept.
+4. *Cost/benefit.* About 100 lines, one format bump, one new file location, and
+   a recovery path to design and test. The benefit exists only for a narrow
+   attacker. Recommendation: do not build it before the format is revisited for
+   another reason (a passphrase-change command also needs a new header), and
+   keep the limit documented.
+
 ## Invariants and how they are enforced
 
 1. **Zero plaintext on disk.** Decryption happens into memory; secrets reach

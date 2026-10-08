@@ -24,6 +24,10 @@ use cloakenv::{diag, elog};
 ///
 /// The vault passphrase is read from $CLOAKENV_PASSPHRASE, else from the file
 /// named by $CLOAKENV_PASSPHRASE_FILE, else prompted for on the terminal.
+// `Debug` is derived here only because `Cmd`'s is written by hand and shows
+// no argument that could be a secret. Keep it that way: do not add a field of
+// a type with a revealing `Debug` (`String`, `OsString`, `Zeroizing<_>` all
+// print their contents) to this struct without redacting it.
 #[derive(Debug, Parser)]
 #[command(name = "cloakenv", version, about, long_about)]
 struct Cli {
@@ -40,7 +44,7 @@ struct Cli {
     command: Cmd,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Cmd {
     /// Create a new, empty encrypted vault.
     Init {
@@ -86,6 +90,36 @@ enum Cmd {
         #[arg(required = true, trailing_var_arg = true, value_name = "COMMAND")]
         command: Vec<OsString>,
     },
+}
+
+/// `Debug` for the parsed command line that never shows an argument: a
+/// misplaced secret ends up in `Set`'s refused VALUE (or in KEY, if the two
+/// are swapped), and anything after `run --` is typed by the user, so none of
+/// it may reach a debug trace, panic message or log. Only structure is shown:
+/// which subcommand, flags, whether a value was present, how many arguments.
+impl std::fmt::Debug for Cmd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const REDACTED: &str = "[REDACTED]";
+        match self {
+            Cmd::Init { force } => f.debug_struct("Init").field("force", force).finish(),
+            Cmd::Set { key: _, value } => f
+                .debug_struct("Set")
+                .field("key", &REDACTED)
+                .field("value", &value.as_ref().map(|_| REDACTED))
+                .finish(),
+            Cmd::Unset { key: _ } => f.debug_struct("Unset").field("key", &REDACTED).finish(),
+            Cmd::Import { file: _ } => f.debug_struct("Import").field("file", &REDACTED).finish(),
+            Cmd::List => f.write_str("List"),
+            Cmd::Run { shield, command } => f
+                .debug_struct("Run")
+                .field("shield", shield)
+                .field(
+                    "command",
+                    &format_args!("[{} argument(s) hidden]", command.len()),
+                )
+                .finish(),
+        }
+    }
 }
 
 /// Exit code for cloakenv's own failures under `run` (as in env(1), docker run),
@@ -540,4 +574,55 @@ fn read_value(key: &str) -> Result<Zeroizing<String>> {
         bail!(TOO_LARGE);
     }
     input::into_text(bytes).map_err(|_| anyhow!(NOT_UTF8))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "sk-live-DEBUG-LEAK-CHECK-0123456789";
+
+    fn parse(args: &[&str]) -> Cli {
+        let mut full = vec!["cloakenv"];
+        full.extend_from_slice(args);
+        Cli::try_parse_from(full).expect("valid command line")
+    }
+
+    /// Whatever shape a misplaced secret takes, the parsed command line's
+    /// Debug output (plain and pretty) never contains it.
+    #[test]
+    fn debug_of_the_parsed_command_line_never_shows_arguments() {
+        for args in [
+            vec!["set", "API_KEY", SECRET], // the refused VALUE
+            vec!["set", SECRET],            // key position
+            vec!["set", SECRET, "API_KEY"], // swapped
+            vec!["unset", SECRET],
+            vec!["import", SECRET],
+            vec!["run", "--", "cmd", "--token", SECRET],
+            vec!["run", "--shield", "--", SECRET],
+            vec!["init", "--force"],
+            vec!["list"],
+        ] {
+            let cli = parse(&args);
+            for shown in [format!("{cli:?}"), format!("{cli:#?}")] {
+                assert!(!shown.contains(SECRET), "{args:?}: {shown}");
+                assert!(!shown.contains("API_KEY"), "{args:?}: {shown}");
+                assert!(!shown.contains("DEBUG-LEAK"), "{args:?}: {shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn debug_still_says_what_was_asked() {
+        let shown = format!("{:?}", parse(&["set", "K", SECRET]));
+        assert!(
+            shown.contains("Set") && shown.contains("[REDACTED]"),
+            "{shown}"
+        );
+        assert_eq!(
+            format!("{:?}", parse(&["run", "--shield", "--", "a", "b"]).command),
+            "Run { shield: true, command: [2 argument(s) hidden] }"
+        );
+        assert_eq!(format!("{:?}", parse(&["list"]).command), "List");
+    }
 }
