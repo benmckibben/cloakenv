@@ -64,11 +64,9 @@ fn wrong_passphrase_is_rejected() {
 fn wrong_passphrase_does_not_modify_vault_on_set() {
     let env = seeded();
     let before = std::fs::read(env.vault()).unwrap();
-    let out = env
-        .cmd(Some("nope"))
-        .args(["set", "OTHER", "x"])
-        .output()
-        .unwrap();
+    let mut cmd = env.cmd(Some("nope"));
+    cmd.args(["set", "OTHER"]);
+    let out = Env::output_with_stdin(cmd, "x");
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(std::fs::read(env.vault()).unwrap(), before);
 }

@@ -35,12 +35,7 @@ fn concurrent_sets_do_not_lose_writes() {
     // read and its write, so without locking most of these updates would be
     // overwritten by a sibling that read the vault earlier.
     let children: Vec<Child> = (0..WRITERS)
-        .map(|i| {
-            env.cmd(Some(PASS))
-                .args(["set", &format!("KEY_{i}"), &format!("value-{i}")])
-                .spawn()
-                .unwrap()
-        })
+        .map(|i| env.spawn_set(&format!("KEY_{i}"), &format!("value-{i}")))
         .collect();
     wait_all(children);
 
@@ -69,10 +64,7 @@ fn concurrent_set_and_unset_are_serialised() {
                     .args(["unset", &format!("OLD_{i}")])
                     .spawn()
                     .unwrap(),
-                env.cmd(Some(PASS))
-                    .args(["set", &format!("NEW_{i}"), "y"])
-                    .spawn()
-                    .unwrap(),
+                env.spawn_set(&format!("NEW_{i}"), "y"),
             ]
         })
         .collect();

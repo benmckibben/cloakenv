@@ -1,8 +1,9 @@
 //! Shared helpers for the CLI integration tests.
 #![allow(dead_code)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 use tempfile::TempDir;
 
@@ -68,8 +69,59 @@ impl Env {
         out
     }
 
+    /// Runs `cmd` with `input` written to its stdin.
+    pub fn output_with_stdin(mut cmd: Command, input: &str) -> Output {
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cloakenv");
+        feed(&mut child, input);
+        child.wait_with_output().unwrap()
+    }
+
+    /// Runs cloakenv (with the test passphrase) feeding `input` on stdin.
+    pub fn run_stdin(&self, args: &[&str], input: &str) -> Output {
+        let mut cmd = self.cmd(Some(PASS));
+        cmd.args(args);
+        Self::output_with_stdin(cmd, input)
+    }
+
+    /// Starts `cloakenv set KEY` with the value piped on stdin (the only
+    /// non-interactive way to pass it) without waiting for it.
+    pub fn spawn_set(&self, key: &str, value: &str) -> Child {
+        let mut child = self
+            .cmd(Some(PASS))
+            .args(["set", key])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cloakenv");
+        feed(&mut child, value);
+        child
+    }
+
     pub fn set(&self, key: &str, value: &str) {
-        self.ok(&["set", key, value]);
+        let out = self.run_stdin(&["set", key], value);
+        assert!(
+            out.status.success(),
+            "cloakenv set {key} failed: {}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// Writes `input` to the child's stdin and closes it. A child that fails
+/// before reading stdin (e.g. a refused key) closes the pipe first; that
+/// broken pipe is expected and ignored.
+fn feed(child: &mut Child, input: &str) {
+    let mut stdin = child.stdin.take().unwrap();
+    match stdin.write_all(input.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        other => other.unwrap(),
     }
 }
 

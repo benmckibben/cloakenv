@@ -70,9 +70,18 @@ blocks other writers.
    truncation, appended data and foreign files all exit 125 without spawning
    (tests use a marker-file child to prove it was never started).
 4. **Streaming redaction.** See below.
-5. **No secret bleed in errors.** Error types carry no values. Invalid variable
-   names are not echoed (a swapped `set VALUE KEY` would otherwise print the
-   secret), and `.env` parse errors report the line number only.
+5. **No secret bleed in errors or argv.** Error types carry no values. Invalid
+   variable names are not echoed (a swapped `set VALUE KEY` would otherwise
+   print the secret), and `.env` parse errors report the line number only.
+   `set` never takes the value as an argument (where `ps`,
+   `/proc/<pid>/cmdline` and shell history would see it): it is read from a
+   hidden prompt or stdin, and a stray VALUE argument is refused — without
+   repeating it — before anything is written. Command-line parse errors are
+   rendered by cloakenv rather than clap, keeping only the error kind, the
+   names of missing arguments, "did you mean" hints drawn from our own
+   argument names, and the usage line; clap's default messages quote the
+   offending token. Tests feed secrets through every common misuse and check
+   that no quoted fragment of them comes back.
 6. **No same-user introspection (Linux).** Right after argument parsing, and
    before the passphrase is read or anything is decrypted or spawned,
    `cloakenv` calls `prctl(PR_SET_DUMPABLE, 0)` (fatal if it fails). The

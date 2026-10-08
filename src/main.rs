@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::Zeroizing;
 
-use cloakenv::vault::{Vault, VaultLock, parse_dotenv};
+use cloakenv::vault::{Vault, VaultError, VaultLock, is_valid_key, parse_dotenv};
 use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, hardening, is_reserved_key, runner};
 
 /// Lightweight encrypted local secret vault and zero-leak process injection engine.
@@ -40,13 +41,22 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Store a secret. If VALUE is omitted it is read from stdin (hidden
-    /// prompt on a terminal), which keeps it out of shell history and ps.
+    /// Store a secret, read from a hidden prompt or stdin (never from argv).
+    ///
+    /// The value is read from a hidden prompt on a terminal, otherwise from
+    /// stdin (one trailing newline is stripped). It is never accepted as an
+    /// argument, where ps(1), /proc and shell history would see it.
+    #[command(
+        after_help = "Examples:\n  cloakenv set API_KEY                       # hidden prompt\n  pass show api-key | cloakenv set API_KEY   # from another tool"
+    )]
     Set {
         /// Environment variable name.
         key: String,
-        /// Secret value.
-        value: Option<String>,
+        /// Not accepted: secret values on the command line are visible to
+        /// other processes. Kept (hidden) only to refuse it with a clear
+        /// error that does not repeat the value.
+        #[arg(hide = true, value_name = "VALUE")]
+        value: Option<OsString>,
     },
     /// Remove a secret.
     Unset {
@@ -66,12 +76,7 @@ enum Cmd {
         #[arg(long)]
         shield: bool,
         /// Command and arguments, e.g. `-- npm start`.
-        #[arg(
-            required = true,
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "COMMAND"
-        )]
+        #[arg(required = true, trailing_var_arg = true, value_name = "COMMAND")]
         command: Vec<OsString>,
     },
 }
@@ -80,8 +85,14 @@ enum Cmd {
 /// so they are distinguishable from the child's exit codes.
 const RUN_FAILURE: u8 = 125;
 
+/// Exit code for command-line usage errors (as clap uses by default).
+const USAGE_FAILURE: u8 = 2;
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => return usage_error(&err),
+    };
     let is_run = matches!(cli.command, Cmd::Run { .. });
     let failure = ExitCode::from(if is_run { RUN_FAILURE } else { 1 });
     // Before reading the passphrase, decrypting anything or spawning a child:
@@ -122,14 +133,23 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             eprintln!("cloakenv: initialized vault at {}", path.display());
         }
         Cmd::Set { key, value } => {
+            if value.is_some() {
+                // Neither the value nor the key is echoed: the arguments may
+                // be swapped. Nothing is written.
+                bail!(
+                    "refusing to read a secret value from the command line, where other processes (ps, /proc/<pid>/cmdline) and shell history can see it; nothing was stored. Run `cloakenv set KEY` and enter the value at the hidden prompt, or pipe it on stdin. If the value was a real secret, consider rotating it"
+                );
+            }
+            // Validate before any prompt, so a mistyped (or swapped) key never
+            // costs the user their typed secret.
+            if !is_valid_key(&key) {
+                return Err(VaultError::InvalidKey.into());
+            }
             refuse_reserved(&key)?;
             let pass = passphrase(false)?;
             // Gather input before taking the lock so a pending prompt never
             // blocks other writers.
-            let value = match value {
-                Some(v) => Zeroizing::new(v),
-                None => read_value(&key)?,
-            };
+            let value = read_value(&key)?;
             let _lock = lock(path)?;
             let mut vault = load(path, &pass)?;
             vault.set(&key, value)?;
@@ -185,6 +205,62 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Reports a command-line parse error *without* echoing any argument.
+///
+/// clap's own messages quote the offending token (`unexpected argument
+/// 'sk-live-…' found`, `unexpected value '…' for '--force'`, `to pass '-x' as a
+/// value, use '-- -x'`), which would put a misplaced secret on stderr and into
+/// CI logs. We print only the error kind, the names of required arguments,
+/// suggestions drawn from our own argument names, and the usage line.
+fn usage_error(err: &clap::Error) -> ExitCode {
+    if matches!(
+        err.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) {
+        // Generated purely from our own definitions.
+        let _ = err.print();
+        return ExitCode::from(u8::try_from(err.exit_code()).unwrap_or(USAGE_FAILURE));
+    }
+    eprint!("{}", sanitized_usage_error(err));
+    ExitCode::from(USAGE_FAILURE)
+}
+
+fn sanitized_usage_error(err: &clap::Error) -> String {
+    let mut msg = format!(
+        "cloakenv: error: {} (arguments are not repeated here in case one of them is a secret)\n",
+        err.kind().as_str().unwrap_or("invalid arguments")
+    );
+    // These context values come from our own command definition, never from
+    // user input. Everything else (invalid arg/value/subcommand, generic
+    // "tip" suggestions) may quote what was typed and is dropped.
+    if err.kind() == ErrorKind::MissingRequiredArgument {
+        if let Some(ContextValue::Strings(names)) = err.get(ContextKind::InvalidArg) {
+            msg.push_str(&format!("  missing: {}\n", names.join(", ")));
+        }
+    }
+    for kind in [ContextKind::SuggestedSubcommand, ContextKind::SuggestedArg] {
+        if let Some(ContextValue::String(s)) = err.get(kind) {
+            msg.push_str(&format!("  tip: did you mean '{s}'?\n"));
+        }
+        if let Some(ContextValue::Strings(names)) = err.get(kind) {
+            if let Some(s) = names.first() {
+                msg.push_str(&format!("  tip: did you mean '{s}'?\n"));
+            }
+        }
+    }
+    let usage = match err.get(ContextKind::Usage) {
+        Some(ContextValue::StyledStr(usage)) => usage.to_string(),
+        _ => Cli::command().render_usage().to_string(),
+    };
+    msg.push_str(&format!(
+        "\n{}\n\nFor more information, try '--help'.\n",
+        usage.trim_end()
+    ));
+    msg
 }
 
 /// Fails before any passphrase prompt or vault write if `key` is one of
