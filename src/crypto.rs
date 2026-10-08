@@ -24,7 +24,14 @@ pub const TAG_LEN: usize = 16;
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CryptoError {
     #[error(
-        "unsupported key-derivation parameters (memory {m_cost_kib} KiB, iterations {t_cost}, lanes {p_cost})"
+        "unsupported key-derivation parameters (memory {m_cost_kib} KiB, iterations {t_cost}, lanes {p_cost}); \
+         this version accepts memory {min_m} to {max_m} KiB, iterations {min_t} to {max_t}, lanes {min_p} to {max_p}",
+        min_m = KdfParams::MIN.m_cost_kib,
+        max_m = KdfParams::MAX.m_cost_kib,
+        min_t = KdfParams::MIN.t_cost,
+        max_t = KdfParams::MAX.t_cost,
+        min_p = KdfParams::MIN.p_cost,
+        max_p = KdfParams::MAX.p_cost,
     )]
     InvalidKdfParams {
         m_cost_kib: u32,
@@ -68,12 +75,15 @@ impl KdfParams {
         t_cost: 1,
         p_cost: 1,
     };
-    /// Strongest parameters accepted. Bounds the work an untrusted vault file
-    /// can make us do before authentication fails (1 GiB, 32 passes, 16 lanes).
+    /// Strongest parameters accepted (256 MiB, 8 passes, 8 lanes). The KDF
+    /// parameters are read from the header *before* the file is authenticated,
+    /// so this bounds the memory and CPU an untrusted vault file can make us
+    /// spend; it is several times stronger than [`KdfParams::DEFAULT`] in
+    /// memory and passes, and costs about a second on a current machine.
     pub const MAX: Self = Self {
-        m_cost_kib: 1024 * 1024,
-        t_cost: 32,
-        p_cost: 16,
+        m_cost_kib: 256 * 1024,
+        t_cost: 8,
+        p_cost: 8,
     };
 
     /// Validates that the parameters fall within [`KdfParams::MIN`] and
@@ -234,6 +244,51 @@ mod tests {
             ..KdfParams::DEFAULT
         };
         assert!(huge.validate().is_err());
+        // The pre-C6 maximum (1 GiB, 32 passes) is now refused...
+        let old_max = KdfParams {
+            m_cost_kib: 1024 * 1024,
+            t_cost: 32,
+            p_cost: 16,
+        };
+        assert!(old_max.validate().is_err());
+        // ...exactly at the cap is fine, one step over is not.
+        assert_eq!(KdfParams::MAX.validate(), Ok(KdfParams::MAX));
+        for over in [
+            KdfParams {
+                m_cost_kib: KdfParams::MAX.m_cost_kib + 1,
+                ..KdfParams::MAX
+            },
+            KdfParams {
+                t_cost: KdfParams::MAX.t_cost + 1,
+                ..KdfParams::MAX
+            },
+            KdfParams {
+                p_cost: KdfParams::MAX.p_cost + 1,
+                ..KdfParams::MAX
+            },
+        ] {
+            assert!(over.validate().is_err(), "{over:?}");
+        }
+    }
+
+    #[test]
+    fn rejected_params_are_never_derived() {
+        // Must fail instantly: no 1 GiB allocation, no 32 passes.
+        let started = std::time::Instant::now();
+        let err = derive_key(
+            b"pw",
+            &[0u8; SALT_LEN],
+            KdfParams {
+                m_cost_kib: 1024 * 1024,
+                t_cost: 32,
+                p_cost: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, CryptoError::InvalidKdfParams { .. }));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let msg = err.to_string();
+        assert!(msg.contains("262144") && msg.contains("accepts"), "{msg}");
         assert!(KdfParams::DEFAULT.validate().is_ok());
     }
 

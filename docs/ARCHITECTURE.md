@@ -15,9 +15,16 @@
 ## Cryptography
 
 * **KDF:** Argon2id v1.3. New vaults use 64 MiB / 3 passes / 1 lane. The
-  parameters live in the header; on read they must fall within
-  8 MiB–1 GiB, 1–32 passes, 1–16 lanes, which caps the work an untrusted file
-  can demand before authentication fails.
+  parameters live in the header, which is read *before* the file is
+  authenticated, so on read they must fall within a fixed range: at most
+  256 MiB, 8 passes and 8 lanes. This caps the memory and CPU an untrusted
+  vault file can demand (a 1 GiB / 32-pass header used to cost ~18 s and ~1 GiB
+  of RAM before failing). Out-of-range headers are rejected before any key
+  derivation, like any other malformed vault: exit 125, child not run, and an
+  error that names the accepted range. There is deliberately no override
+  (flag or environment variable) to raise the cap: new vaults are written with
+  64 MiB / 3 / 1, so only a vault created through the library API with
+  parameters above the cap is affected.
 * **AEAD:** XChaCha20-Poly1305 with a random 192-bit nonce. A fresh salt *and*
   nonce are generated on every write, so nonce reuse is not a practical concern.
 * **Associated data:** the entire 64-byte header (magic, version, algorithm

@@ -91,6 +91,22 @@ container secret mounts (Docker, Kubernetes) are commonly mode 0444/0644 and
 protected by the container boundary instead. On a normal workstation, fix it
 with `chmod 600`.
 
+## Vault file limits
+
+The key-derivation settings are stored in the vault header, which cloakenv has
+to read *before* it can authenticate the file. To keep a hostile or corrupted
+file from forcing a huge allocation or many seconds of CPU, headers asking for
+more than **256 MiB, 8 passes or 8 lanes** are refused up front, exactly like
+any other bad vault (exit 125, nothing spawned):
+
+```
+cloakenv: error: unsupported key-derivation parameters (memory 1048576 KiB, iterations 32, lanes 1); this version accepts memory 8192 to 262144 KiB, iterations 1 to 8, lanes 1 to 8
+```
+
+New vaults use 64 MiB / 3 passes / 1 lane, well inside the limit. There is no
+flag or variable to raise it. It only matters if you created a vault through
+the library API with stronger-than-default settings above the cap.
+
 ## Exit codes
 
 | situation                                      | code          |
