@@ -36,10 +36,12 @@ fn no_stray_files_left_behind() {
         .map(|e| e.unwrap().file_name())
         .collect();
     entries.sort();
-    // The (empty) writer lock file is persistent by design; no temp files.
+    // The (empty) writer lock file and the git-ignore file written by `init`
+    // are persistent by design; no temp files.
     assert_eq!(
         entries,
         vec![
+            std::ffi::OsString::from(".gitignore"),
             std::ffi::OsString::from(".vault.bin.lock"),
             std::ffi::OsString::from("vault.bin"),
         ]

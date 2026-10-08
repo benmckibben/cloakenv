@@ -6,7 +6,9 @@
 |-----------------|-------------------------------------------------------------------------|
 | `src/main.rs`   | clap CLI, passphrase acquisition, exit-code mapping                     |
 | `src/crypto.rs` | Argon2id key derivation, XChaCha20-Poly1305 seal/open, OS RNG           |
-| `src/vault.rs`  | vault file format, in-memory map, atomic 0600 writes, `.env` parser     |
+| `src/vault.rs`  | vault file format, in-memory map, atomic writes (0600 on Unix), `.env` parser |
+| `src/perms.rs`  | advisory permission/symlink warnings for the vault and passphrase file (Unix) |
+| `src/hardening.rs` | process hardening (`PR_SET_DUMPABLE`, Linux only)                    |
 | `src/runner.rs` | child spawning with env injection, `--shield` streaming redactor        |
 | `src/lib.rs`    | re-exports the above so integration tests can exercise them directly    |
 
@@ -46,9 +48,16 @@ value` (UTF-8). Variable names are encrypted too — the file reveals only
 approximate total size. The decoder rejects duplicate keys, invalid names, NUL
 bytes and trailing data.
 
-Writes go to a sibling `.vault.bin.tmp-<random>` created `O_EXCL` with mode
-0600, are fsynced, then `rename`d over the target (and the directory fsynced).
-Only ciphertext is ever written.
+Writes go to a sibling `.vault.bin.tmp-<random>` created `O_EXCL` (with mode
+0600 on Unix), are fsynced, then `rename`d over the target (and, on Unix, the
+directory fsynced; the mode and the directory fsync are `cfg(unix)` and do not
+happen elsewhere). `rename` replaces a symlinked `vault.bin` rather than
+writing through it. Only ciphertext is ever written.
+
+`init` also creates `.cloak/.gitignore` (`*`, `O_EXCL`, never overwritten or
+followed through a symlink) when the vault directory is named `.cloak` or was
+created by that `init`, so the vault cannot be committed with `git add .`;
+failure to write it is a warning, not an error.
 
 Writers (`init`, `set`, `unset`, `import`) hold an exclusive `flock(2)` on a
 sibling `.vault.bin.lock` (empty, mode 0600, never deleted) for the whole
@@ -57,7 +66,24 @@ silently overwriting each other. The lock lives on a separate file because the
 vault inode is replaced on every save. Readers (`list`, `run`) take no lock;
 the atomic rename already guarantees they see a complete vault. Passphrase and
 value prompts happen *before* the lock is taken, so an idle prompt never
-blocks other writers.
+blocks other writers. `flock` is Unix only; elsewhere the lock is a no-op.
+
+**Permission checks (Unix, advisory).** When a command opens the vault,
+`src/perms.rs` warns on stderr if the vault directory is group/world-writable,
+the vault file is group/world-readable or writable, either is a symlink, or
+the `CLOAKENV_PASSPHRASE_FILE` in use is group/world-readable or writable. The
+warnings are printed before decryption and spawning, name only paths and octal
+modes, never change exit codes and never chmod anything. A loose passphrase
+file is deliberately a warning, not an error: Docker/Kubernetes secret mounts
+are routinely 0444/0644 and rely on the container boundary.
+
+## Platform support
+
+Linux and macOS are supported and tested in CI. Windows is unsupported and
+untested (not built in CI; integration tests are `cfg(unix)`). Unix-only
+pieces: file modes 0600/0700, directory fsync, `flock`, permission warnings,
+signal exit codes (`128 + N`; on other platforms any exit status above 255
+becomes 1). `PR_SET_DUMPABLE` is Linux only (see invariant 6).
 
 ## Invariants and how they are enforced
 
@@ -92,7 +118,15 @@ blocks other writers.
    stdout and bypass `--shield`), and no core dump is written on a crash.
    `execve` resets the flag, so children run normally. Tests run probes from
    inside `cloakenv run` and check they fail. Not covered: root /
-   `CAP_SYS_PTRACE`, and non-Linux platforms (no-op there for now).
+   `CAP_SYS_PTRACE`, and **non-Linux platforms**: the call is
+   `cfg(linux/android)`-gated and a no-op elsewhere, so on macOS other
+   processes of the same user may be able to read cloakenv's environment
+   (`CLOAKENV_PASSPHRASE` / the passphrase file path) and cloakenv does not
+   disable core dumps. macOS has no `/proc`, so the `/proc/<pid>/fd` shield
+   bypass does not exist there, but other macOS equivalents have not been
+   assessed. Independently of platform, the child itself receives the plaintext
+   in its environment, which same-user processes can read (on Linux the
+   child is dumpable again after `execve`).
 
 ## `--shield` streaming redaction
 
@@ -111,14 +145,23 @@ tests check every chunk size from 1 to the input length.
 
 **Known limitations** (by design for v0.1):
 
-* Only *literal* values are matched. Transformed secrets (base64, URL-encoded,
-  JSON-escaped, split across lines by the program) are not caught.
+* Only *literal* values are matched. Transformed secrets (base64, hex,
+  URL-encoded, JSON-escaped, case-changed, truncated/masked, split across lines
+  by the program) are not caught.
+* stdout and stderr have independent filters (one per thread): a secret split
+  between the two streams is not caught, and the interleaving of stdout versus
+  stderr in the output is not guaranteed to match the child's write order.
+* If a stream ends while the held-back tail is a proper prefix of a secret
+  (child killed, output cut off), that prefix is written in clear at EOF.
 * Up to `L − 1` trailing bytes are delayed until more output arrives or the
   stream closes; a prompt without a newline may appear late.
 * When two *different* secrets overlap in the output (e.g. `hunter2` and
   `2fa-token` printed as `hunter2fa-token`), leftmost-longest redacts the
   first and the non-overlapping tail of the second remains visible.
-* Very short values (e.g. `1`) will redact every occurrence of that string.
+* Very short values (1–3 characters, e.g. `1`) redact every occurrence of that
+  string: output is mangled and inflated (each 1-byte match becomes
+  22 bytes), and seeing `[REDACTED_BY_CLOAKENV]` for a guessed string confirms
+  the guess, a practical guessing oracle for such values.
 * Empty values are never matched.
 * Redaction only applies to the child's stdout/stderr pipes; anything the
   child writes to files, sockets or `/dev/tty` directly is not filtered.

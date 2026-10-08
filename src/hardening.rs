@@ -16,7 +16,8 @@
 //! The flag is reset by `execve`, so spawned commands run with their normal
 //! dumpable state. Root (`CAP_SYS_PTRACE`) is unaffected, as always.
 //!
-//! On other platforms this is currently a no-op; see the limitations in
+//! On other platforms (including macOS) this is a no-op, so none of the
+//! protections above apply there; see "Platform support" in the README and
 //! `docs/ARCHITECTURE.md`.
 
 use std::io;

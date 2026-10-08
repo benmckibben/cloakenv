@@ -276,8 +276,10 @@ impl Vault {
         Self::open(&bytes, passphrase)
     }
 
-    /// Encrypts and atomically writes the vault to `path` with mode 0600,
-    /// creating the parent directory with mode 0700 if needed.
+    /// Encrypts and atomically writes the vault to `path`, creating the parent
+    /// directory if needed. On Unix the file has mode 0600 and a directory
+    /// created here 0700; other platforms get default permissions. An existing
+    /// symlink at `path` is replaced, never written through.
     pub fn save(&self, path: &Path, passphrase: &[u8]) -> Result<(), VaultError> {
         let bytes = self.seal(passphrase)?;
         write_atomic_private(path, &bytes)
@@ -422,9 +424,53 @@ fn lock_file(_file: &fs::File, _block: bool) -> io::Result<()> {
 }
 
 fn parent_dir(path: &Path) -> PathBuf {
-    match path.parent() {
+    vault_dir(path)
+}
+
+/// The directory that holds the vault at `vault` (`.` for a bare file name).
+pub fn vault_dir(vault: &Path) -> PathBuf {
+    match vault.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
+    }
+}
+
+/// Contents of the `.gitignore` written next to a new vault: everything in
+/// the directory (including the `.gitignore` itself) is ignored by git.
+pub const GITIGNORE_CONTENTS: &str = "*\n";
+
+/// Writes `<vault dir>/.gitignore` containing `*`, so a plain `git add .`
+/// can never pick up the vault (committed ciphertext can be attacked offline
+/// with passphrase guesses).
+///
+/// This is only done for a directory that is plainly cloakenv's own: one named
+/// `.cloak` (the default), or one that did not exist before this `init`
+/// (`dir_preexisted` is false). For a vault dropped into some existing
+/// directory such as the project root, a `*` ignore file would hide the whole
+/// project, so nothing is written.
+///
+/// An existing `.gitignore` is never touched and a symlink at that path is
+/// never followed (`O_EXCL`). Returns whether a file was written.
+pub fn write_gitignore(vault: &Path, dir_preexisted: bool) -> io::Result<bool> {
+    let dir = vault_dir(vault);
+    let ours = dir.file_name().is_some_and(|n| n == ".cloak") || !dir_preexisted;
+    if !ours {
+        return Ok(false);
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(dir.join(".gitignore")) {
+        Ok(mut f) => {
+            f.write_all(GITIGNORE_CONTENTS.as_bytes())?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -700,6 +746,18 @@ mod tests {
                 other => panic!("{input:?}: unexpected {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn gitignore_failure_is_reported_not_panicked() {
+        let t = tempfile::tempdir().unwrap();
+        // The directory does not exist, so the file cannot be created.
+        let vault = t.path().join("missing").join("vault.bin");
+        assert!(write_gitignore(&vault, false).is_err());
+        // An ordinary pre-existing directory that is not `.cloak` is left alone.
+        let vault = t.path().join("vault.bin");
+        assert!(!write_gitignore(&vault, true).unwrap());
+        assert!(!t.path().join(".gitignore").exists());
     }
 
     #[cfg(unix)]
