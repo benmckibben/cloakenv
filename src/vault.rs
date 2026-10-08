@@ -276,8 +276,10 @@ impl Vault {
         Self::open(&bytes, passphrase)
     }
 
-    /// Encrypts and atomically writes the vault to `path` with mode 0600,
-    /// creating the parent directory with mode 0700 if needed.
+    /// Encrypts and atomically writes the vault to `path`, creating the parent
+    /// directory if needed. On Unix the file has mode 0600 and a directory
+    /// created here 0700; other platforms get default permissions. An existing
+    /// symlink at `path` is replaced, never written through.
     pub fn save(&self, path: &Path, passphrase: &[u8]) -> Result<(), VaultError> {
         let bytes = self.seal(passphrase)?;
         write_atomic_private(path, &bytes)

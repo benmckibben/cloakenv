@@ -36,19 +36,60 @@ In order of precedence:
 
 Both variables are always stripped from the child's environment, and
 `cloakenv set` / `cloakenv import` refuse to store secrets under either name.
-On Linux, cloakenv also marks itself non-dumpable at startup, so neither the
-commands it runs nor other processes of your user can read the passphrase out
-of `/proc/<pid>/environ`, inspect its memory, or write around `--shield` via
-`/proc/<pid>/fd`; it never leaves a core dump.
+On Linux, cloakenv also marks itself non-dumpable at startup
+(`prctl(PR_SET_DUMPABLE, 0)`), so neither the commands it runs nor other
+processes of your user can read the passphrase out of `/proc/<pid>/environ`,
+inspect its memory, or write around `--shield` via `/proc/<pid>/fd`; it never
+leaves a core dump. This is **Linux only**; see [Platform support](#platform-support)
+for what that means on macOS.
+
+If the passphrase file is readable or writable by group or others, cloakenv
+warns (see [Permission warnings](#permission-warnings)) but still uses it.
 
 ## Vault location
 
 `.cloak/vault.bin` relative to the current directory by default; override with
-`--vault <path>` or `CLOAKENV_VAULT`. The file is written atomically with mode
-`0600` inside a `0700` directory. `.cloak/` is git-ignored. Commands that
-modify the vault serialise on an advisory lock file next to it
-(`.cloak/.vault.bin.lock`), so concurrent `cloakenv set` calls never lose
-updates.
+`--vault <path>` or `CLOAKENV_VAULT`. On Unix the file is written atomically
+with mode `0600`, inside a `0700` directory if cloakenv has to create it (an
+existing directory is left as it is). Commands that modify the vault
+serialise on an advisory lock file next to it (`.cloak/.vault.bin.lock`), so
+concurrent `cloakenv set` calls never lose updates (Unix only; see
+[Platform support](#platform-support)).
+
+### Keeping the vault out of git
+
+`cloakenv init` writes `.cloak/.gitignore` containing `*`, so `.cloak/`
+(vault, lock file and the ignore file itself) never shows up in `git status`
+or `git add .` in *your* project; the repository-level ignore rules of
+cloakenv's own source tree don't apply there. An existing `.cloak/.gitignore`
+is never overwritten, and if it cannot be written `init` still succeeds and
+prints a warning telling you to ignore the directory yourself. For a vault
+placed in some other pre-existing directory via `--vault` (the project root,
+say) nothing is written, because a `*` there would hide your whole project:
+add an ignore rule yourself. `git add -f` can still force the file in; don't.
+A committed vault is exposed to offline passphrase guessing by anyone who can
+read the repository, forever.
+
+### Permission warnings
+
+On Unix, cloakenv checks permissions each time it opens the vault and prints
+one line per problem on its own stderr, before it decrypts or spawns anything
+(so it never appears inside the redacted stream of a `--shield` child). These
+are warnings only: exit codes do not change and cloakenv never chmods files it
+did not create.
+
+| condition | warning |
+|-----------|---------|
+| vault directory group/world-writable | `cloakenv: warning: vault directory <dir> is group/world-writable (mode 0777, expected 0700); others could replace the vault` |
+| vault file group/world-readable or writable | `cloakenv: warning: vault file <file> is group/world-readable or writable (mode 0644, expected 0600)` |
+| passphrase file group/world-readable or writable | `cloakenv: warning: passphrase file <file> is group/world-readable or writable (mode 0666, expected 0600); anyone who can read it can decrypt the vault` |
+| vault directory is a symlink | `cloakenv: warning: vault directory <dir> is a symbolic link; cloakenv follows it, so make sure its target is private` |
+| vault file is a symlink | `cloakenv: warning: vault file <file> is a symbolic link; reads follow it, but saving replaces the link with a regular file` |
+
+A loose passphrase file is a warning rather than an error on purpose:
+container secret mounts (Docker, Kubernetes) are commonly mode 0444/0644 and
+protected by the container boundary instead. On a normal workstation, fix it
+with `chmod 600`.
 
 ## Exit codes
 
@@ -61,6 +102,85 @@ updates.
 | other subcommands: any failure                 | 1             |
 | invalid command line (arguments never echoed)  | 2             |
 | usage error                                    | 2             |
+
+Exit codes are 0–255 on Unix. A child exit status above 255 (possible on
+Windows only, which is unsupported) is reported as `1`.
+
+## What `--shield` does and doesn't do
+
+`--shield` pipes the child's stdout and stderr through an in-memory filter that
+replaces every **literal, byte-for-byte** occurrence of a decrypted vault value
+with `[REDACTED_BY_CLOAKENV]`, including occurrences that straddle read
+boundaries. It is meant to stop *accidents*: `env` or `set -x` dumps, error
+messages that echo a connection string, a stack trace that includes a token.
+It is **not** a security boundary against a command that wants to leak a
+secret: the child process has the plaintext in its environment.
+
+What it does **not** catch:
+
+- **Transformed secrets.** Only the exact value is matched. Base64, hex,
+  URL/percent-encoded, JSON- or shell-escaped (`\n`, `\"`), reversed,
+  upper/lower-cased, truncated or masked forms (`sk-live-ab…`), and values the
+  program wraps or splits across lines are printed in clear.
+- **Secrets split across the two streams.** stdout and stderr are filtered
+  independently (one filter and one thread each); a secret whose first half goes
+  to stdout and second half to stderr matches in neither.
+- **Interleaving order.** The two streams are read and written by separate
+  threads, so the relative order of stdout and stderr lines in the redacted
+  output is **not** guaranteed to match the order the child produced them.
+  (Within one stream, order is preserved.)
+- **Anything that isn't the stdout/stderr pipe:** files, sockets, `/dev/tty`,
+  other inherited file descriptors, or a deliberate `| base64`.
+- **Very short secrets (1–3 characters).** Every occurrence of the string is
+  replaced, so ordinary output is mangled and *inflated* (a 1-byte secret
+  becomes 22 bytes per occurrence), and `[REDACTED_BY_CLOAKENV]` appearing for a
+  guessed string tells whoever can see the output that the guess is a secret
+  value, which is a practical guessing oracle for such short values. Don't keep
+  tiny non-secret settings (`DEBUG=1`, `PORT=80`) in the vault.
+- **A partial secret at the end of the output.** To match across chunk
+  boundaries the filter holds back the last (longest secret − 1) bytes of each
+  stream. If the stream ends in the middle of what *would* have been a match
+  (the child is killed, or prints only the first part of a token and exits), the
+  held-back prefix is flushed as is, in clear.
+
+These are known limitations, documented here rather than fixed in this
+release; see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#--shield-streaming-redaction).
+
+## Platform support
+
+| platform | status |
+|----------|--------|
+| Linux | supported; tested in CI (Ubuntu 24.04, stable Rust and the 1.87 MSRV) |
+| macOS | supported; tested in CI (macOS 15, stable Rust) |
+| Windows | **unsupported and untested**: not built or tested in CI, integration tests are Unix-only |
+
+Several protections described above are implemented with Unix-only APIs
+(`cfg(unix)`), and silently do not exist elsewhere:
+
+- file mode `0600` for the vault and lock file, and `0700` for a directory
+  cloakenv creates;
+- the directory `fsync` after the atomic rename (durability across power loss);
+- the advisory `flock` that serialises concurrent writers;
+- the permission warnings (symlink warnings do apply);
+- `128 + N` exit codes for a child killed by a signal.
+
+On Windows, cloakenv would use default inherited ACLs, would not prevent
+concurrent `set` calls from losing updates, and has not been checked at all.
+
+**`PR_SET_DUMPABLE` is Linux only.** The hardening that keeps same-user
+processes from reading cloakenv's `/proc/<pid>/environ`, memory and file
+descriptors relies on `prctl(PR_SET_DUMPABLE)`, which exists on Linux only; on
+macOS and everywhere else it is a no-op. On macOS, cloakenv therefore does
+**not** protect `CLOAKENV_PASSPHRASE` (or the `CLOAKENV_PASSPHRASE_FILE` path)
+in its own environment from other processes of the same user, nor disable core
+dumps. There is no `/proc` on macOS, so the Linux-specific `--shield` bypass
+via `/proc/<pid>/fd` doesn't exist there, but equivalent macOS mechanisms have
+not been evaluated. Prefer the interactive prompt or a mode-`0600`
+`CLOAKENV_PASSPHRASE_FILE` over `CLOAKENV_PASSPHRASE` on shared or untrusted
+macOS accounts. Still true on every platform: the commands you run get the
+decrypted values in their own environment (readable by other same-user
+processes the usual way, e.g. `/proc/<pid>/environ` of the child on Linux),
+and cloakenv is not a sandbox.
 
 ## Security model
 
