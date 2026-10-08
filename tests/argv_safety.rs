@@ -157,3 +157,40 @@ fn set_value_is_absent_from_proc_cmdline() {
     let out = env.ok(&["run", "--", "sh", "-c", r#"printf %s "$API_KEY""#]);
     assert_eq!(stdout(&out), SECRET);
 }
+
+/// Arguments that are not UTF-8, with panics and logging turned all the way
+/// up, must neither panic nor echo what was typed.
+#[test]
+fn non_utf8_arguments_and_debug_env_neither_panic_nor_echo() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let env = Env::init();
+    let mut raw = vec![0xff, 0xfe];
+    raw.extend_from_slice(SECRET.as_bytes());
+    let bad = OsString::from_vec(raw);
+    for args in [
+        vec![OsString::from("set"), bad.clone()],
+        vec![OsString::from("unset"), bad.clone()],
+        vec![OsString::from("list"), bad.clone()],
+        vec![bad.clone()],
+    ] {
+        let out = env
+            .cmd(Some(PASS))
+            .env("RUST_BACKTRACE", "full")
+            .env("RUST_LOG", "trace")
+            .args(&args)
+            .output()
+            .unwrap();
+        let all = [out.stdout.clone(), out.stderr.clone()].concat();
+        let all = String::from_utf8_lossy(&all);
+        assert!(!all.contains("panicked"), "{args:?}: {all}");
+        assert!(!all.contains("backtrace"), "{args:?}: {all}");
+        assert!(!all.contains(&SECRET[..8]), "{args:?} echoed input: {all}");
+        assert!(
+            matches!(out.status.code(), Some(1 | 2 | 125 | 127)),
+            "{args:?}: {:?}",
+            out.status
+        );
+    }
+}

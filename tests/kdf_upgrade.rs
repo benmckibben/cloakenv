@@ -247,3 +247,36 @@ fn the_upgrade_notice_follows_the_save_it_describes() {
     assert!(upgraded < removed, "{err}");
     assert_eq!(header_params(&env), KdfParams::DEFAULT);
 }
+
+/// C1 + C14: writers queued on the lock while the first one upgrades a weak
+/// vault all see a consistent vault: no update is lost, the file ends up with
+/// the upgraded settings, and only the writer that actually upgraded says so.
+#[test]
+fn queued_writers_and_a_kdf_upgrade_do_not_lose_updates() {
+    let env = Env::new();
+    write_vault_with(&env, WEAK, &[("OLD", "dummy-old")]);
+    let children: Vec<_> = (0..6)
+        .map(|i| env.spawn_set(&format!("KEY_{i}"), &format!("dummy-{i}")))
+        .collect();
+    let mut notices = 0;
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+        notices += stderr(&out)
+            .matches("upgraded the vault's key-derivation")
+            .count();
+    }
+    assert_eq!(notices, 1, "exactly one writer performs the upgrade");
+    assert_eq!(header_params(&env), KdfParams::DEFAULT);
+    let want: Vec<String> = std::iter::once("OLD".to_owned())
+        .chain((0..6).map(|i| format!("KEY_{i}")))
+        .collect();
+    let mut got: Vec<String> = stdout(&env.ok(&["list"]))
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    got.sort();
+    let mut want = want;
+    want.sort();
+    assert_eq!(got, want);
+}

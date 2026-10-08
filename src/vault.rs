@@ -1044,6 +1044,18 @@ mod tests {
         assert!(VaultLock::try_acquire(&vault).unwrap().is_some());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn lock_fd_is_close_on_exec() {
+        // A command started while a lock is held (or any child of a writer)
+        // must not inherit the lock: it would keep the vault locked after
+        // cloakenv exits.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = VaultLock::acquire(&dir.path().join("vault.bin")).unwrap();
+        let flags = rustix::io::fcntl_getfd(&lock._file).unwrap();
+        assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+    }
+
     #[test]
     fn env_file_reads_are_bounded_and_regular_only() {
         let dir = tempfile::tempdir().unwrap();
