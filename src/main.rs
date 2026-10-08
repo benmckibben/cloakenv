@@ -10,7 +10,9 @@ use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::Zeroizing;
 
-use cloakenv::vault::{Vault, VaultError, VaultLock, is_valid_key, parse_dotenv};
+use cloakenv::vault::{
+    Vault, VaultError, VaultLock, is_valid_key, parse_dotenv, vault_dir, write_gitignore,
+};
 use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, hardening, is_reserved_key, perms, runner};
 
 /// Lightweight encrypted local secret vault and zero-leak process injection engine.
@@ -124,6 +126,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 );
             }
             let pass = passphrase(true)?;
+            let dir_preexisted = vault_dir(path).is_dir();
             let _lock = lock(path)?;
             // Re-check under the lock: another init may have won the race.
             if path.exists() && !force {
@@ -131,6 +134,16 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             perms::emit(&perms::vault_warnings(path, false));
             Vault::new().save(path, pass.as_bytes())?;
+            // Keep the vault out of `git add .`. Never fatal: the vault is
+            // already safely written.
+            if let Err(err) = write_gitignore(path, dir_preexisted) {
+                let dir = vault_dir(path);
+                eprintln!(
+                    "cloakenv: warning: could not write {}: {err}; add {}/ to your project's .gitignore so the vault is not committed",
+                    dir.join(".gitignore").display(),
+                    dir.display()
+                );
+            }
             eprintln!("cloakenv: initialized vault at {}", path.display());
         }
         Cmd::Set { key, value } => {
