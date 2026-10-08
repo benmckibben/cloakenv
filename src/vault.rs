@@ -748,7 +748,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn gitignore_failure_is_reported_not_panicked() {
         let t = tempfile::tempdir().unwrap();
@@ -761,6 +760,7 @@ mod tests {
         assert!(!t.path().join(".gitignore").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn vault_lock_is_exclusive_and_released_on_drop() {
         use std::os::unix::fs::PermissionsExt;
