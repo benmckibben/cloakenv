@@ -24,6 +24,8 @@ cloakenv run -- npm start              # secrets injected into npm's env
 cloakenv run --shield -- ./debug.sh    # ...and redacted from its output
 ```
 
+What this does and does not protect against is in the [Threat model](#threat-model).
+
 ## Values you store
 
 `cloakenv set KEY` reads the value from a hidden prompt, or from stdin when
@@ -296,8 +298,8 @@ filter the output. It then
   have passed (time spent blocked on its own stdout does not count), flushes
   what it has and exits with the command's status. Leftover processes are not
   killed; they lose their output pipe and get `SIGPIPE` on their next write.
-  Before this change a leftover held cloakenv (and so, say, a CI step) up for as
-  long as it lived.
+  (Without this a leftover would hold cloakenv, and so, say, a CI step, up for
+  as long as it lived.)
 
 Windows is unsupported: there `run` is a plain spawn-and-wait with none of the
 above.
@@ -312,8 +314,8 @@ above.
 | `run`: vault/passphrase/shield failure         | 125           |
 | `run`: command not executable / not found      | 126 / 127     |
 | other subcommands: any failure                 | 1             |
-| invalid command line (arguments never echoed)  | 2             |
-| usage error                                    | 2             |
+| invalid command line (arguments are never echoed) | 2          |
+| `list` whose reader closed the pipe early      | 0 (quiet)     |
 
 Exit codes are 0–255 on Unix. A child exit status above 255 (possible on
 Windows only, which is unsupported) is reported as `1`.
@@ -408,28 +410,91 @@ concurrent `set` calls from losing updates, and has not been checked at all.
 
 **`PR_SET_DUMPABLE` and `PR_SET_PDEATHSIG` are Linux only.** `exec` without
 `--shield`, signal forwarding with it and the zero core-file limit work the same
-on macOS; killing cloakenv with `SIGKILL` under `--shield` leaves the command
-running there (see above).
-
-**`PR_SET_DUMPABLE` is Linux only.** The hardening that keeps same-user
-processes from reading cloakenv's `/proc/<pid>/environ`, memory and file
-descriptors relies on `prctl(PR_SET_DUMPABLE)`, which exists on Linux only; on
-macOS and everywhere else it is a no-op. On macOS, cloakenv therefore does
-**not** protect `CLOAKENV_PASSPHRASE` (or the `CLOAKENV_PASSPHRASE_FILE` path)
-in its own environment from other processes of the same user, nor disable core
-dumps. There is no `/proc` on macOS, so the Linux-specific `--shield` bypass
-via `/proc/<pid>/fd` doesn't exist there, but equivalent macOS mechanisms have
-not been evaluated. Prefer the interactive prompt or a mode-`0600`
-`CLOAKENV_PASSPHRASE_FILE` over `CLOAKENV_PASSPHRASE` on shared or untrusted
-macOS accounts. Still true on every platform: the commands you run get the
-decrypted values in their own environment (readable by other same-user
-processes the usual way, e.g. `/proc/<pid>/environ` of the child on Linux),
+on macOS. The hardening that keeps same-user processes from reading cloakenv's
+`/proc/<pid>/environ`, memory and file descriptors relies on
+`prctl(PR_SET_DUMPABLE)`; on macOS and everywhere else it is a no-op. On macOS,
+cloakenv therefore does **not** protect `CLOAKENV_PASSPHRASE` (or the
+`CLOAKENV_PASSPHRASE_FILE` path) in its own environment from other processes
+of the same user (core dumps are still prevented by the zero core-file limit).
+There is no `/proc` on macOS, so the Linux-specific `--shield` bypass via
+`/proc/<pid>/fd` doesn't exist there, but equivalent macOS mechanisms have not
+been evaluated. Killing cloakenv with `SIGKILL` under `--shield` leaves the
+command running there (see above). Prefer the interactive prompt or a
+mode-`0600` `CLOAKENV_PASSPHRASE_FILE` over `CLOAKENV_PASSPHRASE` on shared or
+untrusted macOS accounts. Still true on every platform: the commands you run
+get the decrypted values in their own environment (readable by other same-user
+processes the usual way, e.g. `/proc/<pid>/environ` of the command on Linux),
 and cloakenv is not a sandbox.
 
-## Security model
+## Threat model
+
+cloakenv is a small tool with a narrow job: keep secrets out of plaintext files
+and out of transcripts and logs, on a machine you otherwise trust. This section
+says, in one place, what it does and does not defend against; the details are in
+the sections it links to and in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+**What it protects**
+
+| threat | outcome |
+|--------|---------|
+| Someone gets a copy of the vault file (stolen laptop, backup, a mistaken `git add -f`) | They can only guess the passphrase offline, one Argon2id run (64 MiB, 3 passes) per guess; names and values are both encrypted, only the approximate total size shows. **The passphrase is the whole defence**, hence the warning at `init` for one under 12 characters ([Short passphrases](#exactly-what-counts-as-the-passphrase)). `init` also keeps `.cloak/` out of `git add .`. |
+| Tampering with the vault file | Any change, truncation or foreign file fails authentication; `run` exits 125 and starts nothing ([Vault file limits](#vault-file-limits)). |
+| Plaintext `.env` files, secrets in argv and shell history | `set` never takes a value on the command line (it refuses one and says so); nothing is decrypted to disk ([Values you store](#values-you-store)). Importing does not undo the past: the `.env` you import from stays on disk (and in any backup or git history) until you remove it, and deleting a file does not securely erase it. |
+| Secrets showing up in agent transcripts, CI logs, terminal scrollback | `run --shield` replaces exact occurrences of values in the command's stdout and stderr, for accidents only ([What `--shield` does and doesn't do](#what---shield-does-and-doesnt-do)). |
+| Other local users | The vault is written `0600` in a `0700` directory; loose permissions and symlinks are warned about ([Permission warnings](#permission-warnings)). |
+| Other processes of your user reading cloakenv itself (Linux) | While cloakenv exists it is non-dumpable: no `/proc/<pid>/environ`, `/proc/<pid>/mem`, ptrace or `/proc/<pid>/fd` access, no core dump. Without `--shield` cloakenv replaces itself with the command, so afterwards there is no cloakenv process to read ([Passphrase sources](#passphrase-sources), [How `run` starts your command](#how-run-starts-your-command)). |
+
+**What it does not protect, by design or because it cannot**
+
+- **The command you run.** It gets the secrets in its environment and can do
+  anything with them. After `exec` the kernel resets the dumpable flag, so
+  **other processes of your user (and root) can read the command's
+  `/proc/<pid>/environ`**, with or without `--shield` (it holds no passphrase).
+  cloakenv is not a sandbox.
+- **Root, the kernel, the hypervisor** (`CAP_SYS_PTRACE` bypasses everything
+  above), and **any code running as you before cloakenv starts.**
+- **The passphrase window.** Between the kernel starting cloakenv and its first
+  instruction setting the non-dumpable flag, a same-user process polling `/proc`
+  could read `CLOAKENV_PASSPHRASE` from a freshly started cloakenv; and an
+  exported variable is visible in your shell's own environment. Use the prompt or
+  a `0600` passphrase file where that matters.
+- **Platforms.** On macOS there is no dumpable flag, so cloakenv's own environment
+  and memory are not protected from same-user processes; Windows is unsupported
+  ([Platform support](#platform-support)).
+- **A shield is a filter, not a boundary.** Transformed secrets (base64, hex,
+  escaped, masked, split) pass through; so do secrets split across stdout and
+  stderr, and anything not on those two pipes; and values shorter than 6 bytes
+  are redacted so broadly that the marker confirms a guess (a warning names the
+  keys). Output after the command exits, and a partial secret at the very end of
+  a stream, are also not covered.
+- **Rollback.** Everything in the vault is authenticated, but a valid file is
+  not tied to a point in time. **Anyone who can write the vault's directory can
+  put an older valid vault back** (a backup, an old commit, a copy they took
+  earlier): rotated secrets revert to their old values and deleted ones return,
+  and nothing notices, because `run` has no record of what it saw before. They
+  still cannot read or forge one; they can also just delete it. Keep the
+  directory private (cloakenv warns when it is not) and do not keep the vault
+  where others can write. A generation counter with a high-water mark kept
+  outside the directory could catch this for attackers confined to the
+  directory; it needs a new file format and is written up as a proposal, not
+  built ([Rollback and replacement](docs/ARCHITECTURE.md#rollback-and-replacement-limit-with-a-design-proposal)).
+- **Memory and swap.** Decrypted values are held in buffers that are wiped when
+  dropped, and `exec` without `--shield` leaves nothing behind, but this is best
+  effort: cloakenv does not lock memory (`mlock`), so the OS may write pages
+  holding secrets to swap or a hibernation image, and the copies that the
+  standard library's `Command` makes of the environment cannot be wiped
+  ([Memory hygiene](docs/ARCHITECTURE.md#memory-hygiene-best-effort) lists what
+  is and is not covered, with measurements). Use an encrypted swap if that is in
+  your threat model.
+- **Weak passphrases.** See above: cloakenv warns, it does not refuse.
+- **Metadata.** File size (roughly how much you store), modification time and
+  the existence of a vault are visible to anyone who can list the directory.
+
+## More detail
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the vault format,
-cryptography and the precise guarantees (and non-guarantees) of `--shield`.
+cryptography, memory hygiene and the precise guarantees (and non-guarantees) of
+`--shield`.
 
 ## License
 

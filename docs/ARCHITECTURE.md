@@ -343,8 +343,8 @@ authenticated generation counter:
    `CAP_SYS_PTRACE`, and **non-Linux platforms**: the call is
    `cfg(linux/android)`-gated and a no-op elsewhere, so on macOS other
    processes of the same user may be able to read cloakenv's environment
-   (`CLOAKENV_PASSPHRASE` / the passphrase file path) and cloakenv does not
-   disable core dumps. macOS has no `/proc`, so the `/proc/<pid>/fd` shield
+   (`CLOAKENV_PASSPHRASE` / the passphrase file path); only the zero soft core
+   limit (above) keeps a core file from being written there. macOS has no `/proc`, so the `/proc/<pid>/fd` shield
    bypass does not exist there, but other macOS equivalents have not been
    assessed. Independently of platform, the child itself receives the plaintext
    in its environment, which same-user processes can read (on Linux the
