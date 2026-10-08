@@ -565,7 +565,18 @@ fn the_exec_ed_command_is_dumpable_again_and_holds_no_passphrase() {
     let env = env_with_secret();
     let mut run = Running::start(&env, &[], &sleeper(env.path()));
     let cmd_pid = run.command_pid("pid");
-    let environ = fs::read(format!("/proc/{cmd_pid}/environ")).expect("command is dumpable");
+    // The script publishes its pid and then replaces itself with `sleep`. While
+    // that second exec is in flight the kernel shows an empty (or no) environ for
+    // the pid, so wait for the settled one instead of reading it once.
+    let deadline = Instant::now() + TIMEOUT;
+    let environ = loop {
+        let read = fs::read(format!("/proc/{cmd_pid}/environ"));
+        match read {
+            Ok(environ) if contains(&environ, "API_KEY=") => break environ,
+            _ if Instant::now() >= deadline => break read.expect("command is dumpable"),
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
     assert!(contains(&environ, &format!("API_KEY={SECRET}")));
     assert!(!contains(&environ, "CLOAKENV_PASSPHRASE"));
     assert!(!contains(&environ, PASS));
