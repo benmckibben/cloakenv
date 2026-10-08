@@ -431,6 +431,13 @@ version; see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#--shield-streaming-re
 | macOS | supported; tested in CI (macOS 15, stable Rust) |
 | Windows | **unsupported and untested**: not built or tested in CI, integration tests are Unix-only |
 
+The release workflow ([CONTRIBUTING.md](CONTRIBUTING.md#releasing-maintainer))
+builds static musl binaries for Linux (x86_64 and aarch64) and binaries for
+macOS (Apple silicon and Intel). The test suite runs natively on x86_64 Linux
+(glibc, and musl in the release workflow) and on Apple-silicon macOS; the
+aarch64 Linux and Intel macOS builds are smoke-tested (under QEMU and Rosetta)
+but their tests are not run.
+
 Several protections described above are implemented with Unix-only APIs
 (`cfg(unix)`), and silently do not exist elsewhere:
 
