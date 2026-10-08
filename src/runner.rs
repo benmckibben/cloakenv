@@ -11,6 +11,7 @@ use std::thread;
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::vault::Vault;
 use crate::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV};
@@ -85,10 +86,16 @@ impl RunError {
 /// `max_secret_len - 1` bytes of input until it can prove that no secret
 /// starting inside them is still in flight. Matching is leftmost-longest, so
 /// when one secret is a prefix of another the longer one is redacted whole.
+///
+/// The buffer of held-back input (raw child output, which may contain secrets
+/// that have not been redacted yet) is allocated once and wiped on drop, and
+/// the bytes that are shifted out of it are wiped as they go. The Aho-Corasick
+/// automaton itself cannot be wiped: the library has no way to do it (see
+/// "Memory hygiene" in `docs/ARCHITECTURE.md`).
 pub struct Redactor {
     matcher: Option<AhoCorasick>,
     holdback: usize,
-    pending: Vec<u8>,
+    pending: Zeroizing<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Redactor {
@@ -107,33 +114,55 @@ impl Redactor {
         I: IntoIterator<Item = P>,
         P: AsRef<[u8]>,
     {
-        let patterns: Vec<P> = secrets
-            .into_iter()
-            .filter(|s| !s.as_ref().is_empty())
-            .collect();
-        let max_len = patterns.iter().map(|p| p.as_ref().len()).max().unwrap_or(0);
-        let matcher = if patterns.is_empty() {
-            None
-        } else {
-            Some(
-                AhoCorasick::builder()
-                    .match_kind(MatchKind::LeftmostLongest)
-                    .build(&patterns)
-                    .map_err(|_| RunError::Shield)?,
-            )
-        };
-        Ok(Self {
+        let (matcher, max_len) = build_matcher(secrets)?;
+        Ok(Self::with_matcher(matcher, max_len))
+    }
+
+    /// Builds two independent redactors (one per output stream) that share a
+    /// single automaton, so the secrets are compiled into memory once, not
+    /// twice. Each has its own held-back buffer.
+    pub fn new_pair<I, P>(secrets: I) -> Result<(Self, Self), RunError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<[u8]>,
+    {
+        let (matcher, max_len) = build_matcher(secrets)?;
+        // Cloning an AhoCorasick only bumps a reference count.
+        Ok((
+            Self::with_matcher(matcher.clone(), max_len),
+            Self::with_matcher(matcher, max_len),
+        ))
+    }
+
+    fn with_matcher(matcher: Option<AhoCorasick>, max_len: usize) -> Self {
+        Self {
             matcher,
             holdback: max_len.saturating_sub(1),
-            pending: Vec::with_capacity(CHUNK + max_len),
-        })
+            pending: Zeroizing::new(Vec::with_capacity(CHUNK + max_len)),
+        }
     }
 
     /// Feeds a chunk of input, writing every byte that is now known to be
     /// safe (or redacted) to `out`.
     pub fn push<W: Write + ?Sized>(&mut self, chunk: &[u8], out: &mut W) -> io::Result<()> {
+        self.reserve(chunk.len());
         self.pending.extend_from_slice(chunk);
         self.drain(out, false)
+    }
+
+    /// Makes room for `extra` more bytes without ever leaving the old buffer
+    /// behind unwiped. With the chunk sizes the pumps use the initial
+    /// allocation always suffices; this only matters for callers that push
+    /// large chunks (e.g. [`redact_all`]).
+    fn reserve(&mut self, extra: usize) {
+        let need = self.pending.len() + extra;
+        if need > self.pending.capacity() {
+            let mut bigger =
+                Zeroizing::new(Vec::with_capacity(need.max(2 * self.pending.capacity())));
+            bigger.extend_from_slice(&self.pending);
+            // Dropping the old buffer wipes it.
+            self.pending = bigger;
+        }
     }
 
     /// Flushes all remaining buffered input at end of stream.
@@ -144,7 +173,7 @@ impl Redactor {
     fn drain<W: Write + ?Sized>(&mut self, out: &mut W, eof: bool) -> io::Result<()> {
         let Some(matcher) = &self.matcher else {
             out.write_all(&self.pending)?;
-            self.pending.clear();
+            self.pending.zeroize();
             return Ok(());
         };
         // Any match starting before "safe" is fully determined by the bytes
@@ -166,9 +195,42 @@ impl Redactor {
         }
         let emit_to = cursor.max(safe);
         out.write_all(&self.pending[cursor..emit_to])?;
-        self.pending.drain(..emit_to);
+        // Shift the held-back tail to the front and wipe what is left behind it
+        // (`Vec::drain` would leave stale copies of the emitted bytes there).
+        let len = self.pending.len();
+        self.pending.copy_within(emit_to.., 0);
+        let new_len = len - emit_to;
+        self.pending[new_len..].zeroize();
+        self.pending.truncate(new_len);
         Ok(())
     }
+}
+
+/// Compiles the non-empty `secrets` into one automaton. Returns it (`None` if
+/// there is nothing to match) and the length of the longest secret.
+fn build_matcher<I, P>(secrets: I) -> Result<(Option<AhoCorasick>, usize), RunError>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<[u8]>,
+{
+    let patterns: Vec<P> = secrets
+        .into_iter()
+        .filter(|s| !s.as_ref().is_empty())
+        .collect();
+    let max_len = patterns.iter().map(|p| p.as_ref().len()).max().unwrap_or(0);
+    if patterns.is_empty() {
+        return Ok((None, 0));
+    }
+    let matcher = AhoCorasick::builder()
+        .match_kind(MatchKind::LeftmostLongest)
+        // The prefilter (memchr/Teddy/Rabin-Karp) is a speed-up that keeps
+        // its own contiguous copy of the patterns; without it the secrets
+        // exist only as automaton transitions, which a plain scan of the
+        // process's memory for the secret does not find.
+        .prefilter(false)
+        .build(&patterns)
+        .map_err(|_| RunError::Shield)?;
+    Ok((Some(matcher), max_len))
 }
 
 /// Redacts a complete in-memory buffer. Convenience wrapper over [`Redactor`].
@@ -188,16 +250,18 @@ where
 /// chunk. Only used where there is no supervising poll loop (non-Unix).
 #[cfg(not(unix))]
 fn pump<R: Read, W: Write>(mut reader: R, mut writer: W, mut redactor: Redactor) {
-    let mut buf = vec![0u8; CHUNK];
+    // Raw (unredacted) child output: wiped after every use and on drop.
+    let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if redactor
+                let failed = redactor
                     .push(&buf[..n], &mut writer)
                     .and_then(|()| writer.flush())
-                    .is_err()
-                {
+                    .is_err();
+                buf[..n].zeroize();
+                if failed {
                     return;
                 }
             }
@@ -229,6 +293,10 @@ fn build_command(program: &OsStr, args: &[OsString], vault: &Vault) -> Command {
 /// environment. When `shield` is set, the child's stdout and stderr are piped
 /// through a [`Redactor`] before reaching our own stdout and stderr.
 ///
+/// The vault is taken by value and dropped (wiped) as soon as the command has
+/// been spawned, together with the `Command` that holds a copy of it: the
+/// supervising process keeps only the redaction automaton.
+///
 /// On Unix, cloakenv stays the child's parent for the whole run and
 ///
 /// * forwards `SIGTERM`, `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGUSR1` and `SIGUSR2` to it
@@ -243,29 +311,33 @@ fn build_command(program: &OsStr, args: &[OsString], vault: &Vault) -> Command {
 ///
 /// The CLI only uses this for `--shield`; without it, it replaces itself with
 /// the command via [`exec_replace`].
-pub fn run(command: &[OsString], vault: &Vault, shield: bool) -> Result<ExitStatus, RunError> {
+pub fn run(command: &[OsString], vault: Vault, shield: bool) -> Result<ExitStatus, RunError> {
     let (program, args) = command.split_first().ok_or(RunError::NoCommand)?;
 
-    // Build the redactors before spawning so a failure here fails closed.
+    // Build the redactors before spawning so a failure here fails closed. One
+    // automaton serves both streams.
     let redactors = if shield {
         let values: Vec<&[u8]> = vault.iter().map(|(_, v)| v.as_bytes()).collect();
-        Some((Redactor::new(&values)?, Redactor::new(&values)?))
+        Some(Redactor::new_pair(&values)?)
     } else {
         None
     };
 
-    let mut cmd = build_command(program, args, vault);
+    let mut cmd = build_command(program, args, &vault);
     if shield {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
 
     #[cfg(unix)]
     {
-        crate::supervise::run(cmd, program, redactors)
+        crate::supervise::run(cmd, program, redactors, vault)
     }
     #[cfg(not(unix))]
     {
         let mut child = cmd.spawn().map_err(|e| spawn_error(e, program))?;
+        // The child has its copy; wipe ours (and free the Command's).
+        drop(cmd);
+        drop(vault);
         let Some((out_redactor, err_redactor)) = redactors else {
             return child.wait().map_err(RunError::Wait);
         };
@@ -367,6 +439,59 @@ mod tests {
             v.set(k, Zeroizing::new(val.to_owned())).unwrap();
         }
         assert_eq!(short_value_keys(&v), ["FIVE", "ONE", "UNI"]);
+    }
+
+    /// What is left in a redactor's buffer beyond its length, as bytes.
+    #[allow(unsafe_code)]
+    fn stale_bytes(r: &Redactor, written: usize) -> &[u8] {
+        // SAFETY: the first `written` bytes of the allocation were
+        // initialised by the pushes the tests made (nothing has been freed or
+        // reallocated), so reading them is sound.
+        let all = unsafe { std::slice::from_raw_parts(r.pending.as_ptr(), written) };
+        &all[r.pending.len()..]
+    }
+
+    #[test]
+    fn shifted_out_input_is_wiped_from_the_buffer() {
+        let mut r = Redactor::new(["abcdef"]).unwrap();
+        let mut out = Vec::new();
+        r.push(b"xxxxxxxxxxabc", &mut out).unwrap();
+        assert_eq!(out, b"xxxxxxxx");
+        assert_eq!(&r.pending[..], b"xxabc");
+        assert!(stale_bytes(&r, 13).iter().all(|b| *b == 0));
+
+        // A redacted secret leaves no copy behind either.
+        let mut r = Redactor::new(["abcdef"]).unwrap();
+        let mut out = Vec::new();
+        r.push(b"..abcdef..ab", &mut out).unwrap();
+        assert_eq!(out, b"..[REDACTED_BY_CLOAKENV]");
+        assert_eq!(&r.pending[..], b"..ab");
+        assert!(stale_bytes(&r, 12).iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn a_pair_shares_one_automaton_but_not_buffers() {
+        let (mut a, mut b) = Redactor::new_pair(["abcdef"]).unwrap();
+        let (mut out_a, mut out_b) = (Vec::new(), Vec::new());
+        a.push(b"zzabc", &mut out_a).unwrap();
+        b.push(b"yyyyabcdefyy", &mut out_b).unwrap();
+        a.push(b"def", &mut out_a).unwrap();
+        a.finish(&mut out_a).unwrap();
+        b.finish(&mut out_b).unwrap();
+        assert_eq!(out_a, b"zz[REDACTED_BY_CLOAKENV]");
+        assert_eq!(out_b, b"yyyy[REDACTED_BY_CLOAKENV]yy");
+    }
+
+    #[test]
+    fn growing_the_buffer_never_leaves_the_old_one_behind() {
+        // A chunk larger than the initial allocation forces a new buffer
+        // (old one wiped on drop); output is unaffected.
+        let big = vec![b'q'; CHUNK * 3];
+        let mut r = Redactor::new(["abcdef"]).unwrap();
+        let mut out = Vec::new();
+        r.push(&big, &mut out).unwrap();
+        r.finish(&mut out).unwrap();
+        assert_eq!(out, big);
     }
 
     #[test]

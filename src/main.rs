@@ -1,16 +1,17 @@
 //! `cloakenv` command-line interface.
 
 use std::ffi::OsString;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use cloakenv::crypto::KdfParams;
+use cloakenv::input::{self, InputError};
 use cloakenv::vault::{
     Vault, VaultError, VaultLock, is_valid_key, parse_dotenv, read_env_file, vault_dir,
     write_gitignore,
@@ -233,8 +234,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             if !shield {
                 return Err(runner::exec_replace(&command, vault).into());
             }
-            let status = runner::run(&command, &vault, shield)?;
-            drop(vault);
+            let status = runner::run(&command, vault, shield)?;
             let code = runner::exit_code(status);
             return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
         }
@@ -425,11 +425,7 @@ fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
         Zeroizing::new(p)
     } else if let Some(file) = std::env::var_os(PASSPHRASE_FILE_ENV) {
         perms::emit(&perms::passphrase_file_warnings(Path::new(&file)));
-        let mut content = Zeroizing::new(std::fs::read_to_string(&file).with_context(|| {
-            format!("cannot read passphrase file {}", Path::new(&file).display())
-        })?);
-        strip_newline(&mut content);
-        content
+        read_passphrase_file(Path::new(&file))?
     } else {
         // Only prompt when attached to a terminal; never block a pipeline.
         if !io::stdin().is_terminal() {
@@ -456,26 +452,45 @@ fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
     Ok(pass)
 }
 
+/// Reads the passphrase file into one wiped buffer (at most 64 KiB; a FIFO or
+/// process substitution works too) and strips a single trailing line ending.
+fn read_passphrase_file(file: &Path) -> Result<Zeroizing<String>> {
+    let shown = file.display();
+    let handle = std::fs::File::open(file)
+        .with_context(|| format!("cannot read passphrase file {shown}"))?;
+    let mut bytes =
+        input::read_limited(handle, input::MAX_PASSPHRASE_FILE_LEN).map_err(|e| match e {
+            InputError::TooLarge => anyhow!("passphrase file {shown} is larger than 64 KiB"),
+            InputError::NotUtf8 => anyhow!("passphrase file {shown} is not valid UTF-8"),
+            InputError::Io(e) => {
+                anyhow::Error::new(e).context(format!("cannot read passphrase file {shown}"))
+            }
+        })?;
+    input::strip_one_line_ending(&mut bytes);
+    input::into_text(bytes).map_err(|_| anyhow!("passphrase file {shown} is not valid UTF-8"))
+}
+
 fn read_value(key: &str) -> Result<Zeroizing<String>> {
     if io::stdin().is_terminal() {
         return Ok(Zeroizing::new(rpassword::prompt_password(format!(
             "value for {key}: "
         ))?));
     }
-    let mut buf = Zeroizing::new(String::new());
-    io::stdin()
-        .read_to_string(&mut buf)
-        .context("cannot read value from stdin")?;
-    strip_newline(&mut buf);
-    Ok(buf)
-}
-
-/// Strips a single trailing newline (`\n` or `\r\n`).
-fn strip_newline(s: &mut String) {
-    if s.ends_with('\n') {
-        s.pop();
-        if s.ends_with('\r') {
-            s.pop();
-        }
+    // One buffer, allocated once and wiped on drop, so no stray copy of the
+    // value is left behind by a growing read. The limit is 1 MiB for the
+    // value itself; room for a final `\r\n` is read on top of it and stripped.
+    // None of the input is ever echoed in an error.
+    const TOO_LARGE: &str = "the value on stdin is larger than 1 MiB; nothing was stored";
+    const NOT_UTF8: &str = "the value on stdin is not valid UTF-8; nothing was stored";
+    let mut bytes =
+        input::read_stdin_limited(input::MAX_STDIN_VALUE_LEN + 2).map_err(|e| match e {
+            InputError::TooLarge => anyhow!(TOO_LARGE),
+            InputError::NotUtf8 => anyhow!(NOT_UTF8),
+            InputError::Io(e) => anyhow!("cannot read value from stdin: {e}"),
+        })?;
+    input::strip_one_line_ending(&mut bytes);
+    if bytes.len() > input::MAX_STDIN_VALUE_LEN {
+        bail!(TOO_LARGE);
     }
+    input::into_text(bytes).map_err(|_| anyhow!(NOT_UTF8))
 }

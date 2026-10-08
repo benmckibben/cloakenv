@@ -5,6 +5,7 @@
 | module          | responsibility                                                          |
 |-----------------|-------------------------------------------------------------------------|
 | `src/main.rs`   | clap CLI, passphrase acquisition, exit-code mapping                     |
+| `src/input.rs`  | reading secret text (stdin value, passphrase file) into one wiped, size-capped buffer |
 | `src/crypto.rs` | Argon2id key derivation, XChaCha20-Poly1305 seal/open, OS RNG           |
 | `src/vault.rs`  | vault file format, in-memory map, atomic writes (0600 on Unix), `.env` parser |
 | `src/perms.rs`  | advisory permission/symlink warnings for the vault and passphrase file (Unix) |
@@ -170,6 +171,72 @@ platforms any exit status above 255 becomes 1). `PR_SET_DUMPABLE` and
 `PR_SET_PDEATHSIG` are Linux only (see invariant 6): on macOS `exec` and signal
 forwarding behave the same, but a `SIGKILL` of cloakenv under `--shield` leaves
 the command running.
+
+## Memory hygiene (best effort)
+
+Plaintext secrets are held in `Zeroizing` buffers and wiped when dropped. Rust
+and the standard library offer no way to *guarantee* that no other copy exists
+(a growing `Vec` leaves its old allocation behind, freed but not wiped, and
+std's own buffers are out of reach), so this section records what is done,
+what is not, and why. The numbers come from scanning the anonymous memory and
+heap of a running release build through `/proc/<pid>/mem` (from a parent that
+is allowed to: root of a user namespace, since cloakenv is non-dumpable) for a
+distinctive 212-byte dummy secret, counted before and after the changes
+described here:
+
+| situation (cloakenv process scanned)                  | full copies before | full copies after |
+|-------------------------------------------------------|-------------------:|------------------:|
+| `set`: value read from a slow pipe, waiting for the lock | 1 (plus 0 to 3 stale partial copies from the growing read) | 1 (the live value), no stale copies |
+| `run --shield`: command running, output has flowed    | 8 to 16            | 0                 |
+
+* **Value for `set` (stdin).** Read into one buffer allocated once (1 MiB + 2
+  bytes: the limit plus room for a final `\r\n`, which is stripped; larger
+  input is refused with a non-echoing error), filled in place through a
+  duplicate of the stdin descriptor so that std's 8 KiB stdin buffer never
+  holds a copy, then *moved* (not copied) into the `String` that goes into the
+  vault. Previously `read_to_string` regrew its buffer, leaving unwiped copies
+  of the first bytes behind. The interactive prompt uses `rpassword`, whose
+  line buffer grows character by character: a few short stale copies of what
+  was typed may remain on the heap for the (brief) life of the process.
+  Accepted: the interactive path, bounded by the length of one line.
+* **Passphrase.** From `CLOAKENV_PASSPHRASE` it is copied into a `Zeroizing`
+  string, but the original sits in the process's environment block until the
+  process execs or exits, and a safe Rust program cannot unset it. That is
+  what the non-dumpable flag is for (and why the README recommends a file or
+  the prompt where the same-user window matters). A passphrase file is read like a
+  `set` value (one buffer, at most 64 KiB, wiped). Argon2 works in 64 MiB of
+  memory that the `argon2` crate does not wipe, but it holds only data derived
+  one-way from passphrase and salt, never the passphrase itself (the
+  crate does wipe its initial hash and block hashes); an allocation that size
+  is returned to the operating system, which zeroes the pages before anyone
+  else gets them. Accepted.
+* **`run` without `--shield`.** `exec` replaces the address space: nothing of
+  cloakenv survives (see "Process model").
+* **`run --shield`.** The vault is taken by value and dropped (wiped) right
+  after the command has been spawned, together with the `Command` that held a
+  copy of every value, instead of being kept for as long as the command runs.
+  The two pump read buffers (raw, unredacted child output) and each redactor's
+  held-back buffer are `Zeroizing`: buffers are wiped after every chunk, the
+  bytes shifted out of the held-back buffer are wiped as they go, and a
+  buffer that has to grow is replaced, never reallocated in place. The two
+  output streams share **one** Aho-Corasick automaton (a clone is a reference
+  count) instead of building one each. The library cannot zeroize an
+  automaton, so it is dropped as soon as both pumps are done; but it is built
+  with its prefilter turned off, because the prefilter stores the patterns
+  verbatim, which made the secret findable by a plain memory search (the
+  remaining representation is a state machine, from which a determined
+  attacker with memory access could still reconstruct the values: it is not
+  encryption, merely not a contiguous copy). Matching speed is unaffected for
+  this workload (about 500 to 600 MB/s in a micro-benchmark either way).
+* **Not fixable here, accepted:** the copies that `std::process::Command` makes
+  of the environment (its own map, and the C string array built when
+  spawning). They are freed but not wiped, so they can linger in freed heap
+  memory until reused. In the `--shield` scan above they did not leave a
+  contiguous copy that survived, but nothing guarantees that. Without
+  `--shield` they vanish with the exec.
+* **Argument vector.** clap's raw arguments hold key names, the command to run
+  and, for `set`, a refused VALUE (which is already in the kernel's
+  `/proc/<pid>/cmdline` by then): no secret is ever read from argv by design.
 
 ## Invariants and how they are enforced
 

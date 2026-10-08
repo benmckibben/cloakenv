@@ -24,6 +24,17 @@ cloakenv run -- npm start              # secrets injected into npm's env
 cloakenv run --shield -- ./debug.sh    # ...and redacted from its output
 ```
 
+## Values you store
+
+`cloakenv set KEY` reads the value from a hidden prompt, or from stdin when
+stdin is not a terminal (never from the command line). From stdin it takes at
+most **1 MiB**, with one trailing newline (`\n` or `\r\n`) removed and nothing
+else; anything larger, or not valid UTF-8, is refused with an error that does
+not repeat any of it, and nothing is stored. (Linux itself will not start a
+command whose single environment variable is over 128 KiB, so a value that large
+can be stored but not injected.) The input is read into one buffer that is wiped
+afterwards; see "Memory hygiene" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#memory-hygiene-best-effort).
+
 ## Passphrase sources
 
 In order of precedence:
