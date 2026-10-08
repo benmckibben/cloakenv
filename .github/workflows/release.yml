@@ -18,12 +18,6 @@ on:
     tags: ["v*"]
   # Dry-run the whole pipeline from any branch, without a tag.
   workflow_dispatch:
-  # TEMPORARY (removed again before merge): the PAT used for this PR cannot
-  # dispatch workflows, so exercise the pipeline from the PR itself.
-  pull_request:
-    paths:
-      - ".github/workflows/release.yml"
-      - ".github/scripts/smoke-test.sh"
 
 # Read-only token, workflow-wide. Don't add write scopes here: a release
 # workflow that can write is one bug away from publishing.
