@@ -61,5 +61,5 @@ cryptography and the precise guarantees (and non-guarantees) of `--shield`.
 
 ## License
 
-Licensed under either of Apache License, Version 2.0 or MIT license at your
-option.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
