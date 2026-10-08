@@ -17,6 +17,30 @@ pub const REDACTION: &[u8] = b"[REDACTED_BY_CLOAKENV]";
 
 const CHUNK: usize = 8 * 1024;
 
+/// Under `--shield`, values shorter than this many bytes are flagged by the
+/// CLI. Redaction matches literal substrings, so a short value (`1`, `80`,
+/// `true`, `prod`) matches ordinary output all the time and every match
+/// becomes a 22-byte marker; and the marker appearing for a guessed string
+/// confirms the guess, which for a few bytes is cheap to brute-force. Six
+/// bytes is a line between "plausibly a token or password" and "probably a
+/// flag, port or word"; common non-secret settings (`true`, `false`, `dev`,
+/// `8080`) fall below it. This is advice only: redaction is unchanged.
+pub const SHORT_VALUE_LEN: usize = 6;
+
+/// Keys (in sorted order) whose non-empty values are shorter than
+/// [`SHORT_VALUE_LEN`] bytes. Only names are returned, never values. Empty
+/// values are skipped: the redactor ignores them, so they neither mangle
+/// output nor leak anything.
+///
+/// Every vault entry is considered, since `--shield` redacts all of them.
+pub fn short_value_keys(vault: &Vault) -> Vec<&str> {
+    vault
+        .iter()
+        .filter(|(_, v)| !v.is_empty() && v.len() < SHORT_VALUE_LEN)
+        .map(|(k, _)| k)
+        .collect()
+}
+
 /// Errors produced while running a child process.
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -261,6 +285,23 @@ mod tests {
         let none: [&[u8]; 0] = [];
         assert_eq!(redact_all(none, b"hello").unwrap(), b"hello");
         assert_eq!(redact_all([b"".as_slice()], b"hello").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn short_value_keys_lists_names_only() {
+        use zeroize::Zeroizing;
+        let mut v = Vault::new();
+        for (k, val) in [
+            ("EMPTY", ""),
+            ("ONE", "1"),
+            ("FIVE", "12345"),
+            ("SIX", "123456"),
+            ("LONG", "a-much-longer-value"),
+            ("UNI", "ü€"), // 5 bytes, not 2 characters
+        ] {
+            v.set(k, Zeroizing::new(val.to_owned())).unwrap();
+        }
+        assert_eq!(short_value_keys(&v), ["FIVE", "ONE", "UNI"]);
     }
 
     #[test]

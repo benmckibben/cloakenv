@@ -213,6 +213,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let pass = passphrase(false)?;
             let vault = load(path, &pass)?;
             drop(pass);
+            if shield {
+                warn_short_values(&vault);
+            }
             let status = runner::run(&command, &vault, shield)?;
             drop(vault);
             let code = runner::exit_code(status);
@@ -220,6 +223,27 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Warns (on our own stderr, before the child starts, so never through the
+/// shield stream) about vault values too short to be redacted sensibly.
+/// Names the keys only, never the values. Advisory: exit codes and redaction
+/// are unchanged.
+fn warn_short_values(vault: &Vault) {
+    let keys = runner::short_value_keys(vault);
+    if keys.is_empty() {
+        return;
+    }
+    let (noun, verb) = if keys.len() == 1 {
+        ("value of", "is")
+    } else {
+        ("values of", "are")
+    };
+    eprintln!(
+        "cloakenv: warning: --shield: the {noun} {} {verb} shorter than {} bytes; short values are redacted everywhere they occur (bloating and garbling the output) and the redaction marker confirms a guessed string, so they act as a guessing oracle; keep short, non-secret settings out of the vault",
+        keys.join(", "),
+        runner::SHORT_VALUE_LEN
+    );
 }
 
 /// Reports a command-line parse error *without* echoing any argument.

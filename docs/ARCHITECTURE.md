@@ -182,10 +182,15 @@ tests check every chunk size from 1 to the input length.
 * When two *different* secrets overlap in the output (e.g. `hunter2` and
   `2fa-token` printed as `hunter2fa-token`), leftmost-longest redacts the
   first and the non-overlapping tail of the second remains visible.
-* Very short values (1–3 characters, e.g. `1`) redact every occurrence of that
+* Very short values (a few bytes, e.g. `1`) redact every occurrence of that
   string: output is mangled and inflated (each 1-byte match becomes
   22 bytes), and seeing `[REDACTED_BY_CLOAKENV]` for a guessed string confirms
   the guess, a practical guessing oracle for such values.
+  `run --shield` warns (stderr of cloakenv itself, before spawning; never via
+  the shield stream) naming each key whose non-empty value is under
+  `runner::SHORT_VALUE_LEN` = 6 bytes. All vault entries are checked, since
+  the shield redacts all of them. Advisory only: no exit-code or redaction
+  change.
 * Empty values are never matched.
 * Redaction only applies to the child's stdout/stderr pipes; anything the
   child writes to files, sockets or `/dev/tty` directly is not filtered.

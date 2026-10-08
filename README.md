@@ -186,12 +186,22 @@ What it does **not** catch:
   (Within one stream, order is preserved.)
 - **Anything that isn't the stdout/stderr pipe:** files, sockets, `/dev/tty`,
   other inherited file descriptors, or a deliberate `| base64`.
-- **Very short secrets (1–3 characters).** Every occurrence of the string is
+- **Very short secrets (a few bytes).** Every occurrence of the string is
   replaced, so ordinary output is mangled and *inflated* (a 1-byte secret
   becomes 22 bytes per occurrence), and `[REDACTED_BY_CLOAKENV]` appearing for a
   guessed string tells whoever can see the output that the guess is a secret
   value, which is a practical guessing oracle for such short values. Don't keep
-  tiny non-secret settings (`DEBUG=1`, `PORT=80`) in the vault.
+  tiny non-secret settings (`DEBUG=1`, `PORT=80`) in the vault. To make
+  this visible, `run --shield` prints one warning on cloakenv's own stderr,
+  before the child starts (so it is never part of the redacted stream), when
+  any non-empty vault value is shorter than 6 bytes. It names the keys, never
+  the values, and changes neither exit codes nor redaction:
+
+  ```
+  cloakenv: warning: --shield: the values of DEBUG, PORT are shorter than 6 bytes; short values are redacted everywhere they occur (bloating and garbling the output) and the redaction marker confirms a guessed string, so they act as a guessing oracle; keep short, non-secret settings out of the vault
+  ```
+
+  Redaction itself is unchanged and still applies to such values.
 - **A partial secret at the end of the output.** To match across chunk
   boundaries the filter holds back the last (longest secret − 1) bytes of each
   stream. If the stream ends in the middle of what *would* have been a match
