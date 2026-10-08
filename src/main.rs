@@ -11,7 +11,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use cloakenv::vault::{Vault, VaultError, VaultLock, is_valid_key, parse_dotenv};
-use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, hardening, is_reserved_key, runner};
+use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, hardening, is_reserved_key, perms, runner};
 
 /// Lightweight encrypted local secret vault and zero-leak process injection engine.
 ///
@@ -129,6 +129,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             if path.exists() && !force {
                 bail!("a vault already exists at {}", path.display());
             }
+            perms::emit(&perms::vault_warnings(path, false));
             Vault::new().save(path, pass.as_bytes())?;
             eprintln!("cloakenv: initialized vault at {}", path.display());
         }
@@ -292,6 +293,9 @@ fn load(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
             path.display()
         );
     }
+    // Advisory only; goes to our own stderr before anything is decrypted or
+    // spawned, so it can never end up inside a shielded child stream.
+    perms::emit(&perms::vault_warnings(path, true));
     Ok(Vault::load(path, pass.as_bytes())?)
 }
 
@@ -299,6 +303,7 @@ fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
     let pass = if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
         Zeroizing::new(p)
     } else if let Some(file) = std::env::var_os(PASSPHRASE_FILE_ENV) {
+        perms::emit(&perms::passphrase_file_warnings(Path::new(&file)));
         let mut content = Zeroizing::new(std::fs::read_to_string(&file).with_context(|| {
             format!("cannot read passphrase file {}", Path::new(&file).display())
         })?);

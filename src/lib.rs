@@ -10,6 +10,8 @@
 //!   their environment, plus the `--shield` streaming redactor.
 //! * [`hardening`]: process-level protections (non-dumpable on Linux) applied
 //!   before any secret is handled.
+//! * [`perms`]: advisory warnings about loose permissions on the vault, its
+//!   directory and the passphrase file (Unix).
 //!
 //! Invariant: decrypted secret values only ever live in process memory
 //! (wrapped in [`zeroize::Zeroizing`]) and in the child's environment block.
@@ -19,6 +21,7 @@
 
 pub mod crypto;
 pub mod hardening;
+pub mod perms;
 pub mod runner;
 pub mod vault;
 

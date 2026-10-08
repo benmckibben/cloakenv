@@ -422,7 +422,12 @@ fn lock_file(_file: &fs::File, _block: bool) -> io::Result<()> {
 }
 
 fn parent_dir(path: &Path) -> PathBuf {
-    match path.parent() {
+    vault_dir(path)
+}
+
+/// The directory that holds the vault at `vault` (`.` for a bare file name).
+pub fn vault_dir(vault: &Path) -> PathBuf {
+    match vault.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     }
