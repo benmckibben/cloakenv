@@ -91,6 +91,61 @@ container secret mounts (Docker, Kubernetes) are commonly mode 0444/0644 and
 protected by the container boundary instead. On a normal workstation, fix it
 with `chmod 600`.
 
+## Vault file limits
+
+The key-derivation settings are stored in the vault header, which cloakenv has
+to read *before* it can authenticate the file. To keep a hostile or corrupted
+file from forcing a huge allocation or many seconds of CPU, headers asking for
+more than **256 MiB, 8 passes or 8 lanes** are refused up front, exactly like
+any other bad vault (exit 125, nothing spawned):
+
+```
+cloakenv: error: unsupported key-derivation parameters (memory 1048576 KiB, iterations 32, lanes 1); this version accepts memory 8192 to 262144 KiB, iterations 1 to 8, lanes 1 to 8
+```
+
+New vaults use 64 MiB / 3 passes / 1 lane, well inside the limit. There is no
+flag or variable to raise it. It only matters if you created a vault through
+the library API with stronger-than-default settings above the cap.
+
+### Key-derivation settings are upgraded on save
+
+New vaults use Argon2id with 64 MiB / 3 passes / 1 lane. The library API
+refuses to create a vault weaker than OWASP's minimum Argon2id setting
+(19 MiB / 2 passes / 1 lane). Vaults written by older versions with weaker
+settings (down to 8 MiB / 1 pass) still **open**, so nobody is locked out of
+their secrets, but cloakenv warns about them on stderr (exit codes unchanged):
+
+```
+cloakenv: warning: vault key-derivation settings (memory 8192 KiB, iterations 1, lanes 1) are weaker than the recommended minimum (memory 19456 KiB, iterations 2, lanes 1); they are upgraded the next time you run `cloakenv set`, `unset` or `import`
+```
+
+Every `set`, `unset` and `import` re-saves the vault with each parameter
+raised to at least the default (the per-parameter maximum of the vault's own
+setting and 64 MiB / 3 / 1; a vault that is already stronger keeps its stronger
+parameters), at the cost of one extra key derivation that the save performs
+anyway, and says so:
+
+```
+cloakenv: upgraded the vault's key-derivation settings from memory 8192 KiB, iterations 1, lanes 1 to memory 65536 KiB, iterations 3, lanes 1
+```
+
+A header below 8 MiB / 1 pass / 1 lane is rejected as unsupported.
+
+### Reading the vault
+
+The vault path must also be an ordinary file of at most 16 MiB. cloakenv opens
+it once, checks the open handle (not the path) and reads with a hard size cap,
+so `--vault /dev/zero`, a FIFO, a directory or a huge file is refused
+immediately (exit 125 for `run`, nothing spawned) instead of exhausting memory
+or hanging:
+
+```
+cloakenv: error: /dev/zero is not a regular file (it is a directory, device, pipe or socket); refusing to read it as a vault
+cloakenv: error: vault file is too large (the limit is 16 MiB)
+```
+
+A symbolic link to a regular file keeps working (with the warning above).
+
 ## Exit codes
 
 | situation                                      | code          |
@@ -131,12 +186,22 @@ What it does **not** catch:
   (Within one stream, order is preserved.)
 - **Anything that isn't the stdout/stderr pipe:** files, sockets, `/dev/tty`,
   other inherited file descriptors, or a deliberate `| base64`.
-- **Very short secrets (1–3 characters).** Every occurrence of the string is
+- **Very short secrets (a few bytes).** Every occurrence of the string is
   replaced, so ordinary output is mangled and *inflated* (a 1-byte secret
   becomes 22 bytes per occurrence), and `[REDACTED_BY_CLOAKENV]` appearing for a
   guessed string tells whoever can see the output that the guess is a secret
   value, which is a practical guessing oracle for such short values. Don't keep
-  tiny non-secret settings (`DEBUG=1`, `PORT=80`) in the vault.
+  tiny non-secret settings (`DEBUG=1`, `PORT=80`) in the vault. To make
+  this visible, `run --shield` prints one warning on cloakenv's own stderr,
+  before the child starts (so it is never part of the redacted stream), when
+  any non-empty vault value is shorter than 6 bytes. It names the keys, never
+  the values, and changes neither exit codes nor redaction:
+
+  ```
+  cloakenv: warning: --shield: the values of DEBUG, PORT are shorter than 6 bytes; short values are redacted everywhere they occur (bloating and garbling the output) and the redaction marker confirms a guessed string, so they act as a guessing oracle; keep short, non-secret settings out of the vault
+  ```
+
+  Redaction itself is unchanged and still applies to such values.
 - **A partial secret at the end of the output.** To match across chunk
   boundaries the filter holds back the last (longest secret − 1) bytes of each
   stream. If the stream ends in the middle of what *would* have been a match

@@ -14,10 +14,25 @@
 
 ## Cryptography
 
-* **KDF:** Argon2id v1.3. New vaults use 64 MiB / 3 passes / 1 lane. The
-  parameters live in the header; on read they must fall within
-  8 MiB–1 GiB, 1–32 passes, 1–16 lanes, which caps the work an untrusted file
-  can demand before authentication fails.
+* **KDF:** Argon2id v1.3. New vaults use 64 MiB / 3 passes / 1 lane. A
+  vault is only ever *written* with at least 19 MiB / 2 / 1 (OWASP's minimum
+  Argon2id setting; `KdfParams::MIN`; `Vault::with_params` refuses less, and
+  `seal` clamps up to it). On *read* the lower bound is the more lenient
+  8 MiB / 1 / 1 (`KdfParams::FLOOR`, the old minimum), so a weak vault created
+  by an earlier version still opens instead of locking its owner out; the CLI
+  warns about it and `set`/`unset`/`import` upgrade every parameter to at
+  least the default (`Vault::upgrade_kdf_params`, a per-parameter maximum, so
+  a stronger vault is never weakened) when they re-save. The
+  parameters live in the header, which is read *before* the file is
+  authenticated, so on read they must fall within a fixed range: at most
+  256 MiB, 8 passes and 8 lanes. This caps the memory and CPU an untrusted
+  vault file can demand (a 1 GiB / 32-pass header used to cost ~18 s and ~1 GiB
+  of RAM before failing). Out-of-range headers are rejected before any key
+  derivation, like any other malformed vault: exit 125, child not run, and an
+  error that names the accepted range. There is deliberately no override
+  (flag or environment variable) to raise the cap: new vaults are written with
+  64 MiB / 3 / 1, so only a vault created through the library API with
+  parameters above the cap is affected.
 * **AEAD:** XChaCha20-Poly1305 with a random 192-bit nonce. A fresh salt *and*
   nonce are generated on every write, so nonce reuse is not a practical concern.
 * **Associated data:** the entire 64-byte header (magic, version, algorithm
@@ -67,6 +82,15 @@ vault inode is replaced on every save. Readers (`list`, `run`) take no lock;
 the atomic rename already guarantees they see a complete vault. Passphrase and
 value prompts happen *before* the lock is taken, so an idle prompt never
 blocks other writers. `flock` is Unix only; elsewhere the lock is a no-op.
+
+**Reading the vault is bounded.** `Vault::load` opens the path once
+(`O_NONBLOCK | O_NOCTTY` on Unix, so opening a FIFO or terminal cannot block
+or steal a controlling terminal), runs `fstat` on the *open handle*, and
+refuses anything that is not a regular file or is larger than 16 MiB before
+reading a byte; the read itself is additionally capped at 16 MiB + 1 byte, so a
+file that grows or lies about its size cannot cause unbounded allocation.
+Symlinks are followed (and warned about); a symlink to `/dev/zero` is refused
+because the check is on what it resolves to.
 
 **Permission checks (Unix, advisory).** When a command opens the vault,
 `src/perms.rs` warns on stderr if the vault directory is group/world-writable,
@@ -158,10 +182,15 @@ tests check every chunk size from 1 to the input length.
 * When two *different* secrets overlap in the output (e.g. `hunter2` and
   `2fa-token` printed as `hunter2fa-token`), leftmost-longest redacts the
   first and the non-overlapping tail of the second remains visible.
-* Very short values (1–3 characters, e.g. `1`) redact every occurrence of that
+* Very short values (a few bytes, e.g. `1`) redact every occurrence of that
   string: output is mangled and inflated (each 1-byte match becomes
   22 bytes), and seeing `[REDACTED_BY_CLOAKENV]` for a guessed string confirms
   the guess, a practical guessing oracle for such values.
+  `run --shield` warns (stderr of cloakenv itself, before spawning; never via
+  the shield stream) naming each key whose non-empty value is under
+  `runner::SHORT_VALUE_LEN` = 6 bytes. All vault entries are checked, since
+  the shield redacts all of them. Advisory only: no exit-code or redaction
+  change.
 * Empty values are never matched.
 * Redaction only applies to the child's stdout/stderr pipes; anything the
   child writes to files, sockets or `/dev/tty` directly is not filtered.

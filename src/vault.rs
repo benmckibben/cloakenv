@@ -33,7 +33,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -64,8 +64,13 @@ pub enum VaultError {
     UnsupportedAlgorithm { kdf: u8, aead: u8 },
     #[error("vault file is truncated or malformed")]
     Malformed,
-    #[error("vault file is too large")]
+    #[error("vault file is too large (the limit is 16 MiB)")]
     TooLarge,
+    #[error(
+        "{} is not a regular file (it is a directory, device, pipe or socket); refusing to read it as a vault",
+        .0.display()
+    )]
+    NotRegularFile(PathBuf),
     // The rejected name is deliberately not echoed: a user who swaps the
     // KEY and VALUE arguments would otherwise see their secret in the error.
     #[error("invalid variable name: must match [A-Za-z_][A-Za-z0-9_]*")]
@@ -126,6 +131,8 @@ impl Vault {
     }
 
     /// Creates an empty vault with explicit KDF parameters.
+    /// The parameters must lie within [`KdfParams::MIN`] and
+    /// [`KdfParams::MAX`].
     pub fn with_params(params: KdfParams) -> Result<Self, VaultError> {
         Ok(Self {
             entries: BTreeMap::new(),
@@ -136,6 +143,17 @@ impl Vault {
     /// KDF parameters used when sealing this vault.
     pub fn params(&self) -> KdfParams {
         self.params
+    }
+
+    /// Raises every KDF parameter to at least [`KdfParams::DEFAULT`] (never
+    /// lowering any), so the next [`Vault::save`] re-encrypts older or weaker
+    /// vaults with current settings. Returns whether anything changed. A
+    /// vault already stronger than the default keeps its own settings.
+    pub fn upgrade_kdf_params(&mut self) -> bool {
+        let upgraded = self.params.at_least(KdfParams::DEFAULT);
+        let changed = upgraded != self.params;
+        self.params = upgraded;
+        changed
     }
 
     /// Inserts or replaces a secret.
@@ -241,8 +259,11 @@ impl Vault {
     pub fn seal(&self, passphrase: &[u8]) -> Result<Vec<u8>, VaultError> {
         let salt: [u8; SALT_LEN] = crypto::random_bytes()?;
         let nonce: [u8; NONCE_LEN] = crypto::random_bytes()?;
-        let header = encode_header(self.params, &salt, &nonce);
-        let key = crypto::derive_key(passphrase, &salt, self.params)?;
+        // Never write settings weaker than the current minimum, even for a
+        // vault that was loaded with older, weaker ones.
+        let params = self.params.at_least(KdfParams::MIN).validate()?;
+        let header = encode_header(params, &salt, &nonce);
+        let key = crypto::derive_key(passphrase, &salt, params)?;
         let payload = self.encode_payload();
         let ciphertext = crypto::seal(&key, &nonce, &header, &payload)?;
         let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
@@ -267,12 +288,15 @@ impl Vault {
     }
 
     /// Reads and decrypts a vault file.
+    ///
+    /// The file is opened once and every check is made on that open handle
+    /// (no check-then-open race): it must be a regular file no larger than
+    /// [`MAX_VAULT_LEN`], and the read itself is capped at that size too.
+    /// Symbolic links are followed. Devices, pipes, sockets and directories
+    /// are refused without being read, so `--vault /dev/zero` or a FIFO fails
+    /// closed instead of exhausting memory or hanging.
     pub fn load(path: &Path, passphrase: &[u8]) -> Result<Self, VaultError> {
-        let meta = fs::metadata(path).map_err(|e| VaultError::io("cannot read vault", path, e))?;
-        if meta.len() > MAX_VAULT_LEN {
-            return Err(VaultError::TooLarge);
-        }
-        let bytes = fs::read(path).map_err(|e| VaultError::io("cannot read vault", path, e))?;
+        let bytes = read_vault_file(path)?;
         Self::open(&bytes, passphrase)
     }
 
@@ -284,6 +308,56 @@ impl Vault {
         let bytes = self.seal(passphrase)?;
         write_atomic_private(path, &bytes)
     }
+}
+
+/// Opens `path` once and reads at most [`MAX_VAULT_LEN`] bytes from it, after
+/// checking on the open handle that it is a regular file.
+fn read_vault_file(path: &Path) -> Result<Vec<u8>, VaultError> {
+    let io_err = |e| VaultError::io("cannot read vault", path, e);
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use rustix::fs::OFlags;
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK: opening a FIFO for reading must not wait for a writer.
+        // O_NOCTTY: opening a terminal device must not make it our
+        // controlling terminal. Both are irrelevant for a regular file.
+        opts.custom_flags((OFlags::NONBLOCK | OFlags::NOCTTY).bits() as i32);
+    }
+    let file = opts.open(path).map_err(io_err)?;
+    let meta = file.metadata().map_err(io_err)?;
+    if !meta.is_file() {
+        return Err(VaultError::NotRegularFile(path.to_path_buf()));
+    }
+    if meta.len() > MAX_VAULT_LEN {
+        return Err(VaultError::TooLarge);
+    }
+    // The size above can be stale (a file that grows) or untrue, so the read
+    // is bounded independently.
+    read_capped(file, MAX_VAULT_LEN).map_err(|e| match e {
+        CapError::TooLarge => VaultError::TooLarge,
+        CapError::Io(e) => io_err(e),
+    })
+}
+
+enum CapError {
+    TooLarge,
+    Io(io::Error),
+}
+
+/// Reads `reader` to the end, failing if it yields more than `max` bytes
+/// (without ever buffering more than `max + 1`).
+fn read_capped(reader: impl Read, max: u64) -> Result<Vec<u8>, CapError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(CapError::Io)?;
+    if bytes.len() as u64 > max {
+        return Err(CapError::TooLarge);
+    }
+    Ok(bytes)
 }
 
 fn encode_header(
@@ -328,7 +402,7 @@ fn decode_header(h: &[u8]) -> Result<(KdfParams, [u8; SALT_LEN], [u8; NONCE_LEN]
         t_cost: u32_at(16),
         p_cost: u32_at(20),
     }
-    .validate()?;
+    .validate_for_open()?;
     let mut salt = [0u8; SALT_LEN];
     salt.copy_from_slice(&h[24..40]);
     let mut nonce = [0u8; NONCE_LEN];
@@ -627,6 +701,100 @@ fn trailing_ok(rest: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a vault file the way an older version would have: with
+    /// arbitrary (valid-for-open) KDF parameters.
+    fn legacy_vault_bytes(params: KdfParams, pass: &[u8], entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut v = Vault::new();
+        for (k, val) in entries {
+            v.set(k, Zeroizing::new((*val).to_owned())).unwrap();
+        }
+        let salt = [3u8; SALT_LEN];
+        let nonce = [4u8; NONCE_LEN];
+        let header = encode_header(params, &salt, &nonce);
+        let key = crypto::derive_key(pass, &salt, params).unwrap();
+        let ct = crypto::seal(&key, &nonce, &header, &v.encode_payload()).unwrap();
+        [header.as_slice(), &ct].concat()
+    }
+
+    #[test]
+    fn new_vaults_must_meet_the_current_minimum() {
+        assert!(Vault::with_params(KdfParams::FLOOR).is_err());
+        assert!(Vault::with_params(KdfParams::MIN).is_ok());
+        assert!(Vault::with_params(KdfParams::DEFAULT).is_ok());
+    }
+
+    #[test]
+    fn legacy_weak_vault_loads_and_is_never_written_back_weak() {
+        let bytes = legacy_vault_bytes(KdfParams::FLOOR, b"pw", &[("A", "1")]);
+        let mut v = Vault::open(&bytes, b"pw").unwrap();
+        assert_eq!(v.params(), KdfParams::FLOOR);
+        assert_eq!(v.get("A"), Some("1"));
+
+        // A plain save never writes below MIN...
+        let resealed = v.seal(b"pw").unwrap();
+        let (p, _, _) = decode_header(&resealed[..HEADER_LEN]).unwrap();
+        assert_eq!(p, KdfParams::MIN);
+        // ...and the explicit upgrade moves it to (at least) the default.
+        assert!(v.upgrade_kdf_params());
+        assert_eq!(v.params(), KdfParams::DEFAULT);
+        assert!(!v.upgrade_kdf_params(), "already upgraded");
+        let resealed = v.seal(b"pw").unwrap();
+        let (p, _, _) = decode_header(&resealed[..HEADER_LEN]).unwrap();
+        assert_eq!(p, KdfParams::DEFAULT);
+        assert_eq!(Vault::open(&resealed, b"pw").unwrap().get("A"), Some("1"));
+    }
+
+    #[test]
+    fn upgrade_never_lowers_a_stronger_setting() {
+        let strong = KdfParams {
+            m_cost_kib: 128 * 1024,
+            t_cost: 2,
+            p_cost: 2,
+        };
+        let mut v = Vault::with_params(strong).unwrap();
+        assert!(v.upgrade_kdf_params());
+        assert_eq!(
+            v.params(),
+            KdfParams {
+                m_cost_kib: 128 * 1024,
+                t_cost: KdfParams::DEFAULT.t_cost,
+                p_cost: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn header_below_the_floor_is_rejected_on_open() {
+        let weak = KdfParams {
+            m_cost_kib: 4 * 1024,
+            ..KdfParams::FLOOR
+        };
+        let mut h = encode_header(weak, &[0; SALT_LEN], &[0; NONCE_LEN]).to_vec();
+        h.extend_from_slice(&[0u8; 32]);
+        assert!(matches!(
+            Vault::open(&h, b"pw"),
+            Err(VaultError::Crypto(CryptoError::InvalidKdfParams { .. }))
+        ));
+    }
+
+    #[test]
+    fn read_is_capped_even_for_an_endless_stream() {
+        // An endless reader (what /dev/zero would be) stops at max + 1 bytes.
+        assert!(matches!(
+            read_capped(io::repeat(0), 1000),
+            Err(CapError::TooLarge)
+        ));
+        assert_eq!(
+            read_capped(&[7u8; 1000][..], 1000).ok().unwrap().len(),
+            1000
+        );
+        assert!(matches!(
+            read_capped(&[7u8; 1001][..], 1000),
+            Err(CapError::TooLarge)
+        ));
+        assert!(read_capped(io::empty(), 1000).ok().unwrap().is_empty());
+    }
 
     #[test]
     fn key_validation() {
