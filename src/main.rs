@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
-use cloakenv::vault::{Vault, parse_dotenv};
+use cloakenv::vault::{Vault, VaultLock, parse_dotenv};
 use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, is_reserved_key, runner};
 
 /// Lightweight encrypted local secret vault and zero-leak process injection engine.
@@ -106,23 +106,32 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 );
             }
             let pass = passphrase(true)?;
+            let _lock = lock(path)?;
+            // Re-check under the lock: another init may have won the race.
+            if path.exists() && !force {
+                bail!("a vault already exists at {}", path.display());
+            }
             Vault::new().save(path, pass.as_bytes())?;
             eprintln!("cloakenv: initialized vault at {}", path.display());
         }
         Cmd::Set { key, value } => {
             refuse_reserved(&key)?;
             let pass = passphrase(false)?;
-            let mut vault = load(path, &pass)?;
+            // Gather input before taking the lock so a pending prompt never
+            // blocks other writers.
             let value = match value {
                 Some(v) => Zeroizing::new(v),
                 None => read_value(&key)?,
             };
+            let _lock = lock(path)?;
+            let mut vault = load(path, &pass)?;
             vault.set(&key, value)?;
             vault.save(path, pass.as_bytes())?;
             eprintln!("cloakenv: set {key}");
         }
         Cmd::Unset { key } => {
             let pass = passphrase(false)?;
+            let _lock = lock(path)?;
             let mut vault = load(path, &pass)?;
             if !vault.remove(&key) {
                 bail!("no such key in vault");
@@ -140,6 +149,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 refuse_reserved(key)?;
             }
             let pass = passphrase(false)?;
+            let _lock = lock(path)?;
             let mut vault = load(path, &pass)?;
             let count = pairs.len();
             for (key, value) in pairs {
@@ -180,6 +190,16 @@ fn refuse_reserved(key: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Takes the vault's exclusive write lock, saying so if we have to wait.
+/// Hold the returned guard across the whole load → modify → save cycle.
+fn lock(path: &Path) -> Result<VaultLock> {
+    if let Some(lock) = VaultLock::try_acquire(path)? {
+        return Ok(lock);
+    }
+    eprintln!("cloakenv: waiting for another cloakenv process to release the vault lock...");
+    Ok(VaultLock::acquire(path)?)
 }
 
 fn load(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {

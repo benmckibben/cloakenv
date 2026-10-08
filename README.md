@@ -41,7 +41,10 @@ Both variables are always stripped from the child's environment, and
 
 `.cloak/vault.bin` relative to the current directory by default; override with
 `--vault <path>` or `CLOAKENV_VAULT`. The file is written atomically with mode
-`0600` inside a `0700` directory. `.cloak/` is git-ignored.
+`0600` inside a `0700` directory. `.cloak/` is git-ignored. Commands that
+modify the vault serialise on an advisory lock file next to it
+(`.cloak/.vault.bin.lock`), so concurrent `cloakenv set` calls never lose
+updates.
 
 ## Exit codes
 

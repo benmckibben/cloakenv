@@ -22,6 +22,13 @@
 //!
 //! The plaintext payload is `u32 count` followed by `count` entries of
 //! `u32 key_len, key, u32 value_len, value`.
+//!
+//! # Concurrency
+//!
+//! Every save replaces the vault with `rename`, so readers always see a
+//! complete file. Writers (`init`, `set`, `unset`, `import`) additionally
+//! hold a [`VaultLock`] across their whole load → modify → save cycle so two
+//! concurrent updates cannot silently drop one another's changes.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -327,13 +334,104 @@ fn decode_header(h: &[u8]) -> Result<(KdfParams, [u8; SALT_LEN], [u8; NONCE_LEN]
     Ok((params, salt, nonce))
 }
 
+/// An exclusive advisory lock (`flock(2)`) serialising read-modify-write
+/// cycles on one vault. Released when dropped (or when the process exits).
+///
+/// The lock is taken on a sibling `.<vault>.lock` file rather than the vault
+/// itself, because saves `rename` a new file over the vault and a lock on the
+/// old inode would protect nothing. The lock file is empty, mode 0600, and is
+/// intentionally never removed: deleting it would let a waiter and a newcomer
+/// lock two different inodes at once.
+///
+/// The lock is advisory: it coordinates cloakenv processes only. On non-Unix
+/// platforms it is currently a no-op.
+#[derive(Debug)]
+pub struct VaultLock {
+    _file: fs::File,
+}
+
+impl VaultLock {
+    /// Path of the lock file guarding the vault at `vault`.
+    pub fn path_for(vault: &Path) -> PathBuf {
+        let mut name = std::ffi::OsString::from(".");
+        name.push(vault.file_name().unwrap_or_else(|| "vault".as_ref()));
+        name.push(".lock");
+        vault.with_file_name(name)
+    }
+
+    /// Blocks until the exclusive lock for `vault` is acquired, creating the
+    /// vault directory (0700) and lock file (0600) if needed.
+    pub fn acquire(vault: &Path) -> Result<Self, VaultError> {
+        let file = open_lock_file(vault)?;
+        lock_file(&file, true).map_err(|e| lock_error(vault, e))?;
+        Ok(Self { _file: file })
+    }
+
+    /// Like [`VaultLock::acquire`] but returns `Ok(None)` instead of
+    /// blocking when another process holds the lock.
+    pub fn try_acquire(vault: &Path) -> Result<Option<Self>, VaultError> {
+        let file = open_lock_file(vault)?;
+        match lock_file(&file, false) {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(lock_error(vault, e)),
+        }
+    }
+}
+
+fn lock_error(vault: &Path, e: io::Error) -> VaultError {
+    VaultError::io("cannot lock vault", &VaultLock::path_for(vault), e)
+}
+
+fn open_lock_file(vault: &Path) -> Result<fs::File, VaultError> {
+    let parent = parent_dir(vault);
+    create_private_dir(&parent)
+        .map_err(|e| VaultError::io("cannot create vault directory", &parent, e))?;
+    let lock_path = VaultLock::path_for(vault);
+    let mut opts = fs::OpenOptions::new();
+    // Rust opens files with O_CLOEXEC, so the lock never leaks into children.
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(&lock_path)
+        .map_err(|e| VaultError::io("cannot open vault lock", &lock_path, e))
+}
+
+#[cfg(unix)]
+fn lock_file(file: &fs::File, block: bool) -> io::Result<()> {
+    use rustix::fs::{FlockOperation, flock};
+    let op = if block {
+        FlockOperation::LockExclusive
+    } else {
+        FlockOperation::NonBlockingLockExclusive
+    };
+    loop {
+        match flock(file, op) {
+            Err(rustix::io::Errno::INTR) => continue,
+            other => return other.map_err(io::Error::from),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_file(_file: &fs::File, _block: bool) -> io::Result<()> {
+    Ok(())
+}
+
+fn parent_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 /// Writes `bytes` to a sibling temp file created with mode 0600, fsyncs it,
 /// then renames it over `path`. Only ever used for ciphertext.
 fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
+    let parent = parent_dir(path);
     create_private_dir(&parent)
         .map_err(|e| VaultError::io("cannot create vault directory", &parent, e))?;
 
@@ -602,6 +700,35 @@ mod tests {
                 other => panic!("{input:?}: unexpected {other:?}"),
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_lock_is_exclusive_and_released_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("sub").join("vault.bin");
+        let held = VaultLock::acquire(&vault).unwrap();
+        let lock_path = VaultLock::path_for(&vault);
+        assert_eq!(lock_path, dir.path().join("sub").join(".vault.bin.lock"));
+        let mode = fs::metadata(&lock_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // flock locks belong to the open file description, so a second open in
+        // the same process contends exactly like another process would.
+        assert!(VaultLock::try_acquire(&vault).unwrap().is_none());
+
+        let waiter = std::thread::spawn({
+            let vault = vault.clone();
+            move || VaultLock::acquire(&vault).unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "acquire must block while held");
+        drop(held);
+        let second = waiter.join().unwrap();
+        assert!(VaultLock::try_acquire(&vault).unwrap().is_none());
+        drop(second);
+        assert!(VaultLock::try_acquire(&vault).unwrap().is_some());
     }
 
     #[test]

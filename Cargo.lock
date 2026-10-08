@@ -213,6 +213,7 @@ dependencies = [
  "clap",
  "getrandom",
  "rpassword",
+ "rustix",
  "tempfile",
  "thiserror",
  "zeroize",

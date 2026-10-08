@@ -32,6 +32,10 @@ rpassword = "7.5.4"
 thiserror = "2.0.21"
 zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 
+# Safe wrappers for flock(2) (vault locking); no `unsafe` needed in this crate.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.5", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3.27.0"
 
