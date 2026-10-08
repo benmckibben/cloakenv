@@ -5,6 +5,8 @@
 | module          | responsibility                                                          |
 |-----------------|-------------------------------------------------------------------------|
 | `src/main.rs`   | clap CLI, passphrase acquisition, exit-code mapping                     |
+| `src/passphrase.rs` | the passphrase rules (what each source yields; line-break and length checks) |
+| `src/input.rs`  | reading secret text (stdin value, passphrase file) into one wiped, size-capped buffer |
 | `src/crypto.rs` | Argon2id key derivation, XChaCha20-Poly1305 seal/open, OS RNG           |
 | `src/vault.rs`  | vault file format, in-memory map, atomic writes (0600 on Unix), `.env` parser |
 | `src/perms.rs`  | advisory permission/symlink warnings for the vault and passphrase file (Unix) |
@@ -41,6 +43,21 @@
   ids, KDF parameters, salt, nonce). Flipping any header bit fails decryption.
 * Key material, passphrases and decrypted values are held in
   `zeroize::Zeroizing` buffers and wiped on drop. `Debug` impls never print them.
+
+## Passphrase rules
+
+One passphrase, three sources (`CLOAKENV_PASSPHRASE`, `CLOAKENV_PASSPHRASE_FILE`,
+the prompt), defined in `src/passphrase.rs` and README "Exactly what counts as
+the passphrase". Each source yields exactly the text supplied, except that a
+file loses **one** trailing `\n` or `\r\n` and the prompt loses the Enter key;
+nothing is trimmed. A source that is set but unusable is an error, never a
+silent fallback to the next one (a non-UTF-8 `CLOAKENV_PASSPHRASE` used to be
+skipped). The only passphrases two sources could disagree on are those ending
+in `\n` or `\r`, so `init` refuses them (a vault created with one could be
+opened only through the source that made it), while unlocking never rejects
+anything: existing vaults keep opening exactly as before, and a failed unlock
+with a trailing line break adds a hint. Short passphrases (under 12
+characters) get an advisory warning at `init` only, from every source.
 
 ## Vault format (v1)
 
@@ -171,6 +188,122 @@ platforms any exit status above 255 becomes 1). `PR_SET_DUMPABLE` and
 forwarding behave the same, but a `SIGKILL` of cloakenv under `--shield` leaves
 the command running.
 
+## Memory hygiene (best effort)
+
+Plaintext secrets are held in `Zeroizing` buffers and wiped when dropped. Rust
+and the standard library offer no way to *guarantee* that no other copy exists
+(a growing `Vec` leaves its old allocation behind, freed but not wiped, and
+std's own buffers are out of reach), so this section records what is done,
+what is not, and why. The numbers come from scanning the anonymous memory and
+heap of a running release build through `/proc/<pid>/mem` (from a parent that
+is allowed to: root of a user namespace, since cloakenv is non-dumpable) for a
+distinctive 212-byte dummy secret, counted before and after the changes
+described here:
+
+| situation (cloakenv process scanned)                  | full copies before | full copies after |
+|-------------------------------------------------------|-------------------:|------------------:|
+| `set`: value read from a slow pipe, waiting for the lock | 1 (plus 0 to 3 stale partial copies from the growing read) | 1 (the live value), no stale copies |
+| `run --shield`: command running, output has flowed    | 8 to 16            | 0                 |
+
+* **Value for `set` (stdin).** Read into one buffer allocated once (1 MiB + 2
+  bytes: the limit plus room for a final `\r\n`, which is stripped; larger
+  input is refused with a non-echoing error), filled in place through a
+  duplicate of the stdin descriptor so that std's 8 KiB stdin buffer never
+  holds a copy, then *moved* (not copied) into the `String` that goes into the
+  vault. Previously `read_to_string` regrew its buffer, leaving unwiped copies
+  of the first bytes behind. The interactive prompt uses `rpassword`, whose
+  line buffer grows character by character: a few short stale copies of what
+  was typed may remain on the heap for the (brief) life of the process.
+  Accepted: the interactive path, bounded by the length of one line.
+* **Passphrase.** From `CLOAKENV_PASSPHRASE` it is copied into a `Zeroizing`
+  string, but the original sits in the process's environment block until the
+  process execs or exits, and a safe Rust program cannot unset it. That is
+  what the non-dumpable flag is for (and why the README recommends a file or
+  the prompt where the same-user window matters). A passphrase file is read like a
+  `set` value (one buffer, at most 64 KiB, wiped). Argon2 works in 64 MiB of
+  memory that the `argon2` crate does not wipe, but it holds only data derived
+  one-way from passphrase and salt, never the passphrase itself (the
+  crate does wipe its initial hash and block hashes); an allocation that size
+  is returned to the operating system, which zeroes the pages before anyone
+  else gets them. Accepted.
+* **`run` without `--shield`.** `exec` replaces the address space: nothing of
+  cloakenv survives (see "Process model").
+* **`run --shield`.** The vault is taken by value and dropped (wiped) right
+  after the command has been spawned, together with the `Command` that held a
+  copy of every value, instead of being kept for as long as the command runs.
+  The two pump read buffers (raw, unredacted child output) and each redactor's
+  held-back buffer are `Zeroizing`: buffers are wiped after every chunk, the
+  bytes shifted out of the held-back buffer are wiped as they go, and a
+  buffer that has to grow is replaced, never reallocated in place. The two
+  output streams share **one** Aho-Corasick automaton (a clone is a reference
+  count) instead of building one each. The library cannot zeroize an
+  automaton, so it is dropped as soon as both pumps are done; but it is built
+  with its prefilter turned off, because the prefilter stores the patterns
+  verbatim, which made the secret findable by a plain memory search (the
+  remaining representation is a state machine, from which a determined
+  attacker with memory access could still reconstruct the values: it is not
+  encryption, merely not a contiguous copy). Matching speed is unaffected for
+  this workload (about 500 to 600 MB/s in a micro-benchmark either way).
+* **Not fixable here, accepted:** the copies that `std::process::Command` makes
+  of the environment (its own map, and the C string array built when
+  spawning). They are freed but not wiped, so they can linger in freed heap
+  memory until reused. In the `--shield` scan above they did not leave a
+  contiguous copy that survived, but nothing guarantees that. Without
+  `--shield` they vanish with the exec.
+* **Argument vector.** clap's raw arguments hold key names, the command to run
+  and, for `set`, a refused VALUE (which is already in the kernel's
+  `/proc/<pid>/cmdline` by then): no secret is ever read from argv by design.
+
+## Rollback and replacement (limit, with a design proposal)
+
+**What is true today.** Every vault file is authenticated (header as AAD plus
+the AEAD tag), so nobody can *forge* or edit one without the passphrase. But a
+valid file is not tied to a point in time. Anyone who can write the vault's
+directory can put an **older valid vault** back (a copy they took earlier, a
+backup, an old git commit): values that were rotated come back as their old
+(possibly leaked) versions, removed keys reappear, and nothing complains. The
+same goes for swapping in any vault made with the same passphrase. `run` cannot
+notice without a record of what it has seen before, and cloakenv keeps no state
+outside the vault. This is documented in the README threat model as a limit; the
+mitigations that do work today are filesystem permissions (a private vault
+directory, which cloakenv warns about), and not storing the vault where an
+attacker can write.
+
+**Proposal (not implemented; needs a format version bump).** A monotonic,
+authenticated generation counter:
+
+1. *Counter.* A `u64 generation` in the vault, increased by one on every
+   save (under the write lock, so concurrent writers cannot repeat a value).
+   It must be authenticated: either in the header (which is AAD) or at the start
+   of the encrypted payload. The v1 header has no room (byte 11 is reserved and
+   must be zero; the payload decoder rejects trailing data), so this is a
+   **version 2** format. Old binaries refuse version 2 with the existing
+   "unsupported vault format version" error (fail closed, no mis-parse); new
+   binaries read version 1 as generation 0 and write version 2, so migration is
+   automatic but one-way (a downgrade needs the new binary to export). It is
+   deliberately not part of this change for that reason.
+2. *High-water mark.* A counter inside the file proves nothing on its own: the
+   attacker restores a file with a smaller number and it is perfectly valid. The
+   check needs a place the attacker cannot write: a small state file outside the
+   vault directory, e.g. `$XDG_STATE_HOME/cloakenv/<hash of the canonical vault
+   path>` (0600), holding the highest generation this machine has seen.
+   Every command that opens the vault compares: a smaller generation is
+   refused with a clear error (fail closed, nothing spawned), unless the user
+   explicitly accepts it (`cloakenv accept-rollback`, after restoring a backup on
+   purpose); an equal or larger one raises the mark.
+3. *Limits that stay.* An attacker who can write the state file too (the same
+   user, on the same account) defeats it, so it protects against attackers
+   confined to the vault directory or its transport (a shared volume, a sync
+   service, a restored backup, a repository), not against code running as you.
+   A new machine or a fresh clone has no mark (trust on first use). Losing the
+   state file silently re-opens the hole. Two machines syncing one vault would
+   trip the check on every hand-over and need the explicit accept.
+4. *Cost/benefit.* About 100 lines, one format bump, one new file location, and
+   a recovery path to design and test. The benefit exists only for a narrow
+   attacker. Recommendation: do not build it before the format is revisited for
+   another reason (a passphrase-change command also needs a new header), and
+   keep the limit documented.
+
 ## Invariants and how they are enforced
 
 1. **Zero plaintext on disk.** Decryption happens into memory; secrets reach
@@ -210,8 +343,8 @@ the command running.
    `CAP_SYS_PTRACE`, and **non-Linux platforms**: the call is
    `cfg(linux/android)`-gated and a no-op elsewhere, so on macOS other
    processes of the same user may be able to read cloakenv's environment
-   (`CLOAKENV_PASSPHRASE` / the passphrase file path) and cloakenv does not
-   disable core dumps. macOS has no `/proc`, so the `/proc/<pid>/fd` shield
+   (`CLOAKENV_PASSPHRASE` / the passphrase file path); only the zero soft core
+   limit (above) keeps a core file from being written there. macOS has no `/proc`, so the `/proc/<pid>/fd` shield
    bypass does not exist there, but other macOS equivalents have not been
    assessed. Independently of platform, the child itself receives the plaintext
    in its environment, which same-user processes can read (on Linux the

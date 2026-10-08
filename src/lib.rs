@@ -10,6 +10,8 @@
 //!   environment (replacing cloakenv with the command via `exec`, or, under
 //!   `--shield`, supervising it as a child with signal forwarding), plus the
 //!   `--shield` streaming redactor.
+//! * [`input`]: reading secret text (stdin, passphrase files) into a single
+//!   wiped buffer, with a size cap.
 //! * [`hardening`]: process-level protections (non-dumpable on Linux) applied
 //!   before any secret is handled.
 //! * [`perms`]: advisory warnings about loose permissions on the vault, its
@@ -24,7 +26,10 @@
 #![deny(unsafe_code)]
 
 pub mod crypto;
+pub mod diag;
 pub mod hardening;
+pub mod input;
+pub mod passphrase;
 pub mod perms;
 pub mod runner;
 #[cfg(unix)]

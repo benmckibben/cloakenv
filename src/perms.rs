@@ -110,7 +110,7 @@ pub fn passphrase_file_warnings(file: &Path) -> Vec<String> {
 /// Prints each warning on stderr as `cloakenv: warning: ...`.
 pub fn emit(warnings: &[String]) {
     for w in warnings {
-        eprintln!("cloakenv: warning: {w}");
+        crate::elog!("cloakenv: warning: {w}");
     }
 }
 

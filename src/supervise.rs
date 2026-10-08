@@ -53,8 +53,11 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process, waitid};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
 use signal_hook::iterator::{Handle, Signals};
 
+use zeroize::{Zeroize, Zeroizing};
+
 use crate::runner::{CHUNK, Redactor, RunError, spawn_error};
 use crate::sys;
+use crate::vault::Vault;
 
 /// Once the command has exited, how long the output pipes may stay silent
 /// before the pumps give up on leftover holders and finish.
@@ -166,7 +169,8 @@ fn pump<R: Read + AsFd, W: Write>(
     mut redactor: Redactor,
     state: &ChildState,
 ) {
-    let mut buf = vec![0u8; CHUNK];
+    // Raw (unredacted) child output: wiped after every use and on drop.
+    let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
     let tick = Timespec {
         tv_sec: 0,
         tv_nsec: POLL_TICK.subsec_nanos().into(),
@@ -201,6 +205,7 @@ fn pump<R: Read + AsFd, W: Write>(
                     .push(&buf[..n], &mut writer)
                     .and_then(|()| writer.flush())
                     .is_err();
+                buf[..n].zeroize();
                 if failed {
                     // Parent stream is gone (e.g. EPIPE). Stop reading so the
                     // child observes a broken pipe too.
@@ -220,16 +225,25 @@ fn pump<R: Read + AsFd, W: Write>(
 
 /// Runs `cmd` as a supervised child and returns its exit status. `redactors`
 /// (stdout, stderr) is `Some` when the command's output was set up as pipes.
+/// `vault` (whose values `cmd` was built from) is dropped, and so wiped, as
+/// soon as the child exists, along with `cmd`.
 pub(crate) fn run(
     mut cmd: Command,
     program: &OsStr,
     redactors: Option<(Redactor, Redactor)>,
+    vault: Vault,
 ) -> Result<ExitStatus, RunError> {
     // Before the child exists, so no signal can fall between the two: one
     // arriving early waits in the handler's queue until the forwarder starts.
     let signals = catch_signals()?;
     sys::arm_child(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| spawn_error(e, program))?;
+    // The child has its own copy of the environment now. Nothing here needs
+    // the plaintext any more (the automaton has what it needs to redact):
+    // wipe the vault and free the Command's copies instead of holding them for
+    // as long as the command runs.
+    drop(cmd);
+    drop(vault);
 
     let state = Arc::new(ChildState {
         pid: i32::try_from(child.id()).ok().and_then(Pid::from_raw),
