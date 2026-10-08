@@ -216,6 +216,15 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             if shield {
                 warn_short_values(&vault);
             }
+            // Without --shield there is nothing to supervise: on Unix cloakenv
+            // replaces itself with the command, so no cloakenv process (and no
+            // in-memory copy of the secrets) remains, signals reach the
+            // command directly and its exit status is ours. This only comes
+            // back if the exec itself failed.
+            #[cfg(unix)]
+            if !shield {
+                return Err(runner::exec_replace(&command, vault).into());
+            }
             let status = runner::run(&command, &vault, shield)?;
             drop(vault);
             let code = runner::exit_code(status);

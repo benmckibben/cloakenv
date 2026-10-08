@@ -194,9 +194,18 @@ fn child_exit_code_is_propagated() {
 
 #[test]
 fn signal_death_maps_to_128_plus_signal() {
+    use std::os::unix::process::ExitStatusExt;
+
     let env = Env::init();
-    let out = env.run(&["run", "--", "sh", "-c", "kill -TERM $$"]);
+    // Under --shield cloakenv is the command's parent and reports its death
+    // by signal as the exit code 128 + N, as a shell does.
+    let out = env.run(&["run", "--shield", "--", "sh", "-c", "kill -TERM $$"]);
     assert_eq!(out.status.code(), Some(128 + 15));
+    // Without --shield cloakenv has replaced itself with the command, so the
+    // launching process sees the signal death itself (a shell reports that
+    // as 128 + N too: see tests/supervision.rs for the shell's view).
+    let out = env.run(&["run", "--", "sh", "-c", "kill -TERM $$"]);
+    assert_eq!(out.status.signal(), Some(15));
 }
 
 #[test]
