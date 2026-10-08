@@ -12,7 +12,8 @@ use zeroize::Zeroizing;
 
 use cloakenv::crypto::KdfParams;
 use cloakenv::vault::{
-    Vault, VaultError, VaultLock, is_valid_key, parse_dotenv, vault_dir, write_gitignore,
+    Vault, VaultError, VaultLock, is_valid_key, parse_dotenv, read_env_file, vault_dir,
+    write_gitignore,
 };
 use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, hardening, is_reserved_key, perms, runner};
 
@@ -182,11 +183,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             eprintln!("cloakenv: removed {key}");
         }
         Cmd::Import { file } => {
-            let content = Zeroizing::new(
-                std::fs::read_to_string(&file)
-                    .with_context(|| format!("cannot read {}", file.display()))?,
-            );
-            let pairs = parse_dotenv(&content)?;
+            // Regular files only, at most 16 MiB, read into a buffer that is
+            // wiped on drop (and never reallocated, so no stray copy stays
+            // behind).
+            let content = read_env_file(&file)?;
+            let text =
+                std::str::from_utf8(&content).map_err(|_| VaultError::NotUtf8(file.clone()))?;
+            let pairs = parse_dotenv(text)?;
             for (key, _) in &pairs {
                 refuse_reserved(key)?;
             }
