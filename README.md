@@ -107,6 +107,32 @@ New vaults use 64 MiB / 3 passes / 1 lane, well inside the limit. There is no
 flag or variable to raise it. It only matters if you created a vault through
 the library API with stronger-than-default settings above the cap.
 
+### Key-derivation settings are upgraded on save
+
+New vaults use Argon2id with 64 MiB / 3 passes / 1 lane. The library API
+refuses to create a vault weaker than OWASP's minimum Argon2id setting
+(19 MiB / 2 passes / 1 lane). Vaults written by older versions with weaker
+settings (down to 8 MiB / 1 pass) still **open**, so nobody is locked out of
+their secrets, but cloakenv warns about them on stderr (exit codes unchanged):
+
+```
+cloakenv: warning: vault key-derivation settings (memory 8192 KiB, iterations 1, lanes 1) are weaker than the recommended minimum (memory 19456 KiB, iterations 2, lanes 1); they are upgraded the next time you run `cloakenv set`, `unset` or `import`
+```
+
+Every `set`, `unset` and `import` re-saves the vault with each parameter
+raised to at least the default (the per-parameter maximum of the vault's own
+setting and 64 MiB / 3 / 1; a vault that is already stronger keeps its stronger
+parameters), at the cost of one extra key derivation that the save performs
+anyway, and says so:
+
+```
+cloakenv: upgraded the vault's key-derivation settings from memory 8192 KiB, iterations 1, lanes 1 to memory 65536 KiB, iterations 3, lanes 1
+```
+
+A header below 8 MiB / 1 pass / 1 lane is rejected as unsupported.
+
+### Reading the vault
+
 The vault path must also be an ordinary file of at most 16 MiB. cloakenv opens
 it once, checks the open handle (not the path) and reads with a hard size cap,
 so `--vault /dev/zero`, a FIFO, a directory or a huge file is refused

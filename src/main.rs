@@ -10,6 +10,7 @@ use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::Zeroizing;
 
+use cloakenv::crypto::KdfParams;
 use cloakenv::vault::{
     Vault, VaultError, VaultLock, is_valid_key, parse_dotenv, vault_dir, write_gitignore,
 };
@@ -165,7 +166,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             // blocks other writers.
             let value = read_value(&key)?;
             let _lock = lock(path)?;
-            let mut vault = load(path, &pass)?;
+            let mut vault = load_for_update(path, &pass)?;
             vault.set(&key, value)?;
             vault.save(path, pass.as_bytes())?;
             eprintln!("cloakenv: set {key}");
@@ -173,7 +174,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Cmd::Unset { key } => {
             let pass = passphrase(false)?;
             let _lock = lock(path)?;
-            let mut vault = load(path, &pass)?;
+            let mut vault = load_for_update(path, &pass)?;
             if !vault.remove(&key) {
                 bail!("no such key in vault");
             }
@@ -191,7 +192,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             let pass = passphrase(false)?;
             let _lock = lock(path)?;
-            let mut vault = load(path, &pass)?;
+            let mut vault = load_for_update(path, &pass)?;
             let count = pairs.len();
             for (key, value) in pairs {
                 vault.set(&key, value)?;
@@ -299,7 +300,43 @@ fn lock(path: &Path) -> Result<VaultLock> {
     Ok(VaultLock::acquire(path)?)
 }
 
+/// Loads the vault for a command that only reads it. Warns (never fails) if
+/// it was written with key-derivation settings below the current minimum.
 fn load(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
+    let vault = load_raw(path, pass)?;
+    let p = vault.params();
+    if !p.meets_min() {
+        eprintln!(
+            "cloakenv: warning: vault key-derivation settings (memory {} KiB, iterations {}, lanes {}) are weaker than the recommended minimum (memory {} KiB, iterations {}, lanes {}); they are upgraded the next time you run `cloakenv set`, `unset` or `import`",
+            p.m_cost_kib,
+            p.t_cost,
+            p.p_cost,
+            KdfParams::MIN.m_cost_kib,
+            KdfParams::MIN.t_cost,
+            KdfParams::MIN.p_cost
+        );
+    }
+    Ok(vault)
+}
+
+/// Loads the vault for a command that is about to save it again. The
+/// passphrase is already in hand, so raising old or weak key-derivation
+/// settings to (at least) the defaults costs only the one KDF run that the
+/// save performs anyway.
+fn load_for_update(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
+    let mut vault = load_raw(path, pass)?;
+    let before = vault.params();
+    if vault.upgrade_kdf_params() {
+        let p = vault.params();
+        eprintln!(
+            "cloakenv: upgraded the vault's key-derivation settings from memory {} KiB, iterations {}, lanes {} to memory {} KiB, iterations {}, lanes {}",
+            before.m_cost_kib, before.t_cost, before.p_cost, p.m_cost_kib, p.t_cost, p.p_cost
+        );
+    }
+    Ok(vault)
+}
+
+fn load_raw(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
     if !path.exists() {
         bail!(
             "no vault found at {} (run `cloakenv init` first)",

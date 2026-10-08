@@ -26,17 +26,19 @@ pub enum CryptoError {
     #[error(
         "unsupported key-derivation parameters (memory {m_cost_kib} KiB, iterations {t_cost}, lanes {p_cost}); \
          this version accepts memory {min_m} to {max_m} KiB, iterations {min_t} to {max_t}, lanes {min_p} to {max_p}",
-        min_m = KdfParams::MIN.m_cost_kib,
+        min_m = .min.m_cost_kib,
         max_m = KdfParams::MAX.m_cost_kib,
-        min_t = KdfParams::MIN.t_cost,
+        min_t = .min.t_cost,
         max_t = KdfParams::MAX.t_cost,
-        min_p = KdfParams::MIN.p_cost,
+        min_p = .min.p_cost,
         max_p = KdfParams::MAX.p_cost,
     )]
     InvalidKdfParams {
         m_cost_kib: u32,
         t_cost: u32,
         p_cost: u32,
+        /// The lower bound that applied to this check.
+        min: KdfParams,
     },
     #[error("key derivation failed")]
     Kdf,
@@ -69,8 +71,22 @@ impl KdfParams {
         t_cost: 3,
         p_cost: 1,
     };
-    /// Weakest parameters accepted (OWASP-ish floor): 8 MiB, 1 pass, 1 lane.
+    /// Weakest parameters accepted for a *new* vault, or written by a save:
+    /// 19 MiB, 2 passes, 1 lane. This is OWASP's minimum recommended Argon2id
+    /// configuration, and [`KdfParams::DEFAULT`] is stronger.
     pub const MIN: Self = Self {
+        m_cost_kib: 19 * 1024,
+        t_cost: 2,
+        p_cost: 1,
+    };
+    /// Weakest parameters still *readable*: 8 MiB, 1 pass, 1 lane. Earlier
+    /// versions accepted these as their minimum, so a vault created through
+    /// the library API with such settings must remain openable (otherwise its
+    /// owner would be locked out of their secrets). They are never written
+    /// back: saving raises every parameter to at least [`KdfParams::MIN`], and
+    /// the CLI raises them to [`KdfParams::DEFAULT`] (see
+    /// [`KdfParams::at_least`]).
+    pub const FLOOR: Self = Self {
         m_cost_kib: 8 * 1024,
         t_cost: 1,
         p_cost: 1,
@@ -86,13 +102,25 @@ impl KdfParams {
         p_cost: 8,
     };
 
-    /// Validates that the parameters fall within [`KdfParams::MIN`] and
-    /// [`KdfParams::MAX`].
+    /// Validates parameters for *writing* a vault: they must fall within
+    /// [`KdfParams::MIN`] and [`KdfParams::MAX`].
     pub fn validate(self) -> Result<Self, CryptoError> {
+        self.validate_within(Self::MIN)
+    }
+
+    /// Validates parameters for *reading* a vault: like [`KdfParams::validate`]
+    /// but the lower bound is the more lenient [`KdfParams::FLOOR`], so
+    /// vaults written by earlier versions still open. The upper bound is
+    /// always [`KdfParams::MAX`]: this runs on an unauthenticated header.
+    pub fn validate_for_open(self) -> Result<Self, CryptoError> {
+        self.validate_within(Self::FLOOR)
+    }
+
+    fn validate_within(self, min: Self) -> Result<Self, CryptoError> {
         let in_range = |v: u32, lo: u32, hi: u32| (lo..=hi).contains(&v);
-        if in_range(self.m_cost_kib, Self::MIN.m_cost_kib, Self::MAX.m_cost_kib)
-            && in_range(self.t_cost, Self::MIN.t_cost, Self::MAX.t_cost)
-            && in_range(self.p_cost, Self::MIN.p_cost, Self::MAX.p_cost)
+        if in_range(self.m_cost_kib, min.m_cost_kib, Self::MAX.m_cost_kib)
+            && in_range(self.t_cost, min.t_cost, Self::MAX.t_cost)
+            && in_range(self.p_cost, min.p_cost, Self::MAX.p_cost)
             // Argon2 requires at least 8 KiB of memory per lane.
             && self.m_cost_kib >= 8 * self.p_cost
         {
@@ -102,8 +130,24 @@ impl KdfParams {
                 m_cost_kib: self.m_cost_kib,
                 t_cost: self.t_cost,
                 p_cost: self.p_cost,
+                min,
             })
         }
+    }
+
+    /// The per-parameter maximum of `self` and `other`: every cost is at
+    /// least as high as in either input.
+    pub fn at_least(self, other: Self) -> Self {
+        Self {
+            m_cost_kib: self.m_cost_kib.max(other.m_cost_kib),
+            t_cost: self.t_cost.max(other.t_cost),
+            p_cost: self.p_cost.max(other.p_cost),
+        }
+    }
+
+    /// Whether every parameter is at least [`KdfParams::MIN`].
+    pub fn meets_min(self) -> bool {
+        self == self.at_least(Self::MIN)
     }
 }
 
@@ -128,7 +172,9 @@ pub fn derive_key(
     salt: &[u8; SALT_LEN],
     params: KdfParams,
 ) -> Result<DerivedKey, CryptoError> {
-    let params = params.validate()?;
+    // Lenient lower bound: this also derives keys for old, weaker vaults that
+    // are being opened. Writers enforce [`KdfParams::MIN`] before they get here.
+    let params = params.validate_for_open()?;
     let argon_params = Params::new(
         params.m_cost_kib,
         params.t_cost,
@@ -203,6 +249,55 @@ mod tests {
 
     fn key(pass: &[u8], salt: &[u8; SALT_LEN]) -> DerivedKey {
         derive_key(pass, salt, KdfParams::MIN).unwrap()
+    }
+
+    #[test]
+    fn min_is_at_least_owasp_and_default_is_at_least_min() {
+        // OWASP's lowest recommended Argon2id setting: 19 MiB, t=2, p=1.
+        let (min, default, floor) = (KdfParams::MIN, KdfParams::DEFAULT, KdfParams::FLOOR);
+        assert!(min.m_cost_kib >= 19 * 1024 && min.t_cost >= 2 && min.p_cost >= 1);
+        assert!(default.meets_min());
+        assert_eq!(default.at_least(min), default);
+        assert!(!floor.meets_min());
+        assert!(floor.validate().is_err(), "weak params are never written");
+        assert!(
+            floor.validate_for_open().is_ok(),
+            "but old vaults still open"
+        );
+    }
+
+    #[test]
+    fn below_floor_is_rejected_even_for_open() {
+        for weak in [
+            KdfParams {
+                m_cost_kib: KdfParams::FLOOR.m_cost_kib - 1,
+                ..KdfParams::FLOOR
+            },
+            KdfParams {
+                t_cost: 0,
+                ..KdfParams::FLOOR
+            },
+            KdfParams {
+                p_cost: 0,
+                ..KdfParams::FLOOR
+            },
+        ] {
+            assert!(weak.validate_for_open().is_err(), "{weak:?}");
+            assert!(derive_key(b"pw", &[0u8; SALT_LEN], weak).is_err());
+        }
+    }
+
+    #[test]
+    fn at_least_is_per_parameter() {
+        let a = KdfParams {
+            m_cost_kib: 100_000,
+            t_cost: 1,
+            p_cost: 4,
+        };
+        let up = a.at_least(KdfParams::DEFAULT);
+        assert_eq!(up.m_cost_kib, 100_000);
+        assert_eq!(up.t_cost, KdfParams::DEFAULT.t_cost);
+        assert_eq!(up.p_cost, 4);
     }
 
     #[test]

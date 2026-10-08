@@ -131,6 +131,8 @@ impl Vault {
     }
 
     /// Creates an empty vault with explicit KDF parameters.
+    /// The parameters must lie within [`KdfParams::MIN`] and
+    /// [`KdfParams::MAX`].
     pub fn with_params(params: KdfParams) -> Result<Self, VaultError> {
         Ok(Self {
             entries: BTreeMap::new(),
@@ -141,6 +143,17 @@ impl Vault {
     /// KDF parameters used when sealing this vault.
     pub fn params(&self) -> KdfParams {
         self.params
+    }
+
+    /// Raises every KDF parameter to at least [`KdfParams::DEFAULT`] (never
+    /// lowering any), so the next [`Vault::save`] re-encrypts older or weaker
+    /// vaults with current settings. Returns whether anything changed. A
+    /// vault already stronger than the default keeps its own settings.
+    pub fn upgrade_kdf_params(&mut self) -> bool {
+        let upgraded = self.params.at_least(KdfParams::DEFAULT);
+        let changed = upgraded != self.params;
+        self.params = upgraded;
+        changed
     }
 
     /// Inserts or replaces a secret.
@@ -246,8 +259,11 @@ impl Vault {
     pub fn seal(&self, passphrase: &[u8]) -> Result<Vec<u8>, VaultError> {
         let salt: [u8; SALT_LEN] = crypto::random_bytes()?;
         let nonce: [u8; NONCE_LEN] = crypto::random_bytes()?;
-        let header = encode_header(self.params, &salt, &nonce);
-        let key = crypto::derive_key(passphrase, &salt, self.params)?;
+        // Never write settings weaker than the current minimum, even for a
+        // vault that was loaded with older, weaker ones.
+        let params = self.params.at_least(KdfParams::MIN).validate()?;
+        let header = encode_header(params, &salt, &nonce);
+        let key = crypto::derive_key(passphrase, &salt, params)?;
         let payload = self.encode_payload();
         let ciphertext = crypto::seal(&key, &nonce, &header, &payload)?;
         let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
@@ -386,7 +402,7 @@ fn decode_header(h: &[u8]) -> Result<(KdfParams, [u8; SALT_LEN], [u8; NONCE_LEN]
         t_cost: u32_at(16),
         p_cost: u32_at(20),
     }
-    .validate()?;
+    .validate_for_open()?;
     let mut salt = [0u8; SALT_LEN];
     salt.copy_from_slice(&h[24..40]);
     let mut nonce = [0u8; NONCE_LEN];
@@ -685,6 +701,82 @@ fn trailing_ok(rest: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a vault file the way an older version would have: with
+    /// arbitrary (valid-for-open) KDF parameters.
+    fn legacy_vault_bytes(params: KdfParams, pass: &[u8], entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut v = Vault::new();
+        for (k, val) in entries {
+            v.set(k, Zeroizing::new((*val).to_owned())).unwrap();
+        }
+        let salt = [3u8; SALT_LEN];
+        let nonce = [4u8; NONCE_LEN];
+        let header = encode_header(params, &salt, &nonce);
+        let key = crypto::derive_key(pass, &salt, params).unwrap();
+        let ct = crypto::seal(&key, &nonce, &header, &v.encode_payload()).unwrap();
+        [header.as_slice(), &ct].concat()
+    }
+
+    #[test]
+    fn new_vaults_must_meet_the_current_minimum() {
+        assert!(Vault::with_params(KdfParams::FLOOR).is_err());
+        assert!(Vault::with_params(KdfParams::MIN).is_ok());
+        assert!(Vault::with_params(KdfParams::DEFAULT).is_ok());
+    }
+
+    #[test]
+    fn legacy_weak_vault_loads_and_is_never_written_back_weak() {
+        let bytes = legacy_vault_bytes(KdfParams::FLOOR, b"pw", &[("A", "1")]);
+        let mut v = Vault::open(&bytes, b"pw").unwrap();
+        assert_eq!(v.params(), KdfParams::FLOOR);
+        assert_eq!(v.get("A"), Some("1"));
+
+        // A plain save never writes below MIN...
+        let resealed = v.seal(b"pw").unwrap();
+        let (p, _, _) = decode_header(&resealed[..HEADER_LEN]).unwrap();
+        assert_eq!(p, KdfParams::MIN);
+        // ...and the explicit upgrade moves it to (at least) the default.
+        assert!(v.upgrade_kdf_params());
+        assert_eq!(v.params(), KdfParams::DEFAULT);
+        assert!(!v.upgrade_kdf_params(), "already upgraded");
+        let resealed = v.seal(b"pw").unwrap();
+        let (p, _, _) = decode_header(&resealed[..HEADER_LEN]).unwrap();
+        assert_eq!(p, KdfParams::DEFAULT);
+        assert_eq!(Vault::open(&resealed, b"pw").unwrap().get("A"), Some("1"));
+    }
+
+    #[test]
+    fn upgrade_never_lowers_a_stronger_setting() {
+        let strong = KdfParams {
+            m_cost_kib: 128 * 1024,
+            t_cost: 2,
+            p_cost: 2,
+        };
+        let mut v = Vault::with_params(strong).unwrap();
+        assert!(v.upgrade_kdf_params());
+        assert_eq!(
+            v.params(),
+            KdfParams {
+                m_cost_kib: 128 * 1024,
+                t_cost: KdfParams::DEFAULT.t_cost,
+                p_cost: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn header_below_the_floor_is_rejected_on_open() {
+        let weak = KdfParams {
+            m_cost_kib: 4 * 1024,
+            ..KdfParams::FLOOR
+        };
+        let mut h = encode_header(weak, &[0; SALT_LEN], &[0; NONCE_LEN]).to_vec();
+        h.extend_from_slice(&[0u8; 32]);
+        assert!(matches!(
+            Vault::open(&h, b"pw"),
+            Err(VaultError::Crypto(CryptoError::InvalidKdfParams { .. }))
+        ));
+    }
 
     #[test]
     fn read_is_capped_even_for_an_endless_stream() {

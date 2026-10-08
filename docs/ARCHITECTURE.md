@@ -14,7 +14,15 @@
 
 ## Cryptography
 
-* **KDF:** Argon2id v1.3. New vaults use 64 MiB / 3 passes / 1 lane. The
+* **KDF:** Argon2id v1.3. New vaults use 64 MiB / 3 passes / 1 lane. A
+  vault is only ever *written* with at least 19 MiB / 2 / 1 (OWASP's minimum
+  Argon2id setting; `KdfParams::MIN`; `Vault::with_params` refuses less, and
+  `seal` clamps up to it). On *read* the lower bound is the more lenient
+  8 MiB / 1 / 1 (`KdfParams::FLOOR`, the old minimum), so a weak vault created
+  by an earlier version still opens instead of locking its owner out; the CLI
+  warns about it and `set`/`unset`/`import` upgrade every parameter to at
+  least the default (`Vault::upgrade_kdf_params`, a per-parameter maximum, so
+  a stronger vault is never weakened) when they re-save. The
   parameters live in the header, which is read *before* the file is
   authenticated, so on read they must fall within a fixed range: at most
   256 MiB, 8 passes and 8 lanes. This caps the memory and CPU an untrusted
