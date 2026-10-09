@@ -13,6 +13,7 @@
 //!   cloakenv lowered for itself (and, if cloakenv reset an inherited ignored
 //!   SIGCHLD, ignores it again in the command).
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::io;
 use std::os::raw::c_int;
 use std::os::unix::process::CommandExt;
