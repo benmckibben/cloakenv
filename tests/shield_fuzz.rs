@@ -331,27 +331,46 @@ fn building_the_filter_for_long_values_is_fast() {
 }
 
 /// Throughput check, run by hand: `cargo test --release --test shield_fuzz --
-/// --ignored --nocapture`. 100 MB of output without a newline, typical
-/// (20 secrets of 24 bytes) and worst-ish (output made of the secrets' own
-/// first bytes), in 8 KiB chunks like the pumps.
+/// --ignored --nocapture`. 100 MB of output without a newline in 8 KiB
+/// chunks like the pumps, against 20 secrets of 24 bytes (a DFA) and against the
+/// same plus one 16 KiB secret (more than 8 KiB of secret bytes: a contiguous NFA).
 #[test]
 #[ignore = "benchmark: run by hand in release mode"]
 fn redaction_throughput_on_100_mb_without_a_newline() {
     let mut rng = Rng(9);
     let letters = b"abcdefghijklmnopqrstuvwxyz";
-    let secrets: Vec<Vec<u8>> = (0..20).map(|_| rng.bytes(letters, 24)).collect();
+    let mut secrets: Vec<Vec<u8>> = (0..20).map(|_| rng.bytes(letters, 24)).collect();
     let text = rng.bytes(letters, 100_000_000);
-    let mut r = Redactor::new(&secrets).unwrap();
-    let mut out = Vec::with_capacity(32 * 1024);
-    let start = std::time::Instant::now();
-    let mut total = 0usize;
-    for chunk in text.chunks(8192) {
-        out.clear();
-        r.push(chunk, &mut out).unwrap();
-        total += out.len();
+    for (label, big) in [("DFA", false), ("NFA", true)] {
+        if big {
+            secrets.push(rng.bytes(letters, 16384));
+        }
+        let mut r = Redactor::new(&secrets).unwrap();
+        let mut out = Vec::with_capacity(32 * 1024);
+        let start = std::time::Instant::now();
+        let mut total = 0usize;
+        for chunk in text.chunks(8192) {
+            out.clear();
+            r.push(chunk, &mut out).unwrap();
+            total += out.len();
+        }
+        r.finish(&mut out).unwrap();
+        let took = start.elapsed();
+        eprintln!("{label}: 100 MB in {took:?} ({total} bytes out)");
+        // The DFA is what typical vaults get and must stay well under a
+        // second; the NFA is slower on output that keeps resembling its
+        // secrets (random letters against random letters, here).
+        if !big {
+            assert!(
+                took < std::time::Duration::from_secs(1),
+                "{label}: {took:?}"
+            );
+        }
     }
-    r.finish(&mut out).unwrap();
-    let took = start.elapsed();
-    eprintln!("100 MB in {took:?} ({total} bytes out)");
-    assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    // Worst case for the DFA build: the biggest self-overlapping value it is
+    // still used for.
+    let x = vec![b'x'; 8192];
+    let start = std::time::Instant::now();
+    let _ = Redactor::new([&x]).unwrap();
+    eprintln!("DFA build of 8192 x: {:?}", start.elapsed());
 }

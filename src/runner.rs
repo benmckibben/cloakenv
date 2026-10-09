@@ -94,10 +94,10 @@ impl RunError {
 /// A DFA is built by following failure links for every state and byte class, which
 /// is quadratic for a long value that overlaps itself (`xxxx…`): 16 KiB of
 /// `x` took 0.5 s and 64 KiB took 8 s. Up to this size even that worst case
-/// builds in tens of milliseconds; above it the matcher is a contiguous NFA,
+/// builds in about 0.1 s; above it the matcher is a contiguous NFA,
 /// which builds in linear time (1 MiB of `x` in a few milliseconds) and scans
 /// about as fast on typical output.
-const DFA_MAX_PATTERN_BYTES: usize = 4096;
+const DFA_MAX_PATTERN_BYTES: usize = 8192;
 
 /// The compiled automaton, either flavour.
 enum Engine {

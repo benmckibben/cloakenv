@@ -428,14 +428,18 @@ stream).
 follows failure links for every state and byte class, which is quadratic for a
 value that overlaps itself (`x` repeated: 16 KiB took 0.5 s, 32 KiB 2.1 s, 64 KiB
 8.7 s, 200 KB more than 20 s; `set` accepts values up to 1 MiB, although Linux
-will inject at most 128 KiB per variable). Up to 4 KiB of secret bytes in total
-the matcher is therefore still a DFA (worst case about 30 ms to build); beyond
-that it is a contiguous NFA, which builds in linear time (a 1 MiB value of
-`x`: a few milliseconds; roughly 12 bytes of automaton per secret byte) and
-scans typical output at 200 to 550 MB/s in a release build against 650 to 710
-for the DFA. Measured on the pump's 8 KiB chunks with 100 MB of output without a
-newline: 0.14 s (DFA) and 0.19 to 0.59 s (NFA). There is no limit on the secret
-bytes: the build cost no longer depends on their structure.
+will inject at most 128 KiB per variable). Up to 8 KiB of secret bytes in total
+the matcher is therefore still a DFA (worst case, 8 KiB of `x`: about 0.13 s to
+build); beyond that it is a contiguous NFA, which builds in linear time (a 1 MiB
+value of `x`: a few milliseconds; roughly 12 bytes of automaton per secret byte).
+Measured in a release build, through the redactor in the pump's 8 KiB chunks, on
+100 MB of output without a newline made of random letters (the hard case: the
+text keeps resembling the secrets): 0.18 s with 20 secrets of 24 bytes (DFA),
+1.15 s with those plus one random 16 KiB secret (NFA). Typical output, which
+rarely resembles a secret, scans at 200 to 540 MB/s on the NFA in a stand-alone
+measurement, against 650 to 710 MB/s on the DFA. There is no limit on the secret
+bytes: the build cost no longer depends on their structure. (`cargo test
+--release --test shield_fuzz -- --ignored --nocapture` repeats the measurement.)
 
 **Known limitations** (by design for v0.1):
 
