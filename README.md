@@ -238,11 +238,32 @@ did not create.
 
 | condition | warning |
 |-----------|---------|
-| vault directory group/world-writable | `cloakenv: warning: vault directory <dir> is group/world-writable (mode 0777, expected 0700); others could replace the vault` |
+| vault directory world-writable (and not sticky) | `cloakenv: warning: vault directory <dir> is world-writable (mode 0777, expected 0700); anyone on this machine could replace the vault` |
+| vault directory group-writable, group not private to you | `cloakenv: warning: vault directory <dir> is writable by a group that is not private to you (mode 0770, expected 0700); the members of that group could replace the vault` |
 | vault file group/world-readable or writable | `cloakenv: warning: vault file <file> is group/world-readable or writable (mode 0644, expected 0600)` |
 | passphrase file group/world-readable or writable | `cloakenv: warning: passphrase file <file> is group/world-readable or writable (mode 0666, expected 0600); anyone who can read it can decrypt the vault` |
 | vault directory is a symlink | `cloakenv: warning: vault directory <dir> is a symbolic link; cloakenv follows it, so make sure its target is private` |
 | vault file is a symlink | `cloakenv: warning: vault file <file> is a symbolic link; reads follow it, but saving replaces the link with a regular file` |
+
+**The exact rule for the vault directory.** A directory that others can write
+to lets them replace the vault with one of their own, but an ordinary project
+directory is group-writable (`0775`) on Debian and Ubuntu, where the default
+umask is `0002` and every user has a private one-member group, and a warning
+on every command there would only teach people to ignore warnings. So:
+
+1. World-writable (`o+w`) and **not** sticky: always a warning. (A sticky
+   world-writable directory such as `/tmp` does not let others rename or
+   delete your files, so that alone is not reported.)
+2. Group-writable (`g+w`): a warning **unless** the directory's group is a
+   *private group of yours*, meaning all of: it is your primary group in
+   `/etc/passwd`; no other account has it as a primary group; and `/etc/group`
+   has an entry for it with your user name whose member list names nobody
+   else (the "user private group" convention). Any group that is shared, or
+   that cannot be found in those two files (a network directory service is not
+   consulted), counts as shared and warns.
+3. Otherwise nothing. The mode of the vault *file* (`0600`) and of the
+   passphrase file are still checked strictly, as in the table, whatever the
+   group.
 
 A loose passphrase file is a warning rather than an error on purpose:
 container secret mounts (Docker, Kubernetes) are commonly mode 0444/0644 and

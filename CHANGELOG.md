@@ -104,6 +104,14 @@ Findings from a security audit of the first version, all fixed before release
 
 ### Fixed
 
+- The "vault directory is group/world-writable" warning is no longer printed on
+  every command in an ordinary project directory. With the default umask 0002
+  (Debian, Ubuntu) such a directory is `0775` in the user's own one-member
+  group, which was reported each time `--vault` pointed into it. A
+  world-writable directory (not sticky) still always warns; a group-writable
+  one warns only when its group is not a private group of the user (the exact
+  rule is in the README). The warnings for the vault file and the passphrase
+  file are unchanged.
 - A vault entry named `PATH`, `LD_*`, `DYLD_*` or `BASH_ENV`, which changes
   which programs and libraries run, is now announced with a one-line warning
   on cloakenv's own stderr (key names only, never values): when it is stored

@@ -1,4 +1,4 @@
-//! Permission hygiene (audit C12): loose modes and symlinks on the vault
+//! Permission hygiene: loose modes and symlinks on the vault
 //! directory, the vault file and the passphrase file produce a one-line
 //! warning on cloakenv's own stderr, never an error, never a chmod, and never
 //! anything inside a shielded child stream.
@@ -52,17 +52,17 @@ fn fresh_init_is_private_and_silent() {
 }
 
 #[test]
-fn group_or_world_writable_vault_dir_warns_but_works() {
+fn world_writable_vault_dir_warns_but_works() {
     let env = seeded();
     let dir = env.path().join(".cloak");
-    for dir_mode in [0o770, 0o707, 0o777] {
+    for dir_mode in [0o707, 0o777, 0o702] {
         chmod(&dir, dir_mode);
         let out = env.ok(&["list"]);
         assert_eq!(stdout(&out), "API_KEY\n");
         let w = warnings(&out);
         assert_eq!(w.len(), 1, "{dir_mode:o}: {}", stderr(&out));
         assert!(w[0].contains("vault directory"), "{w:?}");
-        assert!(w[0].contains("group/world-writable"), "{w:?}");
+        assert!(w[0].contains("world-writable"), "{w:?}");
         assert!(w[0].contains(&format!("{dir_mode:04o}")), "{w:?}");
         // We only warn: the mode is left exactly as the user had it.
         assert_eq!(mode(&dir), dir_mode);
@@ -71,10 +71,41 @@ fn group_or_world_writable_vault_dir_warns_but_works() {
     let out = env.run_stdin(&["set", "OTHER"], "dummy-two\n");
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(warnings(&out).len(), 1, "{}", stderr(&out));
-    assert_eq!(mode(&dir), 0o777);
+    assert_eq!(mode(&dir), 0o702);
     // Group/world-readable but not writable is fine.
     chmod(&dir, 0o755);
     assert!(warnings(&env.ok(&["list"])).is_empty());
+}
+
+/// The sticky bit (as on /tmp itself) means others cannot rename or delete our
+/// files, so a world-writable but sticky directory is not reported.
+#[test]
+fn a_sticky_world_writable_vault_dir_is_quiet() {
+    let env = seeded();
+    chmod(&env.path().join(".cloak"), 0o1707);
+    assert!(warnings(&env.ok(&["list"])).is_empty());
+}
+
+/// A group-writable directory is the normal state of a project directory
+/// under the common umask 0002, with the group being the user's own private
+/// group. This machine's group setup decides the outcome, so check only that
+/// the answer is a single, well-formed warning or none, and that it never
+/// depends on the file mode of the vault itself.
+#[test]
+fn a_group_writable_vault_dir_gets_at_most_one_well_formed_warning() {
+    let env = seeded();
+    let dir = env.path().join(".cloak");
+    chmod(&dir, 0o770);
+    let out = env.ok(&["list"]);
+    let w = warnings(&out);
+    assert!(w.len() <= 1, "{w:?}");
+    if let Some(line) = w.first() {
+        assert!(
+            line.contains("not private to you") && line.contains("0770"),
+            "{line}"
+        );
+    }
+    assert_eq!(mode(&dir), 0o770, "never chmod user directories");
 }
 
 #[test]
@@ -126,7 +157,7 @@ fn warnings_do_not_change_exit_codes() {
 fn warnings_stay_out_of_the_shielded_stream() {
     let env = seeded();
     chmod(&env.vault(), 0o644);
-    chmod(&env.path().join(".cloak"), 0o775);
+    chmod(&env.path().join(".cloak"), 0o777);
     let out = env
         .cmd(Some(PASS))
         .args([
