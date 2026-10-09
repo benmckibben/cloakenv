@@ -11,21 +11,23 @@ transcripts, CI logs or terminal scrollback.
 
 ## Install
 
-**The first release, 0.1.0, has not been published yet**: there is no release
-archive and no released crate. Build from source today (Rust 1.87 or newer;
-Linux or macOS, see [Platform support](#platform-support)).
+Rust 1.87 or newer; Linux or macOS (see [Platform support](#platform-support)).
+
+```sh
+cargo install --locked cloakenv       # installs `cloakenv` into ~/.cargo/bin
+```
+
+or from a checkout:
 
 ```sh
 git clone https://github.com/benmckibben/cloakenv
 cd cloakenv
-cargo install --path . --locked    # installs `cloakenv` into ~/.cargo/bin
+cargo install --path . --locked
 # or: cargo build --release --locked   # binary at target/release/cloakenv
 ```
 
-The name `cloakenv` on crates.io is held by a placeholder, version `0.0.0`, that
-contains no functionality: `cargo install cloakenv` currently installs **only that
-placeholder**, not this program. Release archives are built by CI but nothing is
-published yet; see [CONTRIBUTING.md](CONTRIBUTING.md#releasing-maintainer).
+Each GitHub release also carries static Linux (x86_64, aarch64) and macOS
+(aarch64, x86_64) archives with a `SHA256SUMS` file.
 
 ## Quick start
 

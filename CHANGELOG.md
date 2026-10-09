@@ -7,12 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-10-09
 
-The first release, not published yet: this section lists everything it will
-contain, and its date is filled in when it is tagged. (The crate name is held on
-crates.io by a `0.0.0` placeholder with no functionality; `cargo install cloakenv`
-currently installs that placeholder, not this program.)
+The first release.
 
 ### Added
 
@@ -207,5 +204,5 @@ this release:
 - The key-derivation upgrade notice is only printed after the vault was
   actually saved.
 
-[Unreleased]: https://github.com/benmckibben/cloakenv/commits/main
-[0.1.0]: https://github.com/benmckibben/cloakenv/commits/main
+[Unreleased]: https://github.com/benmckibben/cloakenv/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/benmckibben/cloakenv/releases/tag/v0.1.0
