@@ -54,6 +54,11 @@ What this does and does not protect against is in the [Threat model](#threat-mod
 | `cloakenv list` | print the names, one per line, never the values |
 | `cloakenv run [--shield] -- COMMAND [ARGS...]` | run a command with the vault in its environment |
 
+The `--` before the command is required, so that everything after the command's
+name is the command's: `cloakenv run -- cmd --shield` gives `cmd` an argument
+called `--shield`, and `cloakenv run cmd --shield` (no `--`) is a usage error
+(exit 2, nothing is started) rather than an unredacted run.
+
 Every command takes `--vault <path>` (or `CLOAKENV_VAULT`), see
 [Vault location](#vault-location); `--help` and `--version` work everywhere.
 Variable names must match `[A-Za-z_][A-Za-z0-9_]*`; `CLOAKENV_PASSPHRASE` and
@@ -438,9 +443,10 @@ cloakenv process left, so:
   by a signal, the signal death itself (a shell reports it as `128 + N`, a
   program using `waitpid` sees `WIFSIGNALED`, which is not an exit code);
 - stdin, stdout, stderr, the controlling terminal, the working directory and
-  open descriptors are inherited unchanged (cloakenv opens nothing that survives
-  the exec: the vault, passphrase file and lock file are all close-on-exec or
-  closed);
+  open descriptors are inherited as they are (cloakenv opens nothing that
+  survives the exec: the vault, passphrase file and lock file are all
+  close-on-exec or closed). The exceptions are listed in [What the command
+  inherits](#what-the-command-inherits-in-both-modes);
 - cloakenv's environment block, with the passphrase in it, no longer exists
   anywhere: there is nothing left for another process to read, however it asks.
 
@@ -472,6 +478,12 @@ filter the output. It then
   spawned. On macOS there is no equivalent: if cloakenv is killed with
   `SIGKILL` the command keeps running (its next write to the closed output pipe
   ends it with `SIGPIPE`, if it ever writes);
+- resets `SIGCHLD` to its default action for itself if it inherited it as
+  *ignored* (a Python `preexec_fn`, some launchers and init wrappers do that).
+  Left ignored, the kernel reaps the command the moment it exits and cloakenv
+  could not get its exit status (`failed to wait for child process: No child
+  processes`, exit 125). The command still sees `SIGCHLD` ignored, as it would without
+  `--shield`;
 - delivers a Ctrl-C **twice** to the command at a terminal: the terminal sends
   `SIGINT` to the whole foreground process group (cloakenv and the command), and
   cloakenv forwards its copy as well. Telling the two apart needs the signal's
@@ -489,6 +501,43 @@ filter the output. It then
 
 Windows is unsupported: there `run` is a plain spawn-and-wait with none of the
 above.
+
+### What the command inherits, in both modes
+
+Mostly what cloakenv itself had, but not everything:
+
+- **Standard descriptors that were closed.** If descriptor 0, 1 or 2 is closed
+  when cloakenv starts (`cloakenv run … <&-`), the Rust runtime reopens it on
+  `/dev/null` before cloakenv's own code runs, so the command finds `/dev/null`
+  there, not a closed descriptor. (Under `--shield` the command's 1 and 2 are
+  cloakenv's output pipes anyway.) "Inherited unchanged" is true for every
+  descriptor that was open.
+- **`SIGPIPE` is always the default action** for the command, even if cloakenv's
+  caller ignored it (`trap '' PIPE`, a Python launcher): the Rust runtime ignores
+  `SIGPIPE` in cloakenv itself and resets it for the commands it starts, and the
+  caller's setting cannot be recovered. A command that wants `SIGPIPE` ignored
+  must do it itself.
+- **Ignored signals stay ignored** for `SIGTERM`, `SIGHUP`, `SIGINT`, `SIGQUIT`,
+  `SIGUSR1` and `SIGUSR2` (`nohup` style), and `SIGCHLD` keeps whatever the caller
+  set, in both modes (see above for how `--shield` copes with an ignored one).
+- **The core-file size limit** is the one cloakenv's caller had (cloakenv lowers
+  its own to 0, see [Passphrase sources](#passphrase-sources)).
+- **The environment** is the vault's entries on top of cloakenv's own
+  environment, minus `CLOAKENV_PASSPHRASE` and `CLOAKENV_PASSPHRASE_FILE`. A
+  vault entry with the same name as an existing variable replaces it.
+
+### Without `--shield` and with it, side by side
+
+| | no `--shield` (`exec`) | `--shield` |
+|---|---|---|
+| process | cloakenv *is* the command: same pid, parent is whatever started cloakenv, `ps` shows the command | cloakenv stays the parent; the command is its child (a new pid) |
+| signals | go straight to the command; nothing to forward | cloakenv catches `TERM HUP INT QUIT USR1 USR2` and forwards them (Ctrl-C reaches the command twice at a terminal) |
+| exit status | the command's own; a signal death is the signal death itself (a shell shows `128+N`) | the command's code, or `128+N` if a signal killed it |
+| stdout, stderr | the very descriptors cloakenv got (terminal, file, pipe) | pipes cloakenv reads and filters: `isatty()` is false, so colours, progress bars, pagers, line editing and REPLs behave as if piped, and programs that buffer when not on a terminal (C stdio, Python) deliver output in blocks until they flush |
+| stdin | inherited | inherited (a terminal stays a terminal) |
+| if cloakenv is killed with `SIGKILL` | there is no cloakenv | the command is killed too on Linux (`PR_SET_PDEATHSIG`); on macOS it keeps running |
+| `/proc` (Linux) | the command is dumpable: its `environ` is readable by same-user processes | same for the command; cloakenv itself (non-dumpable) holds the redaction state |
+| a leftover background process | keeps the inherited descriptors | cloakenv stops waiting for its output shortly after the command exits (see above) |
 
 ### Variables that change what runs
 
@@ -538,14 +587,32 @@ Run a real init as PID 1 and cloakenv under it (`docker run --init`, `tini`,
 | `run`: command exited normally                 | command's code |
 | `run --shield`: command killed by signal N     | 128 + N       |
 | `run` (no shield): command killed by signal N  | the signal death itself (shells show `128 + N`) |
-| `run`: vault/passphrase/shield failure         | 125           |
+| `run`: vault/passphrase/shield failure, or the command's output could not be written | 125 |
 | `run`: command not executable / not found      | 126 / 127     |
 | other subcommands: any failure                 | 1             |
-| invalid command line (arguments are never echoed) | 2          |
+| invalid command line, including `run` (arguments are never echoed) | 2 |
 | `list` whose reader closed the pipe early      | 0 (quiet)     |
+
+**Ambiguity.** 125, 126 and 127 are also ordinary exit codes of commands (a
+shell script ending in `exit 127`, a wrapper that itself follows the `env`/`docker
+run` convention), and the code is passed through unchanged, so a status of 125,
+126 or 127 does not by itself say who failed. cloakenv's own failures always
+print a line starting with `cloakenv: error:` on stderr first. Under `run`, a
+usage error is 2 but every other cloakenv failure is 125 (not 1, which other
+subcommands use and which a command may return too). `cloakenv run --help`
+prints this table.
 
 Exit codes are 0–255 on Unix. A child exit status above 255 (possible on
 Windows only, which is unsupported) is reported as `1`.
+
+**Output that cannot be written.** Under `run --shield`, cloakenv waits for its
+stdout and stderr to become writable if they are non-blocking (a parent that made
+a pipe non-blocking shares that flag with cloakenv; the output is neither cut
+short nor lost). If writing fails for a reason other than the reader having gone
+away (a full disk, a closed socket that reports an error) cloakenv says so,
+`cloakenv: error: failed to write the command's output: <OS error>`, stops
+reading the command's output, and exits 125 even if the command itself
+succeeded, rather than report a success with output missing.
 
 **Output closed early.** If whatever reads cloakenv's output goes away
 (`cloakenv list | head -1`), cloakenv stops quietly with exit status 0, the way
@@ -568,19 +635,38 @@ messages that echo a connection string, a stack trace that includes a token.
 It is **not** a security boundary against a command that wants to leak a
 secret: the child process has the plaintext in its environment.
 
+What the command sees under `--shield` (the full comparison with the exec mode
+is [above](#without---shield-and-with-it-side-by-side)):
+
+- its **stdout and stderr are pipes, not terminals** (`[ -t 1 ]` is false):
+  colours are usually switched off, progress bars, pagers and interactive REPLs
+  do not work, and programs that line-buffer only on a terminal (C stdio,
+  Python) hold output until a buffer fills unless they flush (`python -u`,
+  `stdbuf -oL`). cloakenv itself shows output as soon as it reads it (see the last
+  bullet below for what is held back);
+- its **stdin is inherited**: still the terminal if cloakenv's is, so
+  prompts and `read` work;
+- if cloakenv's own stdout and stderr are the same destination, it gets **one
+  pipe for both** (what `2>&1` gives it), which also keeps their order.
+
 What it does **not** catch:
 
 - **Transformed secrets.** Only the exact value is matched. Base64, hex,
   URL/percent-encoded, JSON- or shell-escaped (`\n`, `\"`), reversed,
   upper/lower-cased, truncated or masked forms (`sk-live-ab…`), and values the
   program wraps or splits across lines are printed in clear.
-- **Secrets split across the two streams.** stdout and stderr are filtered
-  independently (one filter and one thread each); a secret whose first half goes
-  to stdout and second half to stderr matches in neither.
-- **Interleaving order.** The two streams are read and written by separate
-  threads, so the relative order of stdout and stderr lines in the redacted
-  output is **not** guaranteed to match the order the child produced them.
-  (Within one stream, order is preserved.)
+- **Secrets split across the two streams.** When your stdout and stderr are
+  different files or pipes they are filtered independently (one filter and one
+  thread each), and a secret whose first half goes to stdout and second half to
+  stderr matches in neither. When they are the same destination (`> log 2>&1`,
+  `2>&1 | tee`, both on one terminal) cloakenv gives the command a single pipe
+  for both, exactly as `2>&1` would, so such a secret is caught too.
+- **Interleaving order.** When stdout and stderr are different destinations
+  they are read and written by separate threads, so the relative order of their
+  lines in the redacted output is **not** guaranteed to match the order the
+  child produced them. (Within one stream, order is preserved.) When they are
+  the same destination the child's own order is kept, and a line of one stream
+  is never cut in two by the other.
 - **Anything that isn't the stdout/stderr pipe:** files, sockets, `/dev/tty`,
   other inherited file descriptors, or a deliberate `| base64`.
 - **Very short secrets (a few bytes).** Every occurrence of the string is
@@ -604,10 +690,17 @@ What it does **not** catch:
   (see [How `run` starts your command](#how-run-starts-your-command)): what
   they print after the grace period is not shown at all, filtered or not.
 - **A partial secret at the end of the output.** To match across chunk
-  boundaries the filter holds back the last (longest secret − 1) bytes of each
-  stream. If the stream ends in the middle of what *would* have been a match
-  (the child is killed, or prints only the first part of a token and exits), the
-  held-back prefix is flushed as is, in clear.
+  boundaries the filter holds back the trailing bytes of each stream that could
+  still turn out to be the beginning of a secret, and only those: the longest
+  suffix of the output so far that is a prefix of some secret (`sk-li` for a
+  `sk-live-…` token). A line, a prompt without a newline (`Enter name: `) or a
+  server's `listening on …` message is shown at once. Held bytes wait for more
+  output or for the end of the stream, and are never released by a timer: they
+  are exactly the bytes that begin a secret, so a slow writer would otherwise
+  leak its first half. If the stream ends in the middle of what *would* have
+  been a match (the child is killed, or prints only the first part of a token
+  and exits), the held-back prefix is flushed as is, in clear; it is not the
+  secret.
 
 These are known limitations, documented here rather than fixed in this
 version; see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#--shield-streaming-redaction).

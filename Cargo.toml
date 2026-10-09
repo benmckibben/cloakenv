@@ -47,13 +47,14 @@ thiserror = "2.0.21"
 zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 
 # Unix only. rustix: safe wrappers for flock(2) (vault locking), prctl(2)/setrlimit(2)
-# (process hardening), waitid(2)/kill(2)/poll(2) (supervising the --shield child).
+# (process hardening), waitid(2)/kill(2)/poll(2) (supervising the --shield child),
+# fstat(2)/write(2) on our own stdout and stderr.
 # signal-hook: forwards signals to that child (its iterator mode keeps the
 # signal handler itself async-signal-safe). libc: one read-only sigaction(2)
 # query (is a signal ignored?) in src/sys.rs, the crate's only unsafe code.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"
-rustix = { version = "1.1.5", features = ["fs", "process", "event", "termios"] }
+rustix = { version = "1.1.5", features = ["fs", "process", "event", "stdio", "termios"] }
 signal-hook = { version = "0.4.5", default-features = false, features = ["iterator"] }
 
 # Windows is unsupported, but keep the interactive prompt compiling there.
@@ -69,4 +70,9 @@ tempfile = "3.27.0"
 opt-level = 3
 
 [profile.dev.package.blake2]
+opt-level = 3
+
+# The shield matcher is built and run by the debug-profile tests too, on
+# values up to 1 MiB.
+[profile.dev.package.aho-corasick]
 opt-level = 3

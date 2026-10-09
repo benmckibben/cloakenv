@@ -133,12 +133,37 @@ enum Cmd {
     #[command(after_help = SUBCOMMAND_EXIT_CODES)]
     List,
     /// Run a command with the vault's secrets injected into its environment.
+    ///
+    /// The command comes after `--`, and everything after its name belongs to it:
+    /// `cloakenv run --shield -- cmd --shield` gives `cmd` an argument `--shield`.
+    ///
+    /// Without --shield, cloakenv replaces itself with the command (exec): same
+    /// process id, no cloakenv process left, signals and the exit status are the
+    /// command's own, and stdin, stdout and stderr are inherited as they are.
+    ///
+    /// With --shield, cloakenv stays the command's parent and passes its stdout
+    /// and stderr through a filter that replaces every literal secret value with
+    /// [REDACTED_BY_CLOAKENV]. The command's stdout and stderr are then pipes, not
+    /// terminals (programs may switch off colours, prompts and line buffering);
+    /// its stdin is inherited. Signals are forwarded to it. Output is shown as it
+    /// arrives, except for trailing bytes that could still be the beginning of a
+    /// secret, which wait for more output or the end. When cloakenv's own stdout
+    /// and stderr are the same destination (2>&1) the command gets one pipe for
+    /// both.
+    ///
+    /// A filter for accidents, not a security boundary: it does not catch
+    /// transformed secrets (base64, hex, escaped) or anything not written to
+    /// stdout or stderr. See the README.
+    #[command(after_help = RUN_EXIT_CODES)]
     Run {
-        /// Redact secret values from the command's stdout and stderr.
+        /// Redact secret values from the command's stdout and stderr (which
+        /// become pipes).
         #[arg(long)]
         shield: bool,
-        /// Command and arguments, e.g. `-- npm start`.
-        #[arg(required = true, trailing_var_arg = true, value_name = "COMMAND")]
+        /// The command and its arguments. Always written after `--`, so that
+        /// everything after the command's name belongs to the command
+        /// (`cloakenv run -- cmd --shield` passes `--shield` to `cmd`).
+        #[arg(required = true, last = true, value_name = "COMMAND")]
         command: Vec<OsString>,
     },
 }
@@ -181,6 +206,27 @@ impl std::fmt::Debug for Cmd {
         }
     }
 }
+
+/// The exit-code table printed by `cloakenv run --help`.
+const RUN_EXIT_CODES: &str = "\
+Exit codes of 'run':
+  N      the command's own exit status. A command that exits 125, 126 or 127
+         itself cannot be told from the three cases below by the code alone:
+         cloakenv's own failures print 'cloakenv: error: ...' on stderr.
+  128+N  --shield only: the command was killed by signal N. Without --shield
+         the process is the command and dies of the signal itself, which a
+         shell reports as 128+N too.
+  125    cloakenv itself failed (wrong passphrase, unreadable or corrupt vault,
+         shield could not start, the command's output could not be written).
+         The command was not started, or, for an output failure, was stopped.
+  126    the command was found but could not be executed.
+  127    the command was not found.
+  2      usage error (unknown option, no '--', no command); nothing was started.
+         Every other cloakenv failure under 'run' is 125, not 1 or 2.
+Other subcommands exit 0 on success and 1 on any failure (2 for a usage error).
+If the reader of cloakenv's output goes away (cloakenv run --shield -- cmd | head)
+the command gets SIGPIPE on its next write and the exit status is its own
+(141 if that killed it).";
 
 /// Exit code for cloakenv's own failures under `run` (as in env(1), docker run),
 /// so they are distinguishable from the child's exit codes.
@@ -478,6 +524,17 @@ fn sanitized_usage_error(err: &clap::Error) -> String {
             msg.push_str(&format!("  missing: {}\n", names.join(", ")));
         }
     }
+    let usage = match err.get(ContextKind::Usage) {
+        Some(ContextValue::StyledStr(usage)) => usage.to_string(),
+        _ => Cli::command().render_usage().to_string(),
+    };
+    // `run` takes the command only after `--`. A command typed without it is
+    // the commonest way to land here, so say so (without quoting anything).
+    if usage.contains("cloakenv run") {
+        msg.push_str(
+            "  tip: the command goes after `--`, as in `cloakenv run [--shield] -- COMMAND [ARGS]...`\n",
+        );
+    }
     for kind in [ContextKind::SuggestedSubcommand, ContextKind::SuggestedArg] {
         if let Some(ContextValue::String(s)) = err.get(kind) {
             msg.push_str(&format!("  tip: did you mean '{s}'?\n"));
@@ -488,10 +545,6 @@ fn sanitized_usage_error(err: &clap::Error) -> String {
             }
         }
     }
-    let usage = match err.get(ContextKind::Usage) {
-        Some(ContextValue::StyledStr(usage)) => usage.to_string(),
-        _ => Cli::command().render_usage().to_string(),
-    };
     msg.push_str(&format!(
         "\n{}\n\nFor more information, try '--help'.\n",
         usage.trim_end()

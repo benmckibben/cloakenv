@@ -19,8 +19,22 @@ pub fn stderr_line(args: fmt::Arguments<'_>) {
 }
 
 /// Writes `text` as is to stderr; failure is ignored.
+///
+/// On Unix a non-blocking stderr (see `crate::fdio`) is waited for, for at most
+/// a couple of seconds, rather than losing the message to `EAGAIN`.
 pub fn stderr_text(text: &str) {
-    let _ = io::stderr().write_all(text.as_bytes());
+    #[cfg(unix)]
+    {
+        let mut err = crate::fdio::FdWriter::with_patience(
+            rustix::stdio::stderr(),
+            std::time::Duration::from_secs(2),
+        );
+        let _ = err.write_all(text.as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = io::stderr().write_all(text.as_bytes());
+    }
 }
 
 /// Like `eprintln!`, but never panics.
@@ -35,6 +49,11 @@ macro_rules! elog {
 /// `cloakenv list | head -1`) is a quiet success, like `cat` being cut short,
 /// and any other error is returned.
 pub fn stdout_until_closed(write: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> io::Result<()> {
+    // On Unix a non-blocking stdout is waited for instead of failing with
+    // `EAGAIN` (see `crate::fdio`).
+    #[cfg(unix)]
+    let mut out = io::BufWriter::new(crate::fdio::FdWriter::new(rustix::stdio::stdout()));
+    #[cfg(not(unix))]
     let mut out = io::stdout().lock();
     let result = write(&mut out).and_then(|()| out.flush());
     match result {

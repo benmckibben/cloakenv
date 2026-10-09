@@ -171,6 +171,38 @@ are routinely 0444/0644 and rely on the container boundary.
   cleared by `exec` of a set-uid binary and only reaches the direct child.
   The same hook gives the child back the original core-file limit. Exit
   status mapping is unchanged (`128 + N`).
+* **One pipe or two.** If cloakenv's own stdout and stderr are the same file,
+  pipe, socket or terminal (`fstat` device and inode equal, which also sees
+  through `dup`; `fdio::stdout_and_stderr_are_one`), the command gets one pipe
+  for both streams (the pipe's write end duplicated onto fd 1 and fd 2, as
+  `2>&1` would do) and one pump with one redactor writes to fd 1. Two pumps
+  writing unaligned chunks to one destination cut lines of one stream in two
+  with lines of the other (a fifth or more of the lines of a busy command were
+  garbled when both went to one file), and a secret whose halves went to different streams could not
+  be matched. With one pipe the command's own write order is kept, which also
+  makes the output reproducible. If the inode is 0 (a platform that does not
+  number an object) the answer is "different", the old behaviour. Different
+  destinations are untouched: two pipes, two pumps, two redactors.
+* **Writing our own output** (`src/fdio.rs`). The pumps write with a loop of
+  `write(2)` that tracks how much was written, retries `EINTR`, and on `EAGAIN`
+  (our stdout or stderr is non-blocking: the flag is on the open file
+  description, shared with whoever else holds it) polls for `POLLOUT` and goes
+  on from where it stopped. `std::io::Write::write_all` would fail there and
+  could not say how much had been written, so output was cut (1 MB became
+  about 64 KB) and the stream treated as closed. `EPIPE` (the reader went away)
+  ends that pump quietly, as for `cat`, and the command meets a closed pipe on
+  its next write. Any other write error is returned to the supervisor, which
+  reports `failed to write the command's output` and exits 125 after the
+  command has been reaped. The same writer serves `cloakenv list` and our own
+  diagnostics on stderr (for those, waiting is bounded to two seconds).
+* **Inherited SIGCHLD.** If `SIGCHLD` is `SIG_IGN` when cloakenv starts (it
+  survives `exec`, so a Python `preexec_fn` or an init wrapper can hand it down),
+  the kernel reaps children by itself and `waitpid`/`waitid` fail with `ECHILD`.
+  Before spawning, `--shield` sets it back to the default for its own process
+  (`sys::default_sigchld`); the `pre_exec` hook sets it to `SIG_IGN` again in the
+  command (one `signal(2)` call, async-signal-safe), so the command sees what
+  it would have seen without cloakenv, in both modes. The exec mode needs
+  nothing: it never waits.
 * **Output pumps and leftover holders.** The pumps `poll` their pipe with a
   50 ms tick instead of blocking in `read`. After the command has exited
   they end at EOF, or once the pipe has been silent for 250 ms, or 3 seconds
@@ -244,8 +276,12 @@ described here:
   verbatim, which made the secret findable by a plain memory search (the
   remaining representation is a state machine, from which a determined
   attacker with memory access could still reconstruct the values: it is not
-  encryption, merely not a contiguous copy). Matching speed is unaffected for
-  this workload (about 500 to 600 MB/s in a micro-benchmark either way).
+  encryption, merely not a contiguous copy). The held-back-prefix logic adds
+  only a 256-entry table of which bytes can begin a secret, derived from the
+  automaton's start state. (Not re-measured with a memory scan after the
+  matcher became a DFA-or-NFA pair; both are state machines with no
+  contiguous copy of the patterns.) Matching speed is unaffected for typical
+  secrets (see "Building the automaton" for numbers).
 * **Not fixable here, accepted:** the copies that `std::process::Command` makes
   of the environment (its own map, and the C string array built when
   spawning). They are freed but not wiped, so they can linger in freed heap
@@ -455,16 +491,56 @@ question: its absence is a protection some users want.
 
 stdout and stderr of the child are piped; one thread per stream reads 8 KiB
 chunks and feeds them through a `Redactor` (Aho-Corasick, leftmost-longest)
-before writing and flushing to the parent's corresponding stream. stdin is
+before writing to the parent's corresponding stream after every chunk. If the
+parent's stdout and stderr are the same destination there is one pipe, one
+thread and one redactor for both (see "One pipe or two" above). stdin is
 inherited.
 
-**Chunk boundaries:** with `L` = longest secret length, the redactor holds back
-the last `L − 1` bytes of its buffer. Any match starting before that window is
-fully determined by bytes already seen (including any longer alternative at the
-same start), so it is safe to emit or redact; matches that might still be in
-flight wait for more input or EOF. Output is therefore byte-for-byte identical
-to redacting the whole stream at once, independent of how the OS splits reads —
-tests check every chunk size from 1 to the input length.
+**Chunk boundaries:** the redactor holds back exactly the trailing bytes that
+could still become the beginning of a match: the longest suffix of its buffer
+that is a *proper* prefix of some secret (a secret that nothing longer
+continues is complete, so it is redacted at once). Any match starting before
+that point is fully determined by bytes already seen (a longer alternative at
+the same start would make that start a proper prefix and hold it), so it is
+safe to emit or redact; everything else, such as ordinary output or a prompt
+without a newline, is released immediately. Held bytes wait for more input or
+EOF and are *never* released by a timer: they are the bytes that start a
+secret, so releasing them on idle would leak a secret prefix from any slow
+writer. Output is therefore byte-for-byte identical to redacting the whole
+stream at once, independent of how the OS splits reads. The tests compare the
+redactor with a naive leftmost-longest reference on random overlapping,
+prefix-related and binary secrets and random chunkings, check after every push
+that the held-back length is exactly the reference's, and that no secret ever
+appears in the output.
+
+How the held-back suffix is found: a first-byte table (derived from the
+automaton's anchored start state, so there is no second copy of the secrets)
+skips every position that cannot start a secret; for the others an anchored
+walk of the same automaton from that position tells whether the rest of the
+buffer is a prefix of some secret (and, for a match state, whether anything
+longer continues it). Only the last `L − 1` bytes (`L` = longest secret) are
+candidates. The work per push is bounded (about eight steps per candidate
+byte plus a constant); a stream built to look like the beginning of a long
+self-overlapping secret exceeds it, and the redactor then holds the whole
+`L − 1` window, which is always a safe superset (the old behaviour for every
+stream).
+
+**Building the automaton:** a DFA is the fastest matcher but its construction
+follows failure links for every state and byte class, which is quadratic for a
+value that overlaps itself (`x` repeated: 16 KiB took 0.5 s, 32 KiB 2.1 s, 64 KiB
+8.7 s, 200 KB more than 20 s; `set` accepts values up to 1 MiB, although Linux
+will inject at most 128 KiB per variable). Up to 8 KiB of secret bytes in total
+the matcher is therefore still a DFA (worst case, 8 KiB of `x`: about 0.13 s to
+build); beyond that it is a contiguous NFA, which builds in linear time (a 1 MiB
+value of `x`: a few milliseconds; roughly 12 bytes of automaton per secret byte).
+Measured in a release build, through the redactor in the pump's 8 KiB chunks, on
+100 MB of output without a newline made of random letters (the hard case: the
+text keeps resembling the secrets): 0.18 s with 20 secrets of 24 bytes (DFA),
+1.15 s with those plus one random 16 KiB secret (NFA). Typical output, which
+rarely resembles a secret, scans at 200 to 540 MB/s on the NFA in a stand-alone
+measurement, against 650 to 710 MB/s on the DFA. There is no limit on the secret
+bytes: the build cost no longer depends on their structure. (`cargo test
+--release --test shield_fuzz -- --ignored --nocapture` repeats the measurement.)
 
 **Known limitations** (by design for v0.1):
 
@@ -476,8 +552,12 @@ tests check every chunk size from 1 to the input length.
   stderr in the output is not guaranteed to match the child's write order.
 * If a stream ends while the held-back tail is a proper prefix of a secret
   (child killed, output cut off), that prefix is written in clear at EOF.
-* Up to `L − 1` trailing bytes are delayed until more output arrives or the
-  stream closes; a prompt without a newline may appear late.
+* A trailing partial secret is delayed until more output arrives or the stream
+  closes (and is never released by a timer); nothing else is held back, so a
+  prompt without a newline appears at once. An opt-in idle flush was
+  considered and not built: the held bytes are by definition a prefix of a
+  secret, so flushing them when the writer pauses would reveal the start of
+  a secret to anyone watching the output of a slow writer.
 * When two *different* secrets overlap in the output (e.g. `hunter2` and
   `2fa-token` printed as `hunter2fa-token`), leftmost-longest redacts the
   first and the non-overlapping tail of the second remains visible.
