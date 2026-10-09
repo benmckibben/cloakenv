@@ -104,7 +104,13 @@ impl Env {
     }
 
     pub fn set(&self, key: &str, value: &str) {
-        let out = self.run_stdin(&["set", key], value);
+        // An empty value has to be asked for (see tests/set_empty.rs).
+        let args: &[&str] = if value.is_empty() {
+            &["set", "--allow-empty", key]
+        } else {
+            &["set", key]
+        };
+        let out = self.run_stdin(args, value);
         assert!(
             out.status.success(),
             "cloakenv set {key} failed: {}\nstderr: {}",

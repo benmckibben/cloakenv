@@ -32,6 +32,7 @@ this program. Release archives are built by CI but nothing is published yet; see
 cloakenv init                          # prompts for a passphrase
 cloakenv set DATABASE_URL              # value read from a hidden prompt
 pass show api | cloakenv set API_KEY   # ...or piped on stdin (never as an argument)
+                                       # (an empty value is refused, see below)
 cloakenv import .env && rm .env        # migrate an existing .env file
 cloakenv list                          # names only, never values
 
@@ -46,7 +47,7 @@ What this does and does not protect against is in the [Threat model](#threat-mod
 | command | what it does |
 |---------|--------------|
 | `cloakenv init [--force]` | create an empty vault; refuses to overwrite an existing one unless `--force` (which erases its contents) |
-| `cloakenv set KEY` | store or replace one value, from a hidden prompt or stdin (never from the command line) |
+| `cloakenv set [--allow-empty] KEY` | store or replace one value, from a hidden prompt or stdin (never from the command line); empty input is refused unless `--allow-empty` |
 | `cloakenv unset KEY` | remove one entry (an error if there is no such key) |
 | `cloakenv import FILE` | add or replace the entries of a `.env` file, see [Importing a `.env` file](#importing-a-env-file) |
 | `cloakenv list` | print the names, one per line, never the values |
@@ -65,6 +66,19 @@ most **1 MiB**, with one trailing newline (`\n` or `\r\n`) removed and nothing
 else; anything larger, or not valid UTF-8, is refused with an error that does
 not repeat any of it, and nothing is stored. The input is read into one buffer that is wiped
 afterwards; see "Memory hygiene" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#memory-hygiene-best-effort).
+
+**Empty values are refused.** If the value is empty (after the one trailing
+line break is removed), `cloakenv set` exits with status 1 and stores
+nothing, and the existing value, if any, stays as it was. The usual cause is the
+command feeding stdin having failed: `false | cloakenv set API_KEY`, or a
+`pass show` that could not decrypt, used to replace the good secret with an
+empty string and exit 0. The same goes for pressing Enter at the hidden prompt.
+To store an empty value on purpose (a variable that must exist but be empty),
+say so: `cloakenv set --allow-empty KEY`. In a shell pipeline also use
+`set -o pipefail` so the failure of the producer is not lost. (`import` is
+different: a `KEY=` line in a `.env` file is an explicit empty value, and is
+imported, with a warning that names the keys; see
+[Importing a `.env` file](#importing-a-env-file).)
 
 ### Size limits, checked when you store, not when you next open the vault
 

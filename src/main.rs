@@ -58,13 +58,20 @@ enum Cmd {
     ///
     /// The value is read from a hidden prompt on a terminal, otherwise from
     /// stdin (one trailing newline is stripped). It is never accepted as an
-    /// argument, where ps(1), /proc and shell history would see it.
+    /// argument, where ps(1), /proc and shell history would see it. An empty
+    /// value is refused unless --allow-empty is given: empty input usually
+    /// means the command feeding stdin failed, and storing it would silently
+    /// replace a good secret.
     #[command(
-        after_help = "Examples:\n  cloakenv set API_KEY                       # hidden prompt\n  pass show api-key | cloakenv set API_KEY   # from another tool"
+        after_help = "Examples:\n  cloakenv set API_KEY                       # hidden prompt\n  pass show api-key | cloakenv set API_KEY   # from another tool\n  cloakenv set --allow-empty OPTIONAL_TOKEN  # store an empty value on purpose\n\nTip: in a shell pipeline use 'set -o pipefail' so a failing producer is noticed."
     )]
     Set {
         /// Environment variable name.
         key: String,
+        /// Store the value even if it is empty (by default empty input is
+        /// refused and nothing is stored).
+        #[arg(long)]
+        allow_empty: bool,
         /// Not accepted: secret values on the command line are visible to
         /// other processes. Kept (hidden) only to refuse it with a clear
         /// error that does not repeat the value.
@@ -104,9 +111,14 @@ impl std::fmt::Debug for Cmd {
         const REDACTED: &str = "[REDACTED]";
         match self {
             Cmd::Init { force } => f.debug_struct("Init").field("force", force).finish(),
-            Cmd::Set { key: _, value } => f
+            Cmd::Set {
+                key: _,
+                allow_empty,
+                value,
+            } => f
                 .debug_struct("Set")
                 .field("key", &REDACTED)
+                .field("allow_empty", allow_empty)
                 .field("value", &value.as_ref().map(|_| REDACTED))
                 .finish(),
             Cmd::Unset { key: _ } => f.debug_struct("Unset").field("key", &REDACTED).finish(),
@@ -188,7 +200,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             elog!("cloakenv: initialized vault at {}", path.display());
         }
-        Cmd::Set { key, value } => {
+        Cmd::Set {
+            key,
+            allow_empty,
+            value,
+        } => {
             if value.is_some() {
                 // Neither the value nor the key is echoed: the arguments may
                 // be swapped. Nothing is written.
@@ -207,7 +223,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let pass = passphrase(false)?;
             // Gather input before taking the lock so a pending prompt never
             // blocks other writers.
-            let value = read_value(&key)?;
+            let value = read_value(&key, allow_empty)?;
             // Before the lock and the key derivation: a value too large to
             // inject is refused with its key named.
             check_entry(&key, &value)?;
@@ -562,12 +578,26 @@ fn read_passphrase_file(file: &Path) -> Result<Zeroizing<String>> {
     input::into_text(bytes).map_err(|_| anyhow!("passphrase file {shown} is not valid UTF-8"))
 }
 
-fn read_value(key: &str) -> Result<Zeroizing<String>> {
-    if io::stdin().is_terminal() {
-        return Ok(Zeroizing::new(rpassword::prompt_password(format!(
-            "value for {key}: "
-        ))?));
+/// Reads the value for `set`, from the hidden prompt on a terminal and otherwise
+/// from stdin. Empty input is an error unless `allow_empty`: the usual cause is
+/// the command feeding stdin having failed (`false | cloakenv set KEY`), and
+/// storing that would silently replace a good secret with an empty one. This
+/// holds for the prompt (an Enter with nothing typed) as well.
+fn read_value(key: &str, allow_empty: bool) -> Result<Zeroizing<String>> {
+    let value = if io::stdin().is_terminal() {
+        Zeroizing::new(rpassword::prompt_password(format!("value for {key}: "))?)
+    } else {
+        read_value_from_stdin()?
+    };
+    if value.is_empty() && !allow_empty {
+        bail!(
+            "the value is empty, so nothing was stored and any existing value is unchanged. Empty input usually means the command feeding stdin failed (use `set -o pipefail` in a shell pipeline); to store an empty value on purpose, run `cloakenv set --allow-empty KEY`"
+        );
     }
+    Ok(value)
+}
+
+fn read_value_from_stdin() -> Result<Zeroizing<String>> {
     // One buffer, allocated once and wiped on drop, so no stray copy of the
     // value is left behind by a growing read. The limit is 1 MiB for the
     // value itself; room for a final `\r\n` is read on top of it and stripped.

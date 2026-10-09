@@ -104,6 +104,10 @@ Findings from a security audit of the first version, all fixed before release
 
 ### Fixed
 
+- `cloakenv set` refuses an empty value (empty stdin, a lone line break, or an
+  Enter at the prompt) instead of storing it: `false | cloakenv set API_KEY`
+  used to replace a good secret with an empty string and exit 0. Use the new
+  `cloakenv set --allow-empty KEY` to store an empty value on purpose.
 - Every limit on what the vault can hold is now enforced when something is
   stored, before anything is written. Previously two imports could together
   produce a vault larger than the 16 MiB cloakenv will read, after which every
