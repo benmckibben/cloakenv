@@ -286,6 +286,19 @@ New vaults use 64 MiB / 3 passes / 1 lane, well inside the limit. There is no
 flag or variable to raise it. It only matters if you created a vault through
 the library API with stronger-than-default settings above the cap.
 
+### Leftover temporary files
+
+Every save writes the new vault to a temporary file next to it
+(`.vault.bin.tmp-<12 hex digits>`, mode 0600, ciphertext only) and renames it into
+place, so the vault is never half-written. If cloakenv is killed (`kill -9`,
+power loss, the out-of-memory killer) between those two steps, the temporary
+file stays behind, as large as the vault. The next command that **writes** (`set`,
+`unset`, `import`, `init`) removes such leftovers once it holds the vault lock, but
+only files that are: regular files (not links or directories), named exactly as
+a save names them for this vault, owned by you, and not modified for 5 minutes
+(a running save finishes in seconds). Read-only commands do not clean up.
+Nothing else in the directory is ever deleted.
+
 ### Key-derivation settings are upgraded on save
 
 New vaults use Argon2id with 64 MiB / 3 passes / 1 lane. The library API

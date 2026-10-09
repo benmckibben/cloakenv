@@ -104,6 +104,11 @@ Findings from a security audit of the first version, all fixed before release
 
 ### Fixed
 
+- A save that was killed (`kill -9`, power loss) between writing its temporary
+  file and renaming it left `.vault.bin.tmp-*` behind forever, as large as the
+  vault. The next writing command (`set`, `unset`, `import`, `init`) now removes
+  such leftovers under the vault lock, but only regular files that you own, that
+  match the generated name exactly and that are older than 5 minutes.
 - The "vault directory is group/world-writable" warning is no longer printed on
   every command in an ordinary project directory. With the default umask 0002
   (Debian, Ubuntu) such a directory is `0775` in the user's own one-member

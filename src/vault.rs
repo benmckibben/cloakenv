@@ -35,6 +35,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -600,6 +601,7 @@ impl VaultLock {
     pub fn acquire(vault: &Path) -> Result<Self, VaultError> {
         let file = open_lock_file(vault)?;
         lock_file(&file, true).map_err(|e| lock_error(vault, e))?;
+        remove_stale_temp_files(vault);
         Ok(Self { _file: file })
     }
 
@@ -608,11 +610,90 @@ impl VaultLock {
     pub fn try_acquire(vault: &Path) -> Result<Option<Self>, VaultError> {
         let file = open_lock_file(vault)?;
         match lock_file(&file, false) {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => {
+                remove_stale_temp_files(vault);
+                Ok(Some(Self { _file: file }))
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(lock_error(vault, e)),
         }
     }
+}
+
+/// A temporary file left by a save that was killed (`SIGKILL`, power loss, an
+/// out-of-memory kill) between creating it and renaming it over the vault is
+/// never reused and never removed by the save that made it. It holds only
+/// ciphertext, but it is as large as the vault and would stay forever. Every
+/// writer holds the lock for its whole load-modify-save cycle, so the one that
+/// has just taken it removes such leftovers.
+///
+/// Deliberately conservative: only a *regular file* (not a link, not a
+/// directory) whose name is exactly what a save generates for this vault
+/// (`.<vault file name>.tmp-` and twelve lowercase hex digits), owned by the
+/// current user, and not modified for [`STALE_TEMP_AFTER`], is removed. Errors
+/// are ignored: cleaning up must never make a save fail.
+fn remove_stale_temp_files(vault: &Path) {
+    let Some(vault_name) = vault.file_name() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent_dir(vault)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if is_stale_temp_file(&entry.file_name(), vault_name, &meta, SystemTime::now()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// How long a temporary file must have been untouched before it counts as
+/// abandoned. A live save writes and renames it within seconds.
+pub const STALE_TEMP_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Does `name`, with metadata `meta`, look like an abandoned temporary file
+/// of the vault called `vault_name`? See [`remove_stale_temp_files`].
+fn is_stale_temp_file(
+    name: &std::ffi::OsStr,
+    vault_name: &std::ffi::OsStr,
+    meta: &fs::Metadata,
+    now: SystemTime,
+) -> bool {
+    if !meta.file_type().is_file() {
+        return false; // a directory, a symlink, a socket...: never ours
+    }
+    if !is_temp_file_name(name, vault_name) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != rustix::process::geteuid().as_raw() {
+            return false;
+        }
+    }
+    meta.modified()
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= STALE_TEMP_AFTER)
+}
+
+/// True for exactly the names `write_atomic_private` generates for the vault
+/// `vault_name`: `.`, the name, `.tmp-` and twelve lowercase hex digits.
+fn is_temp_file_name(name: &std::ffi::OsStr, vault_name: &std::ffi::OsStr) -> bool {
+    let (Some(name), Some(vault_name)) = (name.to_str(), vault_name.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name
+        .strip_prefix('.')
+        .and_then(|n| n.strip_prefix(vault_name))
+        .and_then(|n| n.strip_prefix(".tmp-"))
+    else {
+        return false;
+    };
+    rest.len() == 12 && rest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn lock_error(vault: &Path, e: io::Error) -> VaultError {
@@ -1112,6 +1193,120 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.starts_with("OLD: the variable would be"), "{shown}");
         assert!(!shown.contains("s3cr3t"), "{shown}");
+    }
+
+    fn touch(path: &Path, age: Duration) {
+        let f = fs::File::create(path).unwrap();
+        f.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    #[test]
+    fn temp_file_names_are_matched_exactly() {
+        use std::ffi::OsStr;
+        let yes = |n: &str| is_temp_file_name(OsStr::new(n), OsStr::new("vault.bin"));
+        assert!(yes(".vault.bin.tmp-0123456789ab"));
+        assert!(yes(".vault.bin.tmp-ffffffffffff"));
+        assert!(!yes(".vault.bin.tmp-0123456789a")); // 11 digits
+        assert!(!yes(".vault.bin.tmp-0123456789abc")); // 13
+        assert!(!yes(".vault.bin.tmp-0123456789AB")); // upper case
+        assert!(!yes(".vault.bin.tmp-0123456789ag")); // not hex
+        assert!(!yes("vault.bin.tmp-0123456789ab")); // no leading dot
+        assert!(!yes(".vault.bin.tmp-0123456789ab.keep"));
+        assert!(!yes(".vault.bin.lock"));
+        assert!(!yes(".other.bin.tmp-0123456789ab")); // another vault's
+        assert!(!yes(".vault.bin.tmp-"));
+        assert!(!yes("vault.bin"));
+        // The generated name is always recognised.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.bin");
+        Vault::new().save(&path, b"pw").unwrap();
+        // (a successful save leaves nothing behind)
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn taking_the_lock_removes_only_old_leftover_temp_files_of_this_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let vault = d.join("vault.bin");
+        Vault::new().save(&vault, b"pw").unwrap();
+        let hour = Duration::from_secs(3600);
+
+        let stale = d.join(".vault.bin.tmp-0123456789ab");
+        touch(&stale, hour);
+        let stale_too = d.join(".vault.bin.tmp-ffffffffffff");
+        touch(&stale_too, STALE_TEMP_AFTER + Duration::from_secs(5));
+        // Everything below must survive.
+        let fresh = d.join(".vault.bin.tmp-0123456789ac");
+        touch(&fresh, Duration::from_secs(10)); // a save that may still be running
+        let almost = d.join(".vault.bin.tmp-0123456789ad");
+        touch(&almost, STALE_TEMP_AFTER - Duration::from_secs(60));
+        let others = [
+            ".vault.bin.tmp-xyz",
+            // (upper case, but a different name from every file above, since
+            // a case-insensitive file system, macOS, would merge the two)
+            ".vault.bin.tmp-FEDCBA987654",
+            ".vault.bin.tmp-0123456789abc",
+            "vault.bin.tmp-0123456789ab",
+            ".other.bin.tmp-0123456789ab",
+            ".vault.bin.tmp-0123456789ab.keep",
+            "notes.txt",
+        ];
+        for name in others {
+            touch(&d.join(name), hour);
+        }
+        // A directory and a symbolic link with a matching name are never removed.
+        let dir_named = d.join(".vault.bin.tmp-0123456789ae");
+        fs::create_dir(&dir_named).unwrap();
+        #[cfg(unix)]
+        let (link, target) = {
+            let target = d.join("precious.txt");
+            touch(&target, hour);
+            let link = d.join(".vault.bin.tmp-0123456789af");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            (link, target)
+        };
+
+        let _lock = VaultLock::acquire(&vault).unwrap();
+
+        assert!(
+            !stale.exists() && !stale_too.exists(),
+            "stale files must go"
+        );
+        assert!(fresh.exists() && almost.exists(), "recent files must stay");
+        for name in others {
+            assert!(d.join(name).exists(), "{name} must stay");
+        }
+        assert!(dir_named.is_dir());
+        #[cfg(unix)]
+        {
+            assert!(fs::symlink_metadata(&link).is_ok(), "the link must stay");
+            assert!(target.exists());
+        }
+        assert!(vault.exists());
+        assert!(VaultLock::path_for(&vault).exists());
+        assert!(Vault::load(&vault, b"pw").is_ok());
+    }
+
+    #[test]
+    fn try_acquire_cleans_too_and_another_vaults_files_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let hour = Duration::from_secs(3600);
+        let mine = d.join("a.bin");
+        let theirs = d.join("b.bin");
+        touch(&d.join(".a.bin.tmp-000000000001"), hour);
+        touch(&d.join(".b.bin.tmp-000000000001"), hour);
+        let lock = VaultLock::try_acquire(&mine).unwrap();
+        assert!(lock.is_some());
+        assert!(!d.join(".a.bin.tmp-000000000001").exists());
+        assert!(d.join(".b.bin.tmp-000000000001").exists());
+        // A lock that could not be taken cleans nothing.
+        touch(&d.join(".a.bin.tmp-000000000002"), hour);
+        assert!(VaultLock::try_acquire(&mine).unwrap().is_none());
+        assert!(d.join(".a.bin.tmp-000000000002").exists());
+        drop(lock);
+        let _ = theirs;
     }
 
     #[test]
