@@ -86,8 +86,10 @@ enum Cmd {
         /// Redact secret values from the command's stdout and stderr.
         #[arg(long)]
         shield: bool,
-        /// Command and arguments, e.g. `-- npm start`.
-        #[arg(required = true, trailing_var_arg = true, value_name = "COMMAND")]
+        /// The command and its arguments. Always written after `--`, so that
+        /// everything after the command's name belongs to the command
+        /// (`cloakenv run -- cmd --shield` passes `--shield` to `cmd`).
+        #[arg(required = true, last = true, value_name = "COMMAND")]
         command: Vec<OsString>,
     },
 }
@@ -338,6 +340,17 @@ fn sanitized_usage_error(err: &clap::Error) -> String {
             msg.push_str(&format!("  missing: {}\n", names.join(", ")));
         }
     }
+    let usage = match err.get(ContextKind::Usage) {
+        Some(ContextValue::StyledStr(usage)) => usage.to_string(),
+        _ => Cli::command().render_usage().to_string(),
+    };
+    // `run` takes the command only after `--`. A command typed without it is
+    // the commonest way to land here, so say so (without quoting anything).
+    if usage.contains("cloakenv run") {
+        msg.push_str(
+            "  tip: the command goes after `--`, as in `cloakenv run [--shield] -- COMMAND [ARGS]...`\n",
+        );
+    }
     for kind in [ContextKind::SuggestedSubcommand, ContextKind::SuggestedArg] {
         if let Some(ContextValue::String(s)) = err.get(kind) {
             msg.push_str(&format!("  tip: did you mean '{s}'?\n"));
@@ -348,10 +361,6 @@ fn sanitized_usage_error(err: &clap::Error) -> String {
             }
         }
     }
-    let usage = match err.get(ContextKind::Usage) {
-        Some(ContextValue::StyledStr(usage)) => usage.to_string(),
-        _ => Cli::command().render_usage().to_string(),
-    };
     msg.push_str(&format!(
         "\n{}\n\nFor more information, try '--help'.\n",
         usage.trim_end()

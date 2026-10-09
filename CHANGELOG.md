@@ -24,6 +24,11 @@ that has no functionality; it is not a release of this code.)
   to disk. `--shield` streams the command's stdout and stderr through an
   in-memory redactor that replaces literal secret values with
   `[REDACTED_BY_CLOAKENV]`, including values split across read boundaries.
+- `run` takes its command only after `--` (`cloakenv run [OPTIONS] -- COMMAND
+  [ARGS]...`). Everything after the command's name belongs to the command, so a
+  `--shield` typed after it can no longer be passed to the command silently (and
+  leave its output unredacted); a command without `--`, or an unknown option
+  before it, is a usage error (exit 2) and nothing is started.
 - Passphrase from `CLOAKENV_PASSPHRASE`, `CLOAKENV_PASSPHRASE_FILE` or a
   terminal prompt. Both variables are removed from the command's environment
   and can't be stored as vault entries.

@@ -52,6 +52,11 @@ What this does and does not protect against is in the [Threat model](#threat-mod
 | `cloakenv list` | print the names, one per line, never the values |
 | `cloakenv run [--shield] -- COMMAND [ARGS...]` | run a command with the vault in its environment |
 
+The `--` before the command is required, so that everything after the command's
+name is the command's: `cloakenv run -- cmd --shield` gives `cmd` an argument
+called `--shield`, and `cloakenv run cmd --shield` (no `--`) is a usage error
+(exit 2, nothing is started) rather than an unredacted run.
+
 Every command takes `--vault <path>` (or `CLOAKENV_VAULT`), see
 [Vault location](#vault-location); `--help` and `--version` work everywhere.
 Variable names must match `[A-Za-z_][A-Za-z0-9_]*`; `CLOAKENV_PASSPHRASE` and
