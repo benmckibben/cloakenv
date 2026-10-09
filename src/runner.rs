@@ -69,6 +69,12 @@ pub enum RunError {
     },
     #[error("failed to wait for child process")]
     Wait(#[source] io::Error),
+    #[error("failed to create a pipe for the command's output")]
+    Pipe(#[source] io::Error),
+    /// Writing the command's (redacted) output to our own stdout or stderr
+    /// failed, for a reason other than the reader having gone away.
+    #[error("failed to write the command's output")]
+    Output(#[source] io::Error),
     #[error("failed to install signal handlers")]
     Signals(#[source] io::Error),
 }

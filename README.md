@@ -329,6 +329,12 @@ filter the output. It then
   spawned. On macOS there is no equivalent: if cloakenv is killed with
   `SIGKILL` the command keeps running (its next write to the closed output pipe
   ends it with `SIGPIPE`, if it ever writes);
+- resets `SIGCHLD` to its default action for itself if it inherited it as
+  *ignored* (a Python `preexec_fn`, some launchers and init wrappers do that).
+  Left ignored, the kernel reaps the command the moment it exits and cloakenv
+  could not get its exit status (it used to fail with exit 125, "No child
+  processes"). The command still sees `SIGCHLD` ignored, as it would without
+  `--shield`;
 - delivers a Ctrl-C **twice** to the command at a terminal: the terminal sends
   `SIGINT` to the whole foreground process group (cloakenv and the command), and
   cloakenv forwards its copy as well. Telling the two apart needs the signal's
@@ -363,6 +369,15 @@ above.
 Exit codes are 0–255 on Unix. A child exit status above 255 (possible on
 Windows only, which is unsupported) is reported as `1`.
 
+**Output that cannot be written.** Under `run --shield`, cloakenv waits for its
+stdout and stderr to become writable if they are non-blocking (a parent that made
+a pipe non-blocking shares that flag with cloakenv; the output is neither cut
+short nor lost). If writing fails for a reason other than the reader having gone
+away (a full disk, a closed socket that reports an error) cloakenv says so,
+`cloakenv: error: failed to write the command's output: <OS error>`, stops
+reading the command's output, and exits 125 even if the command itself
+succeeded, rather than report a success with output missing.
+
 **Output closed early.** If whatever reads cloakenv's output goes away
 (`cloakenv list | head -1`), cloakenv stops quietly with exit status 0, the way
 `cat` ends quietly: no panic, no message. Under `run --shield` it stops reading
@@ -390,13 +405,18 @@ What it does **not** catch:
   URL/percent-encoded, JSON- or shell-escaped (`\n`, `\"`), reversed,
   upper/lower-cased, truncated or masked forms (`sk-live-ab…`), and values the
   program wraps or splits across lines are printed in clear.
-- **Secrets split across the two streams.** stdout and stderr are filtered
-  independently (one filter and one thread each); a secret whose first half goes
-  to stdout and second half to stderr matches in neither.
-- **Interleaving order.** The two streams are read and written by separate
-  threads, so the relative order of stdout and stderr lines in the redacted
-  output is **not** guaranteed to match the order the child produced them.
-  (Within one stream, order is preserved.)
+- **Secrets split across the two streams.** When your stdout and stderr are
+  different files or pipes they are filtered independently (one filter and one
+  thread each), and a secret whose first half goes to stdout and second half to
+  stderr matches in neither. When they are the same destination (`> log 2>&1`,
+  `2>&1 | tee`, both on one terminal) cloakenv gives the command a single pipe
+  for both, exactly as `2>&1` would, so such a secret is caught too.
+- **Interleaving order.** When stdout and stderr are different destinations
+  they are read and written by separate threads, so the relative order of their
+  lines in the redacted output is **not** guaranteed to match the order the
+  child produced them. (Within one stream, order is preserved.) When they are
+  the same destination the child's own order is kept, and a line of one stream
+  is never cut in two by the other.
 - **Anything that isn't the stdout/stderr pipe:** files, sockets, `/dev/tty`,
   other inherited file descriptors, or a deliberate `| base64`.
 - **Very short secrets (a few bytes).** Every occurrence of the string is

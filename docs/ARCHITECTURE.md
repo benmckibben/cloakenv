@@ -168,6 +168,38 @@ are routinely 0444/0644 and rely on the container boundary.
   cleared by `exec` of a set-uid binary and only reaches the direct child.
   The same hook gives the child back the original core-file limit. Exit
   status mapping is unchanged (`128 + N`).
+* **One pipe or two.** If cloakenv's own stdout and stderr are the same file,
+  pipe, socket or terminal (`fstat` device and inode equal, which also sees
+  through `dup`; `fdio::stdout_and_stderr_are_one`), the command gets one pipe
+  for both streams (the pipe's write end duplicated onto fd 1 and fd 2, as
+  `2>&1` would do) and one pump with one redactor writes to fd 1. Two pumps
+  writing unaligned chunks to one destination cut lines of one stream in two
+  with lines of the other (40,001 lines, 10,032 of them garbled in the audit
+  that found it), and a secret whose halves went to different streams could not
+  be matched. With one pipe the command's own write order is kept, which also
+  makes the output reproducible. If the inode is 0 (a platform that does not
+  number an object) the answer is "different", the old behaviour. Different
+  destinations are untouched: two pipes, two pumps, two redactors.
+* **Writing our own output** (`src/fdio.rs`). The pumps write with a loop of
+  `write(2)` that tracks how much was written, retries `EINTR`, and on `EAGAIN`
+  (our stdout or stderr is non-blocking: the flag is on the open file
+  description, shared with whoever else holds it) polls for `POLLOUT` and goes
+  on from where it stopped. `std::io::Write::write_all` would fail there and
+  could not say how much had been written, so output was cut (1 MB became
+  about 64 KB) and the stream treated as closed. `EPIPE` (the reader went away)
+  ends that pump quietly, as for `cat`, and the command meets a closed pipe on
+  its next write. Any other write error is returned to the supervisor, which
+  reports `failed to write the command's output` and exits 125 after the
+  command has been reaped. The same writer serves `cloakenv list` and our own
+  diagnostics on stderr (for those, waiting is bounded to two seconds).
+* **Inherited SIGCHLD.** If `SIGCHLD` is `SIG_IGN` when cloakenv starts (it
+  survives `exec`, so a Python `preexec_fn` or an init wrapper can hand it down),
+  the kernel reaps children by itself and `waitpid`/`waitid` fail with `ECHILD`.
+  Before spawning, `--shield` sets it back to the default for its own process
+  (`sys::default_sigchld`); the `pre_exec` hook sets it to `SIG_IGN` again in the
+  command (one `signal(2)` call, async-signal-safe), so the command sees what
+  it would have seen without cloakenv, in both modes. The exec mode needs
+  nothing: it never waits.
 * **Output pumps and leftover holders.** The pumps `poll` their pipe with a
   50 ms tick instead of blocking in `read`. After the command has exited
   they end at EOF, or once the pipe has been silent for 250 ms, or 3 seconds

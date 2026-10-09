@@ -21,12 +21,14 @@
 //! (wrapped in [`zeroize::Zeroizing`]) and in the child's environment block.
 //! They are never written to disk, and never included in error messages.
 
-// `unsafe` is denied crate-wide; the two calls that need it live in `sys`
+// `unsafe` is denied crate-wide; the few calls that need it live in `sys`
 // (Unix only), each with a SAFETY comment.
 #![deny(unsafe_code)]
 
 pub mod crypto;
 pub mod diag;
+#[cfg(unix)]
+mod fdio;
 pub mod hardening;
 pub mod input;
 pub mod passphrase;

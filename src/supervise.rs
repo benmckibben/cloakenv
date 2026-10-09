@@ -27,6 +27,27 @@
 //! `siginfo` plumbing. Not forwarding would be worse: a `kill -INT` aimed at
 //! cloakenv alone would be swallowed.
 //!
+//! # Where the output goes
+//!
+//! Under `--shield` the command's stdout and stderr are pipes that cloakenv
+//! reads, redacts and writes to its own stdout and stderr, one thread per
+//! pipe. If cloakenv's own stdout and stderr are the same file, pipe or
+//! terminal (`> log 2>&1`, `2>&1 | tee`), two independent threads writing
+//! unaligned chunks to it would cut lines of one stream in two with lines of
+//! the other, and could not catch a secret whose halves went to different
+//! streams. So in that case the command gets **one** pipe for both its stdout
+//! and its stderr, exactly as `2>&1` would give it: one thread, one redactor,
+//! the command's own order of writes kept, nothing to splice.
+//!
+//! cloakenv's own stdout or stderr may be non-blocking (the flag belongs to the
+//! open file description, which a parent shares with its children): writes
+//! wait for the descriptor to become writable instead of failing with
+//! `EAGAIN` (see [`crate::fdio`]). A write that fails because the reader went
+//! away (`EPIPE`) ends that stream quietly, as for `cat`: the command gets
+//! `SIGPIPE` on its next write and cloakenv exits with the command's status.
+//! Any other write error (a full disk, say) is reported and makes cloakenv
+//! exit 125, whatever the command's own status was.
+//!
 //! # Output after the command exits
 //!
 //! The pumps normally end at EOF, when every holder of the pipes' write ends
@@ -39,8 +60,8 @@
 //! later writes fail with `EPIPE`/`SIGPIPE` because the read end is gone.
 
 use std::ffi::OsStr;
-use std::io::{self, Read, Write};
-use std::os::fd::AsFd;
+use std::io::{self, PipeReader, Read, Write};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::raw::c_int;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -55,6 +76,7 @@ use signal_hook::iterator::{Handle, Signals};
 
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::fdio::{self, FdWriter};
 use crate::runner::{CHUNK, Redactor, RunError, spawn_error};
 use crate::sys;
 use crate::vault::Vault;
@@ -149,8 +171,10 @@ fn catch_signals() -> Result<Option<Signals>, RunError> {
 fn wait(child: &mut Child, state: &ChildState) -> io::Result<ExitStatus> {
     if let Some(pid) = state.pid {
         // Retry on EINTR. Any other outcome is fine: it exited, or there is
-        // nothing left to wait for (e.g. SIGCHLD is ignored, so it was
-        // auto-reaped), which the plain wait below reports either way.
+        // nothing to wait for, which the plain wait below reports either way.
+        // (A SIGCHLD that is ignored makes the kernel reap children by
+        // itself and `wait` fail with ECHILD; `run` sets it back to the
+        // default before spawning, see `sys::default_sigchld`.)
         while let Err(Errno::INTR) = waitid(
             WaitId::Pid(pid),
             WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
@@ -160,17 +184,44 @@ fn wait(child: &mut Child, state: &ChildState) -> io::Result<ExitStatus> {
     child.wait()
 }
 
-/// Copies `reader` to `writer` through a redactor, flushing after each chunk so
-/// interactive output is not delayed more than necessary. Ends at EOF, on a
-/// write error, or (see the module docs) shortly after the command exited.
-fn pump<R: Read + AsFd, W: Write>(
+/// One of our own output streams.
+#[derive(Clone, Copy)]
+enum Dest {
+    Stdout,
+    Stderr,
+}
+
+impl Dest {
+    fn fd(self) -> BorrowedFd<'static> {
+        match self {
+            Dest::Stdout => rustix::stdio::stdout(),
+            Dest::Stderr => rustix::stdio::stderr(),
+        }
+    }
+}
+
+/// What ends a pump early: nothing (EOF), or a write that failed. A reader
+/// that went away (`EPIPE`) is not an error to report: the pump just stops, so
+/// the command's next write meets a closed pipe, as it would for `cat`.
+fn write_failure(error: io::Error) -> Option<io::Error> {
+    (error.kind() != io::ErrorKind::BrokenPipe).then_some(error)
+}
+
+/// Copies `reader` to our own `dest` through a redactor, writing after each
+/// chunk so interactive output is not delayed more than necessary. Ends at
+/// EOF, on a write error, or (see the module docs) shortly after the command
+/// exited. Returns the write error that ended it, if it was a real one.
+fn pump<R: Read + AsFd>(
     mut reader: R,
-    mut writer: W,
+    dest: Dest,
     mut redactor: Redactor,
     state: &ChildState,
-) {
+) -> Option<io::Error> {
     // Raw (unredacted) child output: wiped after every use and on drop.
     let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
+    // The redacted bytes of one chunk, written in one go.
+    let mut out: Vec<u8> = Vec::with_capacity(2 * CHUNK);
+    let mut writer = FdWriter::new(dest.fd());
     let tick = Timespec {
         tv_sec: 0,
         tv_nsec: POLL_TICK.subsec_nanos().into(),
@@ -201,15 +252,16 @@ fn pump<R: Read + AsFd, W: Write>(
             Ok(0) => break,
             Ok(n) => {
                 let started = Instant::now();
-                let failed = redactor
-                    .push(&buf[..n], &mut writer)
-                    .and_then(|()| writer.flush())
-                    .is_err();
+                out.clear();
+                // Pushing into a Vec only fails if the redactor itself does.
+                let written = redactor
+                    .push(&buf[..n], &mut out)
+                    .and_then(|()| writer.write_all(&out));
                 buf[..n].zeroize();
-                if failed {
-                    // Parent stream is gone (e.g. EPIPE). Stop reading so the
-                    // child observes a broken pipe too.
-                    return;
+                if let Err(e) = written {
+                    // Stop reading: if the reader is gone the command meets
+                    // a broken pipe too; for anything else it is told so.
+                    return write_failure(e);
                 }
                 if state.exited_at.get().is_some() {
                     blocked_after_exit += started.elapsed();
@@ -220,7 +272,39 @@ fn pump<R: Read + AsFd, W: Write>(
             Err(_) => break,
         }
     }
-    let _ = redactor.finish(&mut writer).and_then(|()| writer.flush());
+    out.clear();
+    redactor
+        .finish(&mut out)
+        .and_then(|()| writer.write_all(&out))
+        .err()
+        .and_then(write_failure)
+}
+
+/// The pump threads of one run.
+enum Pumps {
+    None,
+    /// stdout and stderr share one pipe: one pump.
+    One(JoinHandle<Option<io::Error>>),
+    Two(JoinHandle<Option<io::Error>>, JoinHandle<Option<io::Error>>),
+}
+
+impl Pumps {
+    /// Waits for the pumps; the first real write error, if any.
+    fn join(self) -> Option<io::Error> {
+        let handles = match self {
+            Pumps::None => return None,
+            Pumps::One(a) => vec![a],
+            Pumps::Two(a, b) => vec![a, b],
+        };
+        let mut first = None;
+        for handle in handles {
+            let result = handle
+                .join()
+                .unwrap_or_else(|_| Some(io::Error::other("the output thread failed")));
+            first = first.or(result);
+        }
+        first
+    }
 }
 
 /// Runs `cmd` as a supervised child and returns its exit status. `redactors`
@@ -236,12 +320,26 @@ pub(crate) fn run(
     // Before the child exists, so no signal can fall between the two: one
     // arriving early waits in the handler's queue until the forwarder starts.
     let signals = catch_signals()?;
-    sys::arm_child(&mut cmd);
+    // A SIGCHLD inherited as "ignore" would make the kernel reap the child on
+    // its own and our wait fail. The command gets it back as it was.
+    let sigchld_was_ignored = sys::default_sigchld();
+    sys::arm_child(&mut cmd, sigchld_was_ignored);
+    // One pipe for both of the command's streams if both of ours are one
+    // destination (see the module docs).
+    let shared = if redactors.is_some() && fdio::stdout_and_stderr_are_one() {
+        let (reader, writer) = io::pipe().map_err(RunError::Pipe)?;
+        let second = writer.try_clone().map_err(RunError::Pipe)?;
+        cmd.stdout(writer).stderr(second);
+        Some(reader)
+    } else {
+        None
+    };
     let mut child = cmd.spawn().map_err(|e| spawn_error(e, program))?;
     // The child has its own copy of the environment now. Nothing here needs
     // the plaintext any more (the automaton has what it needs to redact):
     // wipe the vault and free the Command's copies instead of holding them for
-    // as long as the command runs.
+    // as long as the command runs. (Dropping the Command also closes our
+    // copies of the output pipe's write end, so that EOF can arrive.)
     drop(cmd);
     drop(vault);
 
@@ -252,24 +350,63 @@ pub(crate) fn run(
     });
     let forwarder = signals.map(|s| Forwarder::start(s, Arc::clone(&state)));
 
-    let pumps = redactors.map(|(out_redactor, err_redactor)| {
-        let stdout = child.stdout.take().expect("stdout is piped");
-        let stderr = child.stderr.take().expect("stderr is piped");
-        let (s1, s2) = (Arc::clone(&state), Arc::clone(&state));
-        (
-            thread::spawn(move || pump(stdout, io::stdout(), out_redactor, &s1)),
-            thread::spawn(move || pump(stderr, io::stderr(), err_redactor, &s2)),
-        )
-    });
+    let pumps = start_pumps(redactors, shared, &mut child, &state);
+    let pumps = match pumps {
+        Ok(pumps) => pumps,
+        Err(e) => {
+            // No thread to read its output: do not leave it running with a
+            // pipe nobody drains.
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(forwarder) = forwarder {
+                forwarder.stop();
+            }
+            return Err(RunError::Output(e));
+        }
+    };
 
     let status = wait(&mut child, &state).map_err(RunError::Wait);
 
-    if let Some((out_thread, err_thread)) = pumps {
-        let _ = out_thread.join();
-        let _ = err_thread.join();
-    }
+    let write_error = pumps.join();
     if let Some(forwarder) = forwarder {
         forwarder.stop();
     }
-    status
+    let status = status?;
+    match write_error {
+        Some(e) => Err(RunError::Output(e)),
+        None => Ok(status),
+    }
+}
+
+fn start_pumps(
+    redactors: Option<(Redactor, Redactor)>,
+    shared: Option<PipeReader>,
+    child: &mut Child,
+    state: &Arc<ChildState>,
+) -> io::Result<Pumps> {
+    let Some((out_redactor, err_redactor)) = redactors else {
+        return Ok(Pumps::None);
+    };
+    if let Some(reader) = shared {
+        // One pipe, one redactor: the other is not needed.
+        drop(err_redactor);
+        return start_pump(reader, Dest::Stdout, out_redactor, state).map(Pumps::One);
+    }
+    // Both are piped whenever redactors are given.
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Ok(Pumps::None);
+    };
+    let out = start_pump(stdout, Dest::Stdout, out_redactor, state)?;
+    let err = start_pump(stderr, Dest::Stderr, err_redactor, state)?;
+    Ok(Pumps::Two(out, err))
+}
+
+fn start_pump<R: Read + AsFd + Send + 'static>(
+    reader: R,
+    dest: Dest,
+    redactor: Redactor,
+    state: &Arc<ChildState>,
+) -> io::Result<JoinHandle<Option<io::Error>>> {
+    let state = Arc::clone(state);
+    thread::Builder::new().spawn(move || pump(reader, dest, redactor, &state))
 }

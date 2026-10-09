@@ -28,6 +28,16 @@ that has no functionality; it is not a release of this code.)
   trailing bytes that could still be the beginning of a secret (and never
   releasing those on a timer). A line of output, a prompt without a newline or a
   server's "listening" message appears while the command is still running.
+- When `--shield`'s stdout and stderr are the same destination (`> log 2>&1`,
+  `2>&1 | tee`), the command's two streams share one pipe: lines of one stream
+  are never cut in two by the other (they were, in a fifth or more of the lines
+  of a busy command), the command's own order is kept, and a secret split
+  between stdout and stderr is caught.
+- `--shield` works when its stdout or stderr is non-blocking (output used to be
+  cut short, with the command killed by `SIGPIPE`), reports a failure to write the
+  command's output as an error with exit status 125 (it used to be silent), and
+  works when `SIGCHLD` was inherited as ignored (it used to fail with "failed to
+  wait for child process: No child processes").
 - `--shield` builds its matcher in linear time, so a long value that overlaps
   itself (up to the 1 MiB `set` accepts) no longer takes seconds to minutes
   before the command starts.
