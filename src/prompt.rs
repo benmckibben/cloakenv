@@ -25,7 +25,6 @@
 //! never echoed in an error.
 
 use thiserror::Error;
-#[cfg(not(unix))]
 use zeroize::Zeroizing;
 
 /// Why a prompt produced no text. Never carries any of what was typed.
@@ -47,6 +46,23 @@ pub enum PromptError {
 
 /// Most bytes accepted at a prompt (the same limit as a passphrase file).
 pub const MAX_PROMPT_LEN: usize = crate::input::MAX_PASSPHRASE_FILE_LEN;
+
+/// Turns what was read at a prompt (the first `filled` bytes of `buf`) into
+/// text. The limit applies to the line itself, not to its line ending: the
+/// reader's buffer has room for one byte more than [`MAX_PROMPT_LEN`] so that a
+/// line of exactly that length and its Enter fit.
+#[cfg(unix)]
+fn finish_line(
+    mut buf: Zeroizing<Vec<u8>>,
+    filled: usize,
+) -> Result<Zeroizing<String>, PromptError> {
+    buf.truncate(filled);
+    crate::input::strip_one_line_ending_lf(&mut buf);
+    if buf.len() > MAX_PROMPT_LEN {
+        return Err(PromptError::TooLong);
+    }
+    crate::input::into_text(buf).map_err(|_| PromptError::NotUtf8)
+}
 
 #[cfg(unix)]
 pub use unix::read_hidden;
@@ -198,12 +214,7 @@ mod unix {
                     Err(e) => return Err(io::Error::from(e).into()),
                 }
             }
-            if filled > MAX_PROMPT_LEN {
-                return Err(PromptError::TooLong);
-            }
-            buf.truncate(filled);
-            crate::input::strip_one_line_ending_lf(&mut buf);
-            crate::input::into_text(buf).map_err(|_| PromptError::NotUtf8)
+            super::finish_line(buf, filled)
         }
 
         /// A watched signal arrived: put the terminal right, then let it do
@@ -246,5 +257,55 @@ mod unix {
                 unregister(id);
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A reader buffer as read_line allocates it, holding @@line@@ followed by
+    /// @@ending@@.
+    fn read(line: usize, ending: &[u8]) -> (Zeroizing<Vec<u8>>, usize) {
+        let mut v = vec![b'a'; line];
+        v.extend_from_slice(ending);
+        let filled = v.len();
+        v.resize(MAX_PROMPT_LEN + 2, 0);
+        (Zeroizing::new(v), filled)
+    }
+
+    #[test]
+    fn a_line_of_exactly_the_limit_and_its_enter_is_accepted() {
+        let (buf, filled) = read(MAX_PROMPT_LEN, b"\n");
+        assert_eq!(filled, MAX_PROMPT_LEN + 1);
+        let text = finish_line(buf, filled).unwrap();
+        assert_eq!(text.len(), MAX_PROMPT_LEN);
+    }
+
+    #[test]
+    fn a_line_of_exactly_the_limit_ended_by_eof_is_accepted() {
+        let (buf, filled) = read(MAX_PROMPT_LEN, b"");
+        assert_eq!(finish_line(buf, filled).unwrap().len(), MAX_PROMPT_LEN);
+    }
+
+    #[test]
+    fn one_byte_over_the_limit_is_refused_with_or_without_the_enter() {
+        for ending in [&b"\n"[..], b""] {
+            let (buf, filled) = read(MAX_PROMPT_LEN + 1, ending);
+            assert!(matches!(
+                finish_line(buf, filled),
+                Err(PromptError::TooLong)
+            ));
+        }
+    }
+
+    #[test]
+    fn only_one_line_ending_is_stripped_and_text_must_be_utf8() {
+        let (buf, filled) = read(3, b"\n\n");
+        assert_eq!(finish_line(buf, filled).unwrap().as_str(), "aaa\n");
+        let mut bad = Zeroizing::new(vec![0xff, 0xfe, b'\n']);
+        let n = bad.len();
+        bad.resize(8, 0);
+        assert!(matches!(finish_line(bad, n), Err(PromptError::NotUtf8)));
     }
 }
