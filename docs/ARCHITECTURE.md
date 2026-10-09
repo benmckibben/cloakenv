@@ -174,8 +174,8 @@ are routinely 0444/0644 and rely on the container boundary.
   for both streams (the pipe's write end duplicated onto fd 1 and fd 2, as
   `2>&1` would do) and one pump with one redactor writes to fd 1. Two pumps
   writing unaligned chunks to one destination cut lines of one stream in two
-  with lines of the other (40,001 lines, 10,032 of them garbled in the audit
-  that found it), and a secret whose halves went to different streams could not
+  with lines of the other (a fifth or more of the lines of a busy command were
+  garbled when both went to one file), and a secret whose halves went to different streams could not
   be matched. With one pipe the command's own write order is kept, which also
   makes the output reproducible. If the inode is 0 (a platform that does not
   number an object) the answer is "different", the old behaviour. Different
@@ -274,8 +274,12 @@ described here:
   verbatim, which made the secret findable by a plain memory search (the
   remaining representation is a state machine, from which a determined
   attacker with memory access could still reconstruct the values: it is not
-  encryption, merely not a contiguous copy). Matching speed is unaffected for
-  this workload (about 500 to 600 MB/s in a micro-benchmark either way).
+  encryption, merely not a contiguous copy). The held-back-prefix logic adds
+  only a 256-entry table of which bytes can begin a secret, derived from the
+  automaton's start state. (Not re-measured with a memory scan after the
+  matcher became a DFA-or-NFA pair; both are state machines with no
+  contiguous copy of the patterns.) Matching speed is unaffected for typical
+  secrets (see "Building the automaton" for numbers).
 * **Not fixable here, accepted:** the copies that `std::process::Command` makes
   of the environment (its own map, and the C string array built when
   spawning). They are freed but not wiped, so they can linger in freed heap
@@ -386,7 +390,9 @@ authenticated generation counter:
 
 stdout and stderr of the child are piped; one thread per stream reads 8 KiB
 chunks and feeds them through a `Redactor` (Aho-Corasick, leftmost-longest)
-before writing and flushing to the parent's corresponding stream. stdin is
+before writing to the parent's corresponding stream after every chunk. If the
+parent's stdout and stderr are the same destination there is one pipe, one
+thread and one redactor for both (see "One pipe or two" above). stdin is
 inherited.
 
 **Chunk boundaries:** the redactor holds back exactly the trailing bytes that

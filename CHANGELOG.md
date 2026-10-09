@@ -29,18 +29,21 @@ that has no functionality; it is not a release of this code.)
   releasing those on a timer). A line of output, a prompt without a newline or a
   server's "listening" message appears while the command is still running.
 - When `--shield`'s stdout and stderr are the same destination (`> log 2>&1`,
-  `2>&1 | tee`), the command's two streams share one pipe: lines of one stream
-  are never cut in two by the other (they were, in a fifth or more of the lines
-  of a busy command), the command's own order is kept, and a secret split
-  between stdout and stderr is caught.
-- `--shield` works when its stdout or stderr is non-blocking (output used to be
-  cut short, with the command killed by `SIGPIPE`), reports a failure to write the
-  command's output as an error with exit status 125 (it used to be silent), and
-  works when `SIGCHLD` was inherited as ignored (it used to fail with "failed to
-  wait for child process: No child processes").
+  `2>&1 | tee`), the command's two streams share one pipe, as `2>&1` would give
+  it: lines of one stream are never cut in two by the other, the command's own
+  order is kept, and a secret split between stdout and stderr is caught.
+- `--shield` waits for a non-blocking stdout or stderr instead of cutting the
+  output short, reports a failure to write the command's output (a full disk,
+  say) as an error with exit status 125 instead of a silent success, and works
+  when `SIGCHLD` was inherited as ignored (as a Python `preexec_fn` or some
+  launchers leave it).
+- `run --help` and the README spell out what `--shield` and the exec mode do
+  differently (the command's stdout and stderr are pipes under `--shield`,
+  signals, exit status, process tree), what the command inherits, and the exit
+  codes, including that a command may itself exit 125, 126 or 127 and that a
+  usage error is 2 where every other cloakenv failure under `run` is 125.
 - `--shield` builds its matcher in linear time, so a long value that overlaps
-  itself (up to the 1 MiB `set` accepts) no longer takes seconds to minutes
-  before the command starts.
+  itself (up to the 1 MiB `set` accepts) does not delay the start of the command.
 - `run` takes its command only after `--` (`cloakenv run [OPTIONS] -- COMMAND
   [ARGS]...`). Everything after the command's name belongs to the command, so a
   `--shield` typed after it can no longer be passed to the command silently (and
