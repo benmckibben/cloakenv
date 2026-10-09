@@ -32,20 +32,25 @@ fn set_bytes(env: &Env, key: &str, input: &[u8]) -> Output {
 }
 
 #[test]
-fn a_value_of_exactly_one_mib_is_accepted() {
+fn a_value_of_exactly_one_mib_is_read_but_refused_as_too_large_to_inject() {
+    // 1 MiB is the most that is read from stdin; but Linux cannot start a
+    // command with a variable over 128 KiB, so it is refused at once, naming
+    // the key, rather than stored and failing at the next run.
     let env = Env::init();
     let value = "v".repeat(MIB);
     let out = set_bytes(&env, "BIG", value.as_bytes());
-    assert!(out.status.success(), "{}", stderr(&out));
-    // (Whether a command can then be started with it is up to the OS: Linux
-    // limits a single environment string to 128 KiB.)
-    assert_eq!(stdout(&env.ok(&["list"])), "BIG\n");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("BIG") && err.contains("131071"), "{err}");
+    assert!(!err.contains("vvvv"), "{err}");
+    assert_eq!(stdout(&env.ok(&["list"])), "");
 }
 
 #[test]
 fn the_limit_is_on_the_value_not_on_its_trailing_newline() {
     let env = Env::init();
-    let value = "v".repeat(MIB);
+    // At the 128 KiB per-variable limit, a trailing newline does not count.
+    let value = "v".repeat(128 * 1024 - 1 - "BIG=".len());
     for newline in ["\n", "\r\n"] {
         let out = set_bytes(&env, "BIG", format!("{value}{newline}").as_bytes());
         assert!(out.status.success(), "{}", stderr(&out));
@@ -58,8 +63,12 @@ fn the_limit_is_on_the_value_not_on_its_trailing_newline() {
     ] {
         let out = set_bytes(&env, "BIG", input.as_bytes());
         assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-        assert!(stderr(&out).contains("larger than 1 MiB"));
+        assert!(stderr(&out).contains("BIG"), "{}", stderr(&out));
     }
+    // And the 1 MiB stdin read limit is separate and unchanged.
+    let out = set_bytes(&env, "BIG", "v".repeat(MIB + 1).as_bytes());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("larger than 1 MiB"));
 }
 
 #[test]

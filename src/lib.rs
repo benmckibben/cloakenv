@@ -4,6 +4,7 @@
 //! The crate is split into three layers:
 //!
 //! * [`crypto`]: Argon2id key derivation and XChaCha20-Poly1305 AEAD.
+//! * [`dotenv`]: the `.env` grammar of `import`.
 //! * [`vault`]: the on-disk vault format, in-memory key/value storage and
 //!   `.env` import parsing.
 //! * [`runner`]: running commands with secrets injected straight into their
@@ -12,6 +13,8 @@
 //!   `--shield` streaming redactor.
 //! * [`input`]: reading secret text (stdin, passphrase files) into a single
 //!   wiped buffer, with a size cap.
+//! * [`envcheck`]: pre-flight checks of the environment `run` will build.
+//! * [`prompt`]: the hidden terminal prompt, with the terminal restored on every exit.
 //! * [`hardening`]: process-level protections (non-dumpable on Linux) applied
 //!   before any secret is handled.
 //! * [`perms`]: advisory warnings about loose permissions on the vault, its
@@ -27,12 +30,15 @@
 
 pub mod crypto;
 pub mod diag;
+pub mod dotenv;
+pub mod envcheck;
 #[cfg(unix)]
 mod fdio;
 pub mod hardening;
 pub mod input;
 pub mod passphrase;
 pub mod perms;
+pub mod prompt;
 pub mod runner;
 #[cfg(unix)]
 mod supervise;

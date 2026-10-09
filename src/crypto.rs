@@ -339,7 +339,7 @@ mod tests {
             ..KdfParams::DEFAULT
         };
         assert!(huge.validate().is_err());
-        // The pre-C6 maximum (1 GiB, 32 passes) is now refused...
+        // The previous maximum (1 GiB, 32 passes) is now refused...
         let old_max = KdfParams {
             m_cost_kib: 1024 * 1024,
             t_cost: 32,

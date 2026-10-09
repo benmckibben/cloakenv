@@ -61,7 +61,7 @@ fn assert_params_rejected(m: u32, t: u32, p: u32) {
 
 #[test]
 fn maximal_header_is_rejected_without_deriving() {
-    // The exact values from the audit finding.
+    // The exact values from a reported problem.
     assert_params_rejected(1024 * 1024, 32, 1);
 }
 

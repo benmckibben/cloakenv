@@ -38,7 +38,7 @@ fn a_passphrase_ending_in_a_line_break_is_refused_at_init_from_every_source() {
     assert!(!err.contains("twelve chars"), "{err}");
     assert!(!env.vault().exists());
 
-    // "x\n\n" in a file is the passphrase "x\n": the case from the audit.
+    // "x\n\n" in a file is the passphrase "x\n": a regression case.
     for contents in [
         &b"a long enough passphrase\n\n"[..],
         b"a long enough passphrase\r\n\r\n",
@@ -61,7 +61,7 @@ fn one_trailing_newline_in_a_file_is_not_part_of_the_passphrase() {
         b"a perfectly fine passphrase\n",
         b"a perfectly fine passphrase\r\n",
     ] {
-        let out = with_file(&env, contents, &["init", "--force"]);
+        let out = with_file(&env, contents, &["init", "--force", "--yes"]);
         assert!(out.status.success(), "{contents:?}: {}", stderr(&out));
         // The same passphrase from every source unlocks it.
         assert!(with_env(&env, GOOD, &["list"]).status.success());
@@ -165,7 +165,7 @@ fn a_short_passphrase_draws_a_warning_but_works() {
     assert!(out.status.success());
     assert!(!stderr(&out).contains("shorter than"), "{}", stderr(&out));
     // A file is judged like the environment (after its newline is removed).
-    let out = with_file(&env, b"abc1234\n", &["init", "--force"]);
+    let out = with_file(&env, b"abc1234\n", &["init", "--force", "--yes"]);
     assert!(stderr(&out).contains("shorter than 12 characters"));
 }
 
@@ -178,12 +178,12 @@ fn the_warning_counts_characters_and_stops_at_twelve() {
         ("ééééééééééé", true), // 11 characters in 22 bytes
         ("éééééééééééé", false),
     ] {
-        let out = with_env(&env, pass, &["init", "--force"]);
+        let out = with_env(&env, pass, &["init", "--force", "--yes"]);
         assert!(out.status.success(), "{pass}: {}", stderr(&out));
         assert_eq!(stderr(&out).contains("shorter than"), warns, "{pass}");
     }
     // The strong test passphrase used everywhere else draws nothing.
-    let out = with_env(&env, PASS, &["init", "--force"]);
+    let out = with_env(&env, PASS, &["init", "--force", "--yes"]);
     assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
 }
 

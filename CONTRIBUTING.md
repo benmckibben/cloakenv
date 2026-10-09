@@ -98,8 +98,11 @@ secrets, and publishes nothing. Publishing is done by hand:
 
 1. Bump `version` in `Cargo.toml` and `Cargo.lock` (the crates.io name is currently
    held by a `0.0.0` placeholder, so the first real release must be higher than
-   that); in `CHANGELOG.md`, move the `Unreleased` entries under a new
-   `## [X.Y.Z] - YYYY-MM-DD` heading.
+   that); in `CHANGELOG.md`, the section for the version must exist as
+   `## [X.Y.Z] - YYYY-MM-DD` (the release workflow checks for the heading): for the
+   first release that is the existing `## [0.1.0] - unreleased`, whose date is
+   filled in now; for later releases, move the `Unreleased` entries under a new
+   heading.
 2. Merge that to `main` once CI is green.
 3. Tag the merge commit `vX.Y.Z` and push the tag. Wait for the "Release build" run
    to go green.

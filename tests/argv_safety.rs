@@ -20,7 +20,18 @@ fn assert_no_echo(args: &[&str], stderr: &str) {
         assert!(!stderr.contains(frag), "{args:?} echoed {frag:?}: {stderr}");
     }
     const OURS: &[&str] = &[
-        "--help", "--shield", "--vault", "--force", "init", "set", "unset", "import", "list", "run",
+        "--help",
+        "--shield",
+        "--vault",
+        "--force",
+        "--yes",
+        "--allow-empty",
+        "init",
+        "set",
+        "unset",
+        "import",
+        "list",
+        "run",
     ];
     for word in stderr.split_whitespace() {
         let word = word.trim_end_matches(['?', '.', ',', ';', ':']);

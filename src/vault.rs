@@ -35,11 +35,14 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::crypto::{self, CryptoError, KdfParams, NONCE_LEN, SALT_LEN, TAG_LEN};
+
+pub use crate::dotenv::{DotenvEntry, parse_dotenv, parse_dotenv_entries};
 
 /// File magic.
 pub const MAGIC: &[u8; 8] = b"CLOAKENV";
@@ -53,6 +56,13 @@ pub const HEADER_LEN: usize = 64;
 pub const MAX_VAULT_LEN: u64 = 16 * 1024 * 1024;
 /// Upper bound on the size of a `.env` file `import` will read (16 MiB).
 pub const MAX_ENV_FILE_LEN: u64 = 16 * 1024 * 1024;
+/// Longest `KEY=VALUE` environment string (not counting the terminating NUL)
+/// that can be stored: 128 KiB minus one byte. Linux refuses to start a
+/// program (`E2BIG`, "Argument list too long") if any single environment
+/// string is larger (`MAX_ARG_STRLEN`, 32 pages of at least 4 KiB). The same
+/// limit is applied everywhere, so a vault stays usable on every platform it
+/// is copied to. It bounds the length of a key and of a value together.
+pub const MAX_ENV_ENTRY_LEN: usize = 128 * 1024 - 1;
 
 /// Errors produced by the vault layer. Secret values are never included;
 /// keys (variable names) and line numbers may be.
@@ -68,6 +78,23 @@ pub enum VaultError {
     Malformed,
     #[error("vault file is too large (the limit is 16 MiB)")]
     TooLarge,
+    // Carries only sizes, never any content.
+    #[error(
+        "the vault would be {size} bytes, over the 16 MiB limit (16777216 bytes) that cloakenv can open again; nothing was written. Remove entries you no longer need, or keep some of them in a second vault (`--vault`)"
+    )]
+    VaultFull { size: u64 },
+    #[error(
+        "{key}: the variable would be {len} bytes as KEY=VALUE, over the limit of {max} bytes for one environment variable (Linux cannot start a command with a larger one)"
+    )]
+    EntryTooLarge { key: String, len: usize, max: usize },
+    #[error(
+        "the environment for the command would be {total} bytes, over the {limit} bytes this system lets a program start with (a quarter of the stack limit, see `ulimit -s`, at most 6 MiB). Largest vault entries: {largest}. Remove or shrink some with `cloakenv unset KEY`"
+    )]
+    EnvironmentTooLarge {
+        total: usize,
+        limit: usize,
+        largest: String,
+    },
     #[error(
         "{} is not a regular file (it is a directory, device, pipe or socket); refusing to import it",
         .0.display()
@@ -90,6 +117,11 @@ pub enum VaultError {
     NulInValue(String),
     #[error(".env parse error on line {line}: {reason}")]
     Dotenv { line: usize, reason: &'static str },
+    // Lines only: a name could be a misplaced secret.
+    #[error(
+        ".env parse error on line {line}: this variable is already set on line {first}; remove one of them (a duplicate is never resolved silently)"
+    )]
+    DotenvDuplicate { line: usize, first: usize },
     #[error(transparent)]
     Crypto(#[from] CryptoError),
     // The cause is the `source`, not part of this message, so `{:#}` (which
@@ -111,6 +143,27 @@ impl VaultError {
             source,
         }
     }
+}
+
+/// Checks one entry against the rules every stored variable must meet: a
+/// valid name, no NUL byte in the value, and `KEY=VALUE` no longer than
+/// [`MAX_ENV_ENTRY_LEN`]. Errors name the key and give sizes, never the value.
+pub fn check_entry(key: &str, value: &str) -> Result<(), VaultError> {
+    if !is_valid_key(key) {
+        return Err(VaultError::InvalidKey);
+    }
+    if value.contains('\0') {
+        return Err(VaultError::NulInValue(key.to_owned()));
+    }
+    let len = key.len() + 1 + value.len();
+    if len > MAX_ENV_ENTRY_LEN {
+        return Err(VaultError::EntryTooLarge {
+            key: key.to_owned(),
+            len,
+            max: MAX_ENV_ENTRY_LEN,
+        });
+    }
+    Ok(())
 }
 
 /// Returns true if `key` is a portable environment variable name.
@@ -169,15 +222,34 @@ impl Vault {
         changed
     }
 
-    /// Inserts or replaces a secret.
+    /// Inserts or replaces a secret. Refuses an invalid name, a value with a
+    /// NUL byte and an entry over [`MAX_ENV_ENTRY_LEN`] (see [`check_entry`]);
+    /// the error names the key, never the value.
     pub fn set(&mut self, key: &str, value: Zeroizing<String>) -> Result<(), VaultError> {
-        if !is_valid_key(key) {
-            return Err(VaultError::InvalidKey);
-        }
-        if value.contains('\0') {
-            return Err(VaultError::NulInValue(key.to_owned()));
-        }
+        check_entry(key, &value)?;
         self.entries.insert(key.to_owned(), value);
+        Ok(())
+    }
+
+    /// Size in bytes of the vault file that [`Vault::seal`] would produce.
+    pub fn sealed_len(&self) -> u64 {
+        let payload: u64 = 4 + self
+            .entries
+            .iter()
+            .map(|(k, v)| 8 + k.len() as u64 + v.len() as u64)
+            .sum::<u64>();
+        HEADER_LEN as u64 + payload + TAG_LEN as u64
+    }
+
+    /// Fails if the sealed vault would be larger than [`MAX_VAULT_LEN`], the
+    /// size [`Vault::load`] accepts. A vault that can be written but never
+    /// opened again would lock its owner out of every secret in it, so this
+    /// is checked before anything is encrypted or written.
+    pub fn check_size(&self) -> Result<(), VaultError> {
+        let size = self.sealed_len();
+        if size > MAX_VAULT_LEN {
+            return Err(VaultError::VaultFull { size });
+        }
         Ok(())
     }
 
@@ -270,6 +342,7 @@ impl Vault {
     /// Encrypts the vault with a fresh salt and nonce, returning the complete
     /// file contents.
     pub fn seal(&self, passphrase: &[u8]) -> Result<Vec<u8>, VaultError> {
+        self.check_size()?;
         let salt: [u8; SALT_LEN] = crypto::random_bytes()?;
         let nonce: [u8; NONCE_LEN] = crypto::random_bytes()?;
         // Never write settings weaker than the current minimum, even for a
@@ -314,7 +387,8 @@ impl Vault {
     }
 
     /// Encrypts and atomically writes the vault to `path`, creating the parent
-    /// directory if needed. On Unix the file has mode 0600 and a directory
+    /// directory if needed. Refuses (before writing anything) a vault larger
+    /// than [`MAX_VAULT_LEN`], which could not be opened again. On Unix the file has mode 0600 and a directory
     /// created here 0700; other platforms get default permissions. An existing
     /// symlink at `path` is replaced, never written through.
     pub fn save(&self, path: &Path, passphrase: &[u8]) -> Result<(), VaultError> {
@@ -527,6 +601,7 @@ impl VaultLock {
     pub fn acquire(vault: &Path) -> Result<Self, VaultError> {
         let file = open_lock_file(vault)?;
         lock_file(&file, true).map_err(|e| lock_error(vault, e))?;
+        remove_stale_temp_files(vault);
         Ok(Self { _file: file })
     }
 
@@ -535,11 +610,168 @@ impl VaultLock {
     pub fn try_acquire(vault: &Path) -> Result<Option<Self>, VaultError> {
         let file = open_lock_file(vault)?;
         match lock_file(&file, false) {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => {
+                remove_stale_temp_files(vault);
+                Ok(Some(Self { _file: file }))
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(lock_error(vault, e)),
         }
     }
+}
+
+/// Copies the vault file at `path` to a new file next to it before it is
+/// replaced (`init --force`), and returns the copy's path. The copy is named
+/// `<vault file name>.bak-YYYYMMDDTHHMMSSZ` (UTC; a counter is added if that
+/// name is taken), created with mode 0600, and is only ever the ciphertext. It
+/// is never overwritten or removed by cloakenv, and it does not match the
+/// pattern of the temporary files that are cleaned up. Fails, leaving
+/// everything as it was, if the copy cannot be made.
+pub fn backup_vault(path: &Path) -> Result<PathBuf, VaultError> {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    backup_vault_at(path, secs)
+}
+
+fn backup_vault_at(path: &Path, unix_secs: u64) -> Result<PathBuf, VaultError> {
+    let mut source =
+        fs::File::open(path).map_err(|e| VaultError::io("cannot back up the vault", path, e))?;
+    let name = path.file_name().ok_or_else(|| {
+        VaultError::io(
+            "invalid vault path",
+            path,
+            io::ErrorKind::InvalidInput.into(),
+        )
+    })?;
+    let stamp = utc_stamp(unix_secs);
+    for attempt in 0..1000u32 {
+        let mut backup_name = name.to_os_string();
+        backup_name.push(format!(".bak-{stamp}"));
+        if attempt > 0 {
+            backup_name.push(format!("-{attempt}"));
+        }
+        let backup = path.with_file_name(backup_name);
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut dest = match opts.open(&backup) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(VaultError::io("cannot back up the vault", &backup, e)),
+        };
+        let copied = io::copy(&mut source, &mut dest).and_then(|_| dest.sync_all());
+        if let Err(e) = copied {
+            drop(dest);
+            let _ = fs::remove_file(&backup);
+            return Err(VaultError::io("cannot back up the vault", &backup, e));
+        }
+        return Ok(backup);
+    }
+    Err(VaultError::io(
+        "cannot back up the vault (too many backups with this timestamp)",
+        path,
+        io::ErrorKind::AlreadyExists.into(),
+    ))
+}
+
+/// `YYYYMMDDTHHMMSSZ` for a Unix time, in UTC (civil-from-days, after
+/// H. Hinnant), so that no date library is needed for one file name.
+fn utc_stamp(unix_secs: u64) -> String {
+    let days = i64::try_from(unix_secs / 86_400).unwrap_or(0);
+    let rem = unix_secs % 86_400;
+    let (hour, minute, second) = (rem / 3600, rem % 3600 / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
+/// A temporary file left by a save that was killed (`SIGKILL`, power loss, an
+/// out-of-memory kill) between creating it and renaming it over the vault is
+/// never reused and never removed by the save that made it. It holds only
+/// ciphertext, but it is as large as the vault and would stay forever. Every
+/// writer holds the lock for its whole load-modify-save cycle, so the one that
+/// has just taken it removes such leftovers.
+///
+/// Deliberately conservative: only a *regular file* (not a link, not a
+/// directory) whose name is exactly what a save generates for this vault
+/// (`.<vault file name>.tmp-` and twelve lowercase hex digits), owned by the
+/// current user, and not modified for [`STALE_TEMP_AFTER`], is removed. Errors
+/// are ignored: cleaning up must never make a save fail.
+fn remove_stale_temp_files(vault: &Path) {
+    let Some(vault_name) = vault.file_name() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent_dir(vault)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if is_stale_temp_file(&entry.file_name(), vault_name, &meta, SystemTime::now()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// How long a temporary file must have been untouched before it counts as
+/// abandoned. A live save writes and renames it within seconds.
+pub const STALE_TEMP_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Does `name`, with metadata `meta`, look like an abandoned temporary file
+/// of the vault called `vault_name`? See [`remove_stale_temp_files`].
+fn is_stale_temp_file(
+    name: &std::ffi::OsStr,
+    vault_name: &std::ffi::OsStr,
+    meta: &fs::Metadata,
+    now: SystemTime,
+) -> bool {
+    if !meta.file_type().is_file() {
+        return false; // a directory, a symlink, a socket...: never ours
+    }
+    if !is_temp_file_name(name, vault_name) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != rustix::process::geteuid().as_raw() {
+            return false;
+        }
+    }
+    meta.modified()
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= STALE_TEMP_AFTER)
+}
+
+/// True for exactly the names `write_atomic_private` generates for the vault
+/// `vault_name`: `.`, the name, `.tmp-` and twelve lowercase hex digits.
+fn is_temp_file_name(name: &std::ffi::OsStr, vault_name: &std::ffi::OsStr) -> bool {
+    let (Some(name), Some(vault_name)) = (name.to_str(), vault_name.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name
+        .strip_prefix('.')
+        .and_then(|n| n.strip_prefix(vault_name))
+        .and_then(|n| n.strip_prefix(".tmp-"))
+    else {
+        return false;
+    };
+    rest.len() == 12 && rest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn lock_error(vault: &Path, e: io::Error) -> VaultError {
@@ -693,98 +925,6 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
     builder.create(dir)
 }
 
-/// Parses `.env`-style content into `(KEY, value)` pairs.
-///
-/// Supported syntax: blank lines, `# comments`, an optional `export ` prefix,
-/// unquoted values (the earliest trailing ` #` or `\t#` comment is stripped),
-/// single-quoted literal values and double-quoted values with `\n \r \t \\ \"`
-/// escapes. Multi-line values are not supported. Errors reference line numbers
-/// only, never content.
-pub fn parse_dotenv(content: &str) -> Result<Vec<(String, Zeroizing<String>)>, VaultError> {
-    let mut out = Vec::new();
-    for (idx, raw) in content.lines().enumerate() {
-        let line_no = idx + 1;
-        let err = |reason| VaultError::Dotenv {
-            line: line_no,
-            reason,
-        };
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line
-            .strip_prefix("export")
-            .filter(|rest| rest.starts_with([' ', '\t']))
-            .map(str::trim_start)
-            .unwrap_or(line);
-        let (key, rest) = line
-            .split_once('=')
-            .ok_or_else(|| err("expected KEY=VALUE"))?;
-        let key = key.trim();
-        if !is_valid_key(key) {
-            return Err(err("invalid variable name"));
-        }
-        let rest = rest.trim_start();
-        let value = if let Some(body) = rest.strip_prefix('\'') {
-            let end = body
-                .find('\'')
-                .ok_or_else(|| err("unterminated single quote"))?;
-            if !trailing_ok(&body[end + 1..]) {
-                return Err(err("unexpected characters after closing quote"));
-            }
-            Zeroizing::new(body[..end].to_owned())
-        } else if let Some(body) = rest.strip_prefix('"') {
-            let mut value = Zeroizing::new(String::with_capacity(body.len()));
-            let mut chars = body.char_indices();
-            let mut closed_at = None;
-            while let Some((i, c)) = chars.next() {
-                match c {
-                    '"' => {
-                        closed_at = Some(i);
-                        break;
-                    }
-                    '\\' => match chars.next().map(|(_, c)| c) {
-                        Some('n') => value.push('\n'),
-                        Some('r') => value.push('\r'),
-                        Some('t') => value.push('\t'),
-                        Some('\\') => value.push('\\'),
-                        Some('"') => value.push('"'),
-                        Some(other) => {
-                            value.push('\\');
-                            value.push(other);
-                        }
-                        None => return Err(err("unterminated double quote")),
-                    },
-                    c => value.push(c),
-                }
-            }
-            let end = closed_at.ok_or_else(|| err("unterminated double quote"))?;
-            if !trailing_ok(&body[end + 1..]) {
-                return Err(err("unexpected characters after closing quote"));
-            }
-            value
-        } else {
-            // Earliest marker wins. `or_else` would ignore a leading `\t#`
-            // whenever a later ` #` is also present.
-            let value = match rest.find(" #").into_iter().chain(rest.find("\t#")).min() {
-                Some(i) => &rest[..i],
-                None => rest,
-            };
-            Zeroizing::new(value.trim_end().to_owned())
-        };
-        if value.contains('\0') {
-            return Err(err("value contains a NUL byte"));
-        }
-        out.push((key.to_owned(), value));
-    }
-    Ok(out)
-}
-
-fn trailing_ok(rest: &str) -> bool {
-    let rest = rest.trim();
-    rest.is_empty() || rest.starts_with('#')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,85 +1064,6 @@ mod tests {
         ));
     }
 
-    fn parsed(input: &str) -> Vec<(String, String)> {
-        parse_dotenv(input)
-            .unwrap()
-            .into_iter()
-            .map(|(k, v)| (k, v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn dotenv_syntax() {
-        let input = concat!(
-            "# header\n",
-            "\n",
-            "PLAIN=value\n",
-            "  SPACED = padded value  \n",
-            "export EXPORTED=1\n",
-            "exporter=not-an-export\n",
-            "COMMENTED=abc # note\n",
-            "HASH=abc#def\n",
-            r"SQ='a \n # b'",
-            "\n",
-            r#"DQ="tab\tquote\" nl\n" # note"#,
-            "\n",
-            "EMPTY=\n",
-            "EQ=a=b=c\n",
-            "CRLF=x\r\n",
-        );
-        let want: Vec<(String, String)> = [
-            ("PLAIN", "value"),
-            ("SPACED", "padded value"),
-            ("EXPORTED", "1"),
-            ("exporter", "not-an-export"),
-            ("COMMENTED", "abc"),
-            ("HASH", "abc#def"),
-            ("SQ", r"a \n # b"),
-            ("DQ", "tab\tquote\" nl\n"),
-            ("EMPTY", ""),
-            ("EQ", "a=b=c"),
-            ("CRLF", "x"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
-        .collect();
-        assert_eq!(parsed(input), want);
-    }
-
-    #[test]
-    fn unquoted_comment_uses_earliest_marker() {
-        let cases = [
-            ("TAB=val\t# comment\n", "TAB", "val"),
-            ("BOTH=val\t#comment #note\n", "BOTH", "val"),
-            ("SPACE_FIRST=val #note\t#later\n", "SPACE_FIRST", "val"),
-            ("HASH=abc#def\n", "HASH", "abc#def"),
-        ];
-        for (input, key, value) in cases {
-            assert_eq!(
-                parsed(input),
-                vec![(key.to_owned(), value.to_owned())],
-                "{input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn dotenv_errors_report_line_only() {
-        for (input, line) in [
-            ("A=1\nnot a pair\n", 2),
-            ("1BAD=x\n", 1),
-            ("A=1\nB=\"open\n", 2),
-            ("A='open\n", 1),
-            ("A='x' trailing\n", 1),
-        ] {
-            match parse_dotenv(input) {
-                Err(VaultError::Dotenv { line: l, .. }) => assert_eq!(l, line, "{input:?}"),
-                other => panic!("{input:?}: unexpected {other:?}"),
-            }
-        }
-    }
-
     #[test]
     fn gitignore_failure_is_reported_not_panicked() {
         let t = tempfile::tempdir().unwrap();
@@ -1084,6 +1145,294 @@ mod tests {
         ));
         f.set_len(MAX_ENV_FILE_LEN).unwrap();
         assert_eq!(read_env_file(&big).unwrap().len() as u64, MAX_ENV_FILE_LEN);
+    }
+
+    fn big(key: &str, value_len: usize) -> (String, Zeroizing<String>) {
+        (key.to_owned(), Zeroizing::new("v".repeat(value_len)))
+    }
+
+    #[test]
+    fn one_variable_may_be_at_most_128_kib_minus_one_as_key_equals_value() {
+        let mut v = Vault::new();
+        // "BIG" + "=" + value: exactly at the limit is fine...
+        let (k, ok) = big("BIG", MAX_ENV_ENTRY_LEN - 4);
+        v.set(&k, ok).unwrap();
+        // ...one byte more is refused, naming the key and never the value.
+        let (k, over) = big("BIG", MAX_ENV_ENTRY_LEN - 3);
+        match v.set(&k, over) {
+            Err(e @ VaultError::EntryTooLarge { .. }) => {
+                let shown = e.to_string();
+                assert!(shown.contains("BIG") && shown.contains("131071"), "{shown}");
+                assert!(!shown.contains("vvvv"), "{shown}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // The key counts: a longer key leaves less room for the value.
+        let (k, ok) = big("LONGER_KEY", MAX_ENV_ENTRY_LEN - 11);
+        v.set(&k, ok).unwrap();
+        let (k, over) = big("LONGER_KEY", MAX_ENV_ENTRY_LEN - 10);
+        assert!(matches!(
+            v.set(&k, over),
+            Err(VaultError::EntryTooLarge { .. })
+        ));
+        // A refused entry changes nothing.
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn entry_checks_cover_name_nul_and_size_without_echoing_the_value() {
+        assert!(matches!(
+            check_entry("1BAD", "x"),
+            Err(VaultError::InvalidKey)
+        ));
+        assert!(matches!(
+            check_entry("K", "a\0b"),
+            Err(VaultError::NulInValue(k)) if k == "K"
+        ));
+        assert!(check_entry("K", "").is_ok());
+    }
+
+    /// A vault whose sealed size is exactly MAX_VAULT_LEN plus extra.
+    fn vault_of_sealed_len(extra: u64) -> Vault {
+        let mut v = Vault::new();
+        let fixed = v.sealed_len();
+        let target = MAX_VAULT_LEN + extra;
+        let mut remaining = target - fixed;
+        let mut i = 0;
+        while remaining > 0 {
+            // Each entry costs 8 bytes of framing + key + value.
+            let key = format!("K{i:04}");
+            let overhead = 8 + key.len() as u64;
+            let value_len = (remaining - overhead).min(100_000);
+            let (k, val) = big(&key, value_len as usize);
+            v.set(&k, val).unwrap();
+            remaining -= overhead + value_len;
+            i += 1;
+        }
+        assert_eq!(v.sealed_len(), target);
+        v
+    }
+
+    #[test]
+    fn a_vault_of_exactly_16_mib_is_saved_and_opened_again_and_one_byte_more_is_refused() {
+        let at_limit = vault_of_sealed_len(0);
+        assert!(at_limit.check_size().is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.bin");
+        at_limit.save(&path, b"pw").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_VAULT_LEN);
+        let back = Vault::load(&path, b"pw").unwrap();
+        assert_eq!(back.len(), at_limit.len());
+
+        // One byte over: refused before anything is written.
+        let over = vault_of_sealed_len(1);
+        let other = dir.path().join("over.bin");
+        match over.save(&other, b"pw") {
+            Err(e @ VaultError::VaultFull { size }) => {
+                assert_eq!(size, MAX_VAULT_LEN + 1);
+                assert!(e.to_string().contains("16 MiB"), "{e}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(!other.exists(), "nothing may be written");
+        // No temporary file is left behind either.
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+    }
+
+    #[test]
+    fn sealed_len_is_the_real_file_size() {
+        let mut v = Vault::new();
+        assert_eq!(v.seal(b"pw").unwrap().len() as u64, v.sealed_len());
+        v.set("A", Zeroizing::new("1".into())).unwrap();
+        v.set("B", Zeroizing::new("ünï🔐".into())).unwrap();
+        assert_eq!(v.seal(b"pw").unwrap().len() as u64, v.sealed_len());
+    }
+
+    /// A vault written before the per-variable limit existed can hold an
+    /// entry that no command can be started with; opening it still works and
+    /// the run-time check names the key.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_old_vault_with_an_oversized_entry_opens_and_run_names_the_key() {
+        let value = "s3cr3t".repeat(30_000);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(b"OLD");
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        payload.extend_from_slice(value.as_bytes());
+        let vault = Vault::decode_payload(&payload, KdfParams::MIN).unwrap();
+        assert_eq!(vault.len(), 1);
+        let err = crate::envcheck::check_run_environment(&vault, &[]).unwrap_err();
+        let shown = err.to_string();
+        assert!(shown.starts_with("OLD: the variable would be"), "{shown}");
+        assert!(!shown.contains("s3cr3t"), "{shown}");
+    }
+
+    fn touch(path: &Path, age: Duration) {
+        let f = fs::File::create(path).unwrap();
+        f.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    #[test]
+    fn temp_file_names_are_matched_exactly() {
+        use std::ffi::OsStr;
+        let yes = |n: &str| is_temp_file_name(OsStr::new(n), OsStr::new("vault.bin"));
+        assert!(yes(".vault.bin.tmp-0123456789ab"));
+        assert!(yes(".vault.bin.tmp-ffffffffffff"));
+        assert!(!yes(".vault.bin.tmp-0123456789a")); // 11 digits
+        assert!(!yes(".vault.bin.tmp-0123456789abc")); // 13
+        assert!(!yes(".vault.bin.tmp-0123456789AB")); // upper case
+        assert!(!yes(".vault.bin.tmp-0123456789ag")); // not hex
+        assert!(!yes("vault.bin.tmp-0123456789ab")); // no leading dot
+        assert!(!yes(".vault.bin.tmp-0123456789ab.keep"));
+        assert!(!yes(".vault.bin.lock"));
+        assert!(!yes(".other.bin.tmp-0123456789ab")); // another vault's
+        assert!(!yes(".vault.bin.tmp-"));
+        assert!(!yes("vault.bin"));
+        // The generated name is always recognised.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.bin");
+        Vault::new().save(&path, b"pw").unwrap();
+        // (a successful save leaves nothing behind)
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn taking_the_lock_removes_only_old_leftover_temp_files_of_this_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let vault = d.join("vault.bin");
+        Vault::new().save(&vault, b"pw").unwrap();
+        let hour = Duration::from_secs(3600);
+
+        let stale = d.join(".vault.bin.tmp-0123456789ab");
+        touch(&stale, hour);
+        let stale_too = d.join(".vault.bin.tmp-ffffffffffff");
+        touch(&stale_too, STALE_TEMP_AFTER + Duration::from_secs(5));
+        // Everything below must survive.
+        let fresh = d.join(".vault.bin.tmp-0123456789ac");
+        touch(&fresh, Duration::from_secs(10)); // a save that may still be running
+        let almost = d.join(".vault.bin.tmp-0123456789ad");
+        touch(&almost, STALE_TEMP_AFTER - Duration::from_secs(60));
+        let others = [
+            ".vault.bin.tmp-xyz",
+            // (upper case, but a different name from every file above, since
+            // a case-insensitive file system, macOS, would merge the two)
+            ".vault.bin.tmp-FEDCBA987654",
+            ".vault.bin.tmp-0123456789abc",
+            "vault.bin.tmp-0123456789ab",
+            ".other.bin.tmp-0123456789ab",
+            ".vault.bin.tmp-0123456789ab.keep",
+            "notes.txt",
+        ];
+        for name in others {
+            touch(&d.join(name), hour);
+        }
+        // A directory and a symbolic link with a matching name are never removed.
+        let dir_named = d.join(".vault.bin.tmp-0123456789ae");
+        fs::create_dir(&dir_named).unwrap();
+        #[cfg(unix)]
+        let (link, target) = {
+            let target = d.join("precious.txt");
+            touch(&target, hour);
+            let link = d.join(".vault.bin.tmp-0123456789af");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            (link, target)
+        };
+
+        let _lock = VaultLock::acquire(&vault).unwrap();
+
+        assert!(
+            !stale.exists() && !stale_too.exists(),
+            "stale files must go"
+        );
+        assert!(fresh.exists() && almost.exists(), "recent files must stay");
+        for name in others {
+            assert!(d.join(name).exists(), "{name} must stay");
+        }
+        assert!(dir_named.is_dir());
+        #[cfg(unix)]
+        {
+            assert!(fs::symlink_metadata(&link).is_ok(), "the link must stay");
+            assert!(target.exists());
+        }
+        assert!(vault.exists());
+        assert!(VaultLock::path_for(&vault).exists());
+        assert!(Vault::load(&vault, b"pw").is_ok());
+    }
+
+    #[test]
+    fn try_acquire_cleans_too_and_another_vaults_files_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let hour = Duration::from_secs(3600);
+        let mine = d.join("a.bin");
+        let theirs = d.join("b.bin");
+        touch(&d.join(".a.bin.tmp-000000000001"), hour);
+        touch(&d.join(".b.bin.tmp-000000000001"), hour);
+        let lock = VaultLock::try_acquire(&mine).unwrap();
+        assert!(lock.is_some());
+        assert!(!d.join(".a.bin.tmp-000000000001").exists());
+        assert!(d.join(".b.bin.tmp-000000000001").exists());
+        // A lock that could not be taken cleans nothing.
+        touch(&d.join(".a.bin.tmp-000000000002"), hour);
+        assert!(VaultLock::try_acquire(&mine).unwrap().is_none());
+        assert!(d.join(".a.bin.tmp-000000000002").exists());
+        drop(lock);
+        let _ = theirs;
+    }
+
+    #[test]
+    fn utc_stamps_are_right_around_leap_days_and_epochs() {
+        for (secs, want) in [
+            (0, "19700101T000000Z"),
+            (86_399, "19700101T235959Z"),
+            (951_782_400, "20000229T000000Z"),
+            (1_000_000_000, "20010909T014640Z"),
+            (1_700_000_000, "20231114T221320Z"),
+            (4_102_444_800, "21000101T000000Z"),
+        ] {
+            assert_eq!(utc_stamp(secs), want, "{secs}");
+        }
+    }
+
+    #[test]
+    fn a_backup_is_a_private_byte_for_byte_copy_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault.bin");
+        let mut v = Vault::new();
+        v.set("K", Zeroizing::new("old secret".into())).unwrap();
+        v.save(&vault, b"old passphrase").unwrap();
+        let original = fs::read(&vault).unwrap();
+
+        let first = backup_vault_at(&vault, 1_700_000_000).unwrap();
+        let second = backup_vault_at(&vault, 1_700_000_000).unwrap();
+        assert_eq!(first.file_name().unwrap(), "vault.bin.bak-20231114T221320Z");
+        assert_eq!(
+            second.file_name().unwrap(),
+            "vault.bin.bak-20231114T221320Z-1"
+        );
+        for b in [&first, &second] {
+            assert_eq!(fs::read(b).unwrap(), original);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(fs::metadata(b).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+        }
+        // The copy is a vault in its own right, under the old passphrase.
+        assert_eq!(Vault::load(&first, b"old passphrase").unwrap().len(), 1);
+        // The original is untouched, and a missing vault is an error.
+        assert_eq!(fs::read(&vault).unwrap(), original);
+        assert!(backup_vault_at(&dir.path().join("nope.bin"), 0).is_err());
+        // A backup never looks like a temporary file to the cleanup.
+        let name = first.file_name().unwrap();
+        assert!(!is_temp_file_name(name, std::ffi::OsStr::new("vault.bin")));
     }
 
     #[test]

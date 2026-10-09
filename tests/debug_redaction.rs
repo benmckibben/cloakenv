@@ -74,8 +74,12 @@ fn error_types_do_not_carry_values() {
 /// clap `Cli` whose `Cmd` has a hand-written `Debug`.
 const DERIVES_DEBUG: &[(&str, &[&str])] = &[
     ("crypto.rs", &["CryptoError", "KdfParams"]),
+    // DotenvEntry (dotenv.rs) holds values and deliberately has no Debug.
+    ("envcheck.rs", &["Overrun"]), // key names and byte counts
     ("input.rs", &["InputError"]),
     ("main.rs", &["Cli"]),
+    ("perms.rs", &["Exposure"]),     // a two-variant tag
+    ("prompt.rs", &["PromptError"]), // never carries what was typed
     ("runner.rs", &["RunError"]),
     ("vault.rs", &["VaultError", "VaultLock"]),
 ];
@@ -83,12 +87,15 @@ const DERIVES_DEBUG: &[(&str, &[&str])] = &[
 const SOURCES: &[(&str, &str)] = &[
     ("crypto.rs", include_str!("../src/crypto.rs")),
     ("diag.rs", include_str!("../src/diag.rs")),
+    ("dotenv.rs", include_str!("../src/dotenv.rs")),
+    ("envcheck.rs", include_str!("../src/envcheck.rs")),
     ("hardening.rs", include_str!("../src/hardening.rs")),
     ("input.rs", include_str!("../src/input.rs")),
     ("lib.rs", include_str!("../src/lib.rs")),
     ("main.rs", include_str!("../src/main.rs")),
     ("passphrase.rs", include_str!("../src/passphrase.rs")),
     ("perms.rs", include_str!("../src/perms.rs")),
+    ("prompt.rs", include_str!("../src/prompt.rs")),
     ("runner.rs", include_str!("../src/runner.rs")),
     ("supervise.rs", include_str!("../src/supervise.rs")),
     ("sys.rs", include_str!("../src/sys.rs")),
