@@ -13,6 +13,32 @@ use std::ffi::OsString;
 use crate::vault::{MAX_ENV_ENTRY_LEN, Vault, VaultError};
 use crate::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV};
 
+/// Variables that decide which programs and libraries run, for *every*
+/// command and everything it starts: `PATH` (which `true` is found), the
+/// dynamic loader's `LD_*` (`LD_PRELOAD`, `LD_LIBRARY_PATH`, ...) and `DYLD_*`
+/// (macOS), and `BASH_ENV` (a file every non-interactive bash runs first).
+/// A vault entry with one of these names changes what the command executes,
+/// not just what it knows, so it is announced. The list is deliberately short:
+/// language-specific variables such as `PYTHONPATH` and `NODE_OPTIONS` only
+/// affect one runtime and are common, legitimate project settings.
+pub fn is_loader_variable(key: &str) -> bool {
+    key == "PATH" || key == "BASH_ENV" || key.starts_with("LD_") || key.starts_with("DYLD_")
+}
+
+/// One line, naming the keys (never a value), for vault keys that
+/// [`is_loader_variable`]; `None` if there are none.
+pub fn loader_warning<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let hits: Vec<&str> = keys.into_iter().filter(|k| is_loader_variable(k)).collect();
+    if hits.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "cloakenv: warning: the vault sets {}, which {} what programs and libraries run (see the README); check it is meant, and remove it with `cloakenv unset KEY` if not",
+        hits.join(", "),
+        if hits.len() == 1 { "changes" } else { "change" },
+    ))
+}
+
 /// The most bytes of argument and environment strings (plus their pointers)
 /// the kernel lets a program start with, or `None` where this is not checked.
 ///
@@ -121,6 +147,49 @@ pub fn budget_overrun(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loader_variables_are_a_short_documented_list() {
+        for key in [
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "BASH_ENV",
+        ] {
+            assert!(is_loader_variable(key), "{key}");
+        }
+        for key in [
+            "PYTHONPATH",
+            "NODE_OPTIONS",
+            "ENV",
+            "HOME",
+            "PATHEXT",
+            "MY_PATH",
+            "LDFLAGS",
+            "LD",
+            "DYLD",
+            "API_KEY",
+            "path",
+        ] {
+            assert!(!is_loader_variable(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_warning_names_keys_and_never_values() {
+        assert_eq!(loader_warning(["A", "B"]), None);
+        let one = loader_warning(["A", "PATH"]).unwrap();
+        assert!(one.contains("sets PATH, which changes"), "{one}");
+        assert!(!one.contains('\n'));
+        let two = loader_warning(["LD_PRELOAD", "PATH"]).unwrap();
+        assert!(
+            two.contains("sets LD_PRELOAD, PATH, which change "),
+            "{two}"
+        );
+    }
 
     #[test]
     fn a_budget_that_fits_is_not_reported() {

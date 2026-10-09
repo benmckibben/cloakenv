@@ -104,6 +104,12 @@ Findings from a security audit of the first version, all fixed before release
 
 ### Fixed
 
+- A vault entry named `PATH`, `LD_*`, `DYLD_*` or `BASH_ENV`, which changes
+  which programs and libraries run, is now announced with a one-line warning
+  on cloakenv's own stderr (key names only, never values): when it is stored
+  with `set` or `import`, and on every `run` before the command starts. It
+  used to apply silently (a vault `PATH` changed which `true` ran). Only a
+  warning: nothing is blocked and exit codes are unchanged.
 - The hidden passphrase prompt no longer leaves the terminal broken. Ctrl-C,
   `kill`, a hangup or Ctrl-Z at the prompt used to leave echo and line editing
   switched off in the user's shell; the terminal is now restored on every way

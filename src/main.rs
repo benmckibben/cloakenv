@@ -233,6 +233,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             update.vault.set(&key, value)?;
             update.save(path, &pass)?;
             elog!("cloakenv: set {key}");
+            if let Some(warning) = envcheck::loader_warning([key.as_str()]) {
+                elog!("{warning}");
+            }
         }
         Cmd::Unset { key } => {
             require_vault(path)?;
@@ -283,6 +286,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     names(&interpolated)
                 )
             });
+            let loader_note = envcheck::loader_warning(entries.iter().map(|e| e.key.as_str()));
             let pass = passphrase(false)?;
             let _lock = lock(path)?;
             let mut update = load_for_update(path, &pass)?;
@@ -296,7 +300,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     .map_err(|e| anyhow!("{e}; nothing was imported"))?;
             }
             update.save(path, &pass)?;
-            for note in empty_note.iter().chain(&interpolation_note) {
+            for note in empty_note
+                .iter()
+                .chain(&interpolation_note)
+                .chain(&loader_note)
+            {
                 elog!("{note}");
             }
             elog!("cloakenv: imported {count} key(s) from {}", file.display());
@@ -317,6 +325,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let pass = passphrase(false)?;
             let vault = load(path, &pass)?;
             drop(pass);
+            if let Some(warning) = envcheck::loader_warning(vault.iter().map(|(k, _)| k)) {
+                elog!("{warning}");
+            }
             envcheck::check_run_environment(&vault, &command)?;
             if shield {
                 warn_short_values(&vault);

@@ -418,6 +418,35 @@ filter the output. It then
 Windows is unsupported: there `run` is a plain spawn-and-wait with none of the
 above.
 
+### Variables that change what runs
+
+Most variables only change what the command *knows*. A few change what it
+*executes*, for the command and for everything it starts:
+
+| variable | effect |
+|----------|--------|
+| `PATH` | which `true`, `python`, `git` ... is found and run |
+| `LD_*` (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT` ...) | the dynamic loader loads code of the vault's choosing into every program |
+| `DYLD_*` (macOS equivalents) | the same on macOS (the system strips them for protected programs) |
+| `BASH_ENV` | a file every non-interactive bash runs first |
+
+A vault entry with one of these names is applied like any other (an entry
+overrides the inherited variable, as always), but cloakenv announces it with
+one line on its **own** stderr, naming the keys and never the values:
+
+```
+cloakenv: warning: the vault sets PATH, LD_PRELOAD, which change what programs and libraries run (see the README); check it is meant, and remove it with `cloakenv unset KEY` if not
+```
+
+The line is printed when the entry is stored (`set`, `import`) and on every
+`run`, before the command starts, and never goes through the `--shield`
+stream. It is only a warning: nothing is blocked and exit codes do not change.
+The list is deliberately short. `PYTHONPATH`, `NODE_OPTIONS`, `RUBYOPT` and the
+like affect one language runtime and are common, legitimate project settings,
+so they are not flagged; anything that makes you want to set them is for you
+to review. Treat a vault you did not create as you would a script you did not
+write.
+
 ## Exit codes
 
 | situation                                      | code          |
