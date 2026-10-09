@@ -70,6 +70,14 @@ pub fn strip_one_line_ending(bytes: &mut Vec<u8>) {
     }
 }
 
+/// Removes a single trailing line feed (what a terminal's Enter key sends)
+/// and nothing else: a `\r` before it stays, as the passphrase rules say.
+pub fn strip_one_line_ending_lf(bytes: &mut Vec<u8>) {
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+}
+
 /// Turns the buffer into text without copying it. Fails with
 /// [`InputError::NotUtf8`] (the buffer is wiped, nothing is echoed).
 pub fn into_text(mut bytes: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, InputError> {

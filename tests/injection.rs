@@ -369,7 +369,7 @@ fn init_refuses_to_clobber_without_force() {
     let out = env.run(&["init"]);
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(stdout(&env.ok(&["list"])), "K\n");
-    env.ok(&["init", "--force"]);
+    env.ok(&["init", "--force", "--yes"]);
     assert_eq!(stdout(&env.ok(&["list"])), "");
 }
 

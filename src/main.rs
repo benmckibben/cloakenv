@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
+use clap::builder::TypedValueParser as _;
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::Zeroizing;
@@ -13,11 +14,14 @@ use zeroize::Zeroizing;
 use cloakenv::crypto::{CryptoError, KdfParams};
 use cloakenv::input::{self, InputError};
 use cloakenv::passphrase as rules;
+use cloakenv::prompt::{self, PromptError};
 use cloakenv::vault::{
-    Vault, VaultError, VaultLock, is_valid_key, parse_dotenv, read_env_file, vault_dir,
-    write_gitignore,
+    Vault, VaultError, VaultLock, backup_vault, check_entry, is_valid_key, parse_dotenv_entries,
+    read_env_file, vault_dir, write_gitignore,
 };
-use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, hardening, is_reserved_key, perms, runner};
+use cloakenv::{
+    PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, envcheck, hardening, is_reserved_key, perms, runner,
+};
 use cloakenv::{diag, elog};
 
 /// Lightweight encrypted local secret vault and zero-leak process injection engine.
@@ -29,14 +33,19 @@ use cloakenv::{diag, elog};
 // a type with a revealing `Debug` (`String`, `OsString`, `Zeroizing<_>` all
 // print their contents) to this struct without redacting it.
 #[derive(Debug, Parser)]
-#[command(name = "cloakenv", version, about, long_about)]
+#[command(name = "cloakenv", version, about, long_about, after_help = EXIT_CODES_HELP)]
 struct Cli {
-    /// Path to the encrypted vault file.
+    /// Path to the encrypted vault file (only this path is used: there is no
+    /// search in parent directories).
+    // The path is taken as is (an OsString parser, not clap's PathBuf one,
+    // which rejects an empty value with an unhelpful message): an empty path
+    // is reported by [dispatch] in plain words.
     #[arg(
         long,
         global = true,
         env = "CLOAKENV_VAULT",
-        default_value = ".cloak/vault.bin"
+        default_value = ".cloak/vault.bin",
+        value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from)
     )]
     vault: PathBuf,
 
@@ -44,25 +53,61 @@ struct Cli {
     command: Cmd,
 }
 
+/// Shown at the end of `cloakenv --help`. The README's "Exit codes" section
+/// has the full table.
+const EXIT_CODES_HELP: &str = "Exit codes:
+  0    success
+  1    init, set, unset, import or list failed (wrong passphrase, no vault, bad input...)
+  2    invalid command line
+  run: the command's own exit code; 125 if cloakenv itself failed (vault,
+       passphrase, --shield); 126 / 127 if the command is not executable / not
+       found; a command killed by signal N ends cloakenv by that signal (shells
+       show 128+N), with --shield it exits 128+N
+
+The vault is only looked for at the path given (default .cloak/vault.bin in the
+current directory), never in parent directories. Secrets must be UTF-8 text.";
+
+/// Shown at the end of the help of the subcommands other than `run`.
+const SUBCOMMAND_EXIT_CODES: &str =
+    "Exit codes: 0 success, 1 failure (the message is on stderr), 2 invalid command line.";
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Create a new, empty encrypted vault.
+    ///
+    /// Replacing an existing vault needs --force, which empties it. Since the
+    /// only way to change the passphrase is to start a new vault, --force asks
+    /// for confirmation on a terminal (or --yes when there is none) and first
+    /// saves a copy of the old vault next to it, as
+    /// vault.bin.bak-YYYYMMDDTHHMMSSZ (mode 0600, still encrypted with the old
+    /// passphrase; delete it when you no longer need it).
+    #[command(after_help = SUBCOMMAND_EXIT_CODES)]
     Init {
-        /// Overwrite an existing vault (its contents are lost).
+        /// Replace an existing vault with an empty one (a backup copy is kept).
         #[arg(long)]
         force: bool,
+        /// With --force: do not ask for confirmation (for scripts).
+        #[arg(long, requires = "force")]
+        yes: bool,
     },
     /// Store a secret, read from a hidden prompt or stdin (never from argv).
     ///
     /// The value is read from a hidden prompt on a terminal, otherwise from
     /// stdin (one trailing newline is stripped). It is never accepted as an
-    /// argument, where ps(1), /proc and shell history would see it.
+    /// argument, where ps(1), /proc and shell history would see it. An empty
+    /// value is refused unless --allow-empty is given: empty input usually
+    /// means the command feeding stdin failed, and storing it would silently
+    /// replace a good secret.
     #[command(
-        after_help = "Examples:\n  cloakenv set API_KEY                       # hidden prompt\n  pass show api-key | cloakenv set API_KEY   # from another tool"
+        after_help = "Examples:\n  cloakenv set API_KEY                       # hidden prompt\n  pass show api-key | cloakenv set API_KEY   # from another tool\n  cloakenv set --allow-empty OPTIONAL_TOKEN  # store an empty value on purpose\n\nTip: in a shell pipeline use 'set -o pipefail' so a failing producer is noticed.\n\nExit codes: 0 success, 1 failure (the message is on stderr), 2 invalid command line."
     )]
     Set {
         /// Environment variable name.
         key: String,
+        /// Store the value even if it is empty (by default empty input is
+        /// refused and nothing is stored).
+        #[arg(long)]
+        allow_empty: bool,
         /// Not accepted: secret values on the command line are visible to
         /// other processes. Kept (hidden) only to refuse it with a clear
         /// error that does not repeat the value.
@@ -70,16 +115,22 @@ enum Cmd {
         value: Option<OsString>,
     },
     /// Remove a secret.
+    #[command(after_help = SUBCOMMAND_EXIT_CODES)]
     Unset {
         /// Environment variable name.
         key: String,
     },
     /// Import KEY=VALUE pairs from a .env file into the vault.
+    ///
+    /// Duplicate names are an error and $VAR is never expanded; see the
+    /// README for the exact grammar. All or nothing.
+    #[command(after_help = SUBCOMMAND_EXIT_CODES)]
     Import {
         /// Path to the .env file.
         file: PathBuf,
     },
     /// List stored variable names (never values).
+    #[command(after_help = SUBCOMMAND_EXIT_CODES)]
     List,
     /// Run a command with the vault's secrets injected into its environment.
     Run {
@@ -101,10 +152,19 @@ impl std::fmt::Debug for Cmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         const REDACTED: &str = "[REDACTED]";
         match self {
-            Cmd::Init { force } => f.debug_struct("Init").field("force", force).finish(),
-            Cmd::Set { key: _, value } => f
+            Cmd::Init { force, yes } => f
+                .debug_struct("Init")
+                .field("force", force)
+                .field("yes", yes)
+                .finish(),
+            Cmd::Set {
+                key: _,
+                allow_empty,
+                value,
+            } => f
                 .debug_struct("Set")
                 .field("key", &REDACTED)
+                .field("allow_empty", allow_empty)
                 .field("value", &value.as_ref().map(|_| REDACTED))
                 .finish(),
             Cmd::Unset { key: _ } => f.debug_struct("Unset").field("key", &REDACTED).finish(),
@@ -156,13 +216,21 @@ fn main() -> ExitCode {
 
 fn dispatch(cli: Cli) -> Result<ExitCode> {
     let path = cli.vault.as_path();
+    if path.as_os_str().is_empty() {
+        bail!(
+            "the vault path is empty: CLOAKENV_VAULT is set to an empty value, or --vault was given an empty path. Unset the variable, or give the path of the vault file (default .cloak/vault.bin)"
+        );
+    }
     match cli.command {
-        Cmd::Init { force } => {
+        Cmd::Init { force, yes } => {
             if path.exists() && !force {
                 bail!(
-                    "a vault already exists at {} (use --force to overwrite)",
+                    "a vault already exists at {} (use --force to replace it with an empty one; a backup copy is kept)",
                     path.display()
                 );
+            }
+            if path.exists() {
+                confirm_replace(path, yes)?;
             }
             let pass = passphrase(true)?;
             check_new_passphrase(&pass)?;
@@ -173,6 +241,15 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 bail!("a vault already exists at {}", path.display());
             }
             perms::emit(&perms::vault_warnings(path, false));
+            if path.exists() {
+                // Only now that the new passphrase is in hand and the lock
+                // is held: keep the old file before it is replaced.
+                let backup = backup_vault(path)?;
+                elog!(
+                    "cloakenv: kept a copy of the old vault at {} (still encrypted with its old passphrase; delete it when you no longer need it)",
+                    backup.display()
+                );
+            }
             Vault::new().save(path, pass.as_bytes())?;
             // Keep the vault out of `git add .`. Never fatal: the vault is
             // already safely written.
@@ -186,7 +263,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             elog!("cloakenv: initialized vault at {}", path.display());
         }
-        Cmd::Set { key, value } => {
+        Cmd::Set {
+            key,
+            allow_empty,
+            value,
+        } => {
             if value.is_some() {
                 // Neither the value nor the key is echoed: the arguments may
                 // be swapped. Nothing is written.
@@ -205,12 +286,18 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let pass = passphrase(false)?;
             // Gather input before taking the lock so a pending prompt never
             // blocks other writers.
-            let value = read_value(&key)?;
+            let value = read_value(&key, allow_empty)?;
+            // Before the lock and the key derivation: a value too large to
+            // inject is refused with its key named.
+            check_entry(&key, &value)?;
             let _lock = lock(path)?;
             let mut update = load_for_update(path, &pass)?;
             update.vault.set(&key, value)?;
             update.save(path, &pass)?;
             elog!("cloakenv: set {key}");
+            if let Some(warning) = envcheck::loader_warning([key.as_str()]) {
+                elog!("{warning}");
+            }
         }
         Cmd::Unset { key } => {
             require_vault(path)?;
@@ -232,18 +319,56 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let content = read_env_file(&file)?;
             let text =
                 std::str::from_utf8(&content).map_err(|_| VaultError::NotUtf8(file.clone()))?;
-            let pairs = parse_dotenv(text)?;
-            for (key, _) in &pairs {
-                refuse_reserved(key)?;
+            let entries = parse_dotenv_entries(text)?;
+            for e in &entries {
+                refuse_reserved(&e.key)?;
             }
+            // Advisory notes, gathered while the values are still at hand and
+            // printed once the import has succeeded. Names and line numbers
+            // only, never a value.
+            let empty: Vec<&str> = entries
+                .iter()
+                .filter(|e| e.value.is_empty())
+                .map(|e| e.key.as_str())
+                .collect();
+            let empty_note = (!empty.is_empty()).then(|| {
+                format!(
+                    "cloakenv: warning: {} imported with an empty value (a `KEY=` line is stored as an empty value, and the variable is set to it)",
+                    names(&empty)
+                )
+            });
+            let interpolated: Vec<String> = entries
+                .iter()
+                .filter(|e| e.looks_interpolated)
+                .map(|e| e.line.to_string())
+                .collect();
+            let interpolation_note = (!interpolated.is_empty()).then(|| {
+                format!(
+                    "cloakenv: warning: the value on line {} contains `$NAME` or `${{NAME}}`, which is stored exactly as written: cloakenv does not expand variables. Put the final value in the file, or use single quotes if the dollar sign is meant literally",
+                    names(&interpolated)
+                )
+            });
+            let loader_note = envcheck::loader_warning(entries.iter().map(|e| e.key.as_str()));
             let pass = passphrase(false)?;
             let _lock = lock(path)?;
             let mut update = load_for_update(path, &pass)?;
-            let count = pairs.len();
-            for (key, value) in pairs {
-                update.vault.set(&key, value)?;
+            let count = entries.len();
+            // All or nothing: the merged vault is only saved if every entry
+            // is acceptable and the whole still fits the size limit.
+            for entry in entries {
+                update
+                    .vault
+                    .set(&entry.key, entry.value)
+                    .map_err(|e| anyhow!("{e}; nothing was imported"))?;
             }
             update.save(path, &pass)?;
+            for note in empty_note
+                .iter()
+                .chain(&interpolation_note)
+                .chain(&loader_note)
+            {
+                elog!("{note}");
+            }
             elog!("cloakenv: imported {count} key(s) from {}", file.display());
         }
         Cmd::List => {
@@ -262,6 +387,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let pass = passphrase(false)?;
             let vault = load(path, &pass)?;
             drop(pass);
+            if let Some(warning) = envcheck::loader_warning(vault.iter().map(|(k, _)| k)) {
+                elog!("{warning}");
+            }
+            envcheck::check_run_environment(&vault, &command)?;
             if shield {
                 warn_short_values(&vault);
             }
@@ -280,6 +409,17 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Joins at most a few names (or line numbers) for a message, saying how many
+/// were left out.
+fn names<T: std::fmt::Display>(items: &[T]) -> String {
+    const SHOWN: usize = 10;
+    let mut shown: Vec<String> = items.iter().take(SHOWN).map(ToString::to_string).collect();
+    if items.len() > SHOWN {
+        shown.push(format!("and {} more", items.len() - SHOWN));
+    }
+    shown.join(", ")
 }
 
 /// Warns (on our own stderr, before the child starts, so never through the
@@ -446,15 +586,48 @@ fn load_for_update(path: &Path, pass: &Zeroizing<String>) -> Result<Update> {
 
 /// Fails with the usual "no vault" error if there is no vault yet, before
 /// anything is prompted for or created (taking the write lock creates the
-/// vault directory and a lock file).
+/// vault directory and a lock file). The error gives the absolute path that
+/// was tried: the vault is looked for there and nowhere else, in particular
+/// not in parent directories, where a directory that someone else can write
+/// to could hold a vault that injects variables of their choosing.
 fn require_vault(path: &Path) -> Result<()> {
     if !path.exists() {
+        let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         bail!(
-            "no vault found at {} (run `cloakenv init` first)",
-            path.display()
+            "no vault found at {} (only this path is tried; parent directories are not searched). Run `cloakenv init` here, or point to a vault with --vault or CLOAKENV_VAULT",
+            shown.display()
         );
     }
     Ok(())
+}
+
+/// Asks before `init --force` empties an existing vault: on a terminal by a
+/// question, otherwise only `--yes` will do (a script has to say so).
+fn confirm_replace(path: &Path, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    if !io::stdin().is_terminal() {
+        bail!(
+            "{} already holds a vault and --force would replace it with an empty one. Add --yes to confirm without being asked (a backup copy of the old vault is kept next to it)",
+            shown.display()
+        );
+    }
+    elog!(
+        "cloakenv: this replaces the vault at {} with an empty one, protected by a new passphrase. A copy of the old file is kept next to it.",
+        shown.display()
+    );
+    diag::stderr_text("Type 'yes' to continue: ");
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("cannot read the answer")?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") {
+        return Ok(());
+    }
+    bail!("not confirmed; the vault was left as it was")
 }
 
 fn load_raw(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
@@ -514,13 +687,11 @@ fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
                 "no passphrase available: set {PASSPHRASE_ENV} or {PASSPHRASE_FILE_ENV}, or run on a terminal"
             );
         }
-        let p = Zeroizing::new(
-            rpassword::prompt_password("cloakenv passphrase: ").with_context(|| {
-                format!("no passphrase available: set {PASSPHRASE_ENV} or {PASSPHRASE_FILE_ENV}, or run on a terminal")
-            })?,
-        );
+        let p = prompt::read_hidden("cloakenv passphrase: ")
+            .map_err(|e| prompt_error(e, "passphrase"))?;
         if confirm {
-            let again = Zeroizing::new(rpassword::prompt_password("confirm passphrase: ")?);
+            let again = prompt::read_hidden("confirm passphrase: ")
+                .map_err(|e| prompt_error(e, "passphrase"))?;
             if *again != *p {
                 bail!("passphrases do not match");
             }
@@ -531,6 +702,21 @@ fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
         bail!("passphrase must not be empty");
     }
     Ok(pass)
+}
+
+/// Turns a failed prompt into a message that says what happened: a closed
+/// input (Ctrl-D) is not "no passphrase available". Nothing typed is shown.
+fn prompt_error(err: PromptError, what: &str) -> anyhow::Error {
+    match err {
+        PromptError::EndOfInput => {
+            anyhow!("no {what} entered (end of input at the prompt); nothing was changed")
+        }
+        PromptError::TooLong => anyhow!("the {what} typed is longer than 64 KiB"),
+        PromptError::NotUtf8 => anyhow!("the {what} typed is not valid UTF-8"),
+        PromptError::Io(e) => anyhow::Error::new(e).context(format!(
+            "cannot read the {what} from the terminal (set {PASSPHRASE_ENV} or {PASSPHRASE_FILE_ENV} to avoid the prompt)"
+        )),
+    }
 }
 
 /// Reads the passphrase file into one wiped buffer (at most 64 KiB; a FIFO or
@@ -551,12 +737,26 @@ fn read_passphrase_file(file: &Path) -> Result<Zeroizing<String>> {
     input::into_text(bytes).map_err(|_| anyhow!("passphrase file {shown} is not valid UTF-8"))
 }
 
-fn read_value(key: &str) -> Result<Zeroizing<String>> {
-    if io::stdin().is_terminal() {
-        return Ok(Zeroizing::new(rpassword::prompt_password(format!(
-            "value for {key}: "
-        ))?));
+/// Reads the value for `set`, from the hidden prompt on a terminal and otherwise
+/// from stdin. Empty input is an error unless `allow_empty`: the usual cause is
+/// the command feeding stdin having failed (`false | cloakenv set KEY`), and
+/// storing that would silently replace a good secret with an empty one. This
+/// holds for the prompt (an Enter with nothing typed) as well.
+fn read_value(key: &str, allow_empty: bool) -> Result<Zeroizing<String>> {
+    let value = if io::stdin().is_terminal() {
+        prompt::read_hidden(&format!("value for {key}: ")).map_err(|e| prompt_error(e, "value"))?
+    } else {
+        read_value_from_stdin()?
+    };
+    if value.is_empty() && !allow_empty {
+        bail!(
+            "the value is empty, so nothing was stored and any existing value is unchanged. Empty input usually means the command feeding stdin failed (use `set -o pipefail` in a shell pipeline); to store an empty value on purpose, run `cloakenv set --allow-empty KEY`"
+        );
     }
+    Ok(value)
+}
+
+fn read_value_from_stdin() -> Result<Zeroizing<String>> {
     // One buffer, allocated once and wiped on drop, so no stray copy of the
     // value is left behind by a growing read. The limit is 1 MiB for the
     // value itself; room for a final `\r\n` is read on top of it and stripped.

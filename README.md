@@ -11,8 +11,9 @@ transcripts, CI logs or terminal scrollback.
 
 ## Install
 
-cloakenv has no release yet: build it from source (Rust 1.87 or newer; Linux or
-macOS, see [Platform support](#platform-support)).
+**The first release, 0.1.0, has not been published yet**: there is no release
+archive and no released crate. Build from source today (Rust 1.87 or newer;
+Linux or macOS, see [Platform support](#platform-support)).
 
 ```sh
 git clone https://github.com/benmckibben/cloakenv
@@ -21,10 +22,10 @@ cargo install --path . --locked    # installs `cloakenv` into ~/.cargo/bin
 # or: cargo build --release --locked   # binary at target/release/cloakenv
 ```
 
-The name `cloakenv` on crates.io is reserved by a placeholder (version `0.0.0`)
-that contains no functionality, so `cargo install cloakenv` does **not** give you
-this program. Release archives are built by CI but nothing is published yet; see
-[CONTRIBUTING.md](CONTRIBUTING.md#releasing-maintainer).
+The name `cloakenv` on crates.io is held by a placeholder, version `0.0.0`, that
+contains no functionality: `cargo install cloakenv` currently installs **only that
+placeholder**, not this program. Release archives are built by CI but nothing is
+published yet; see [CONTRIBUTING.md](CONTRIBUTING.md#releasing-maintainer).
 
 ## Quick start
 
@@ -32,6 +33,7 @@ this program. Release archives are built by CI but nothing is published yet; see
 cloakenv init                          # prompts for a passphrase
 cloakenv set DATABASE_URL              # value read from a hidden prompt
 pass show api | cloakenv set API_KEY   # ...or piped on stdin (never as an argument)
+                                       # (an empty value is refused, see below)
 cloakenv import .env && rm .env        # migrate an existing .env file
 cloakenv list                          # names only, never values
 
@@ -45,8 +47,8 @@ What this does and does not protect against is in the [Threat model](#threat-mod
 
 | command | what it does |
 |---------|--------------|
-| `cloakenv init [--force]` | create an empty vault; refuses to overwrite an existing one unless `--force` (which erases its contents) |
-| `cloakenv set KEY` | store or replace one value, from a hidden prompt or stdin (never from the command line) |
+| `cloakenv init [--force [--yes]]` | create an empty vault; refuses to overwrite an existing one unless `--force`, which asks for confirmation (or `--yes`) and first saves a backup copy, see [Replacing a vault, changing the passphrase](#replacing-a-vault-changing-the-passphrase) |
+| `cloakenv set [--allow-empty] KEY` | store or replace one value, from a hidden prompt or stdin (never from the command line); empty input is refused unless `--allow-empty` |
 | `cloakenv unset KEY` | remove one entry (an error if there is no such key) |
 | `cloakenv import FILE` | add or replace the entries of a `.env` file, see [Importing a `.env` file](#importing-a-env-file) |
 | `cloakenv list` | print the names, one per line, never the values |
@@ -63,10 +65,52 @@ Variable names must match `[A-Za-z_][A-Za-z0-9_]*`; `CLOAKENV_PASSPHRASE` and
 stdin is not a terminal (never from the command line). From stdin it takes at
 most **1 MiB**, with one trailing newline (`\n` or `\r\n`) removed and nothing
 else; anything larger, or not valid UTF-8, is refused with an error that does
-not repeat any of it, and nothing is stored. (Linux itself will not start a
-command whose single environment variable is over 128 KiB, so a value that large
-can be stored but not injected.) The input is read into one buffer that is wiped
+not repeat any of it, and nothing is stored. The input is read into one buffer that is wiped
 afterwards; see "Memory hygiene" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#memory-hygiene-best-effort).
+
+**Empty values are refused.** If the value is empty (after the one trailing
+line break is removed), `cloakenv set` exits with status 1 and stores
+nothing, and the existing value, if any, stays as it was. The usual cause is the
+command feeding stdin having failed: `false | cloakenv set API_KEY`, or a
+`pass show` that could not decrypt, used to replace the good secret with an
+empty string and exit 0. The same goes for pressing Enter at the hidden prompt.
+To store an empty value on purpose (a variable that must exist but be empty),
+say so: `cloakenv set --allow-empty KEY`. In a shell pipeline also use
+`set -o pipefail` so the failure of the producer is not lost. (`import` is
+different: a `KEY=` line in a `.env` file is an explicit empty value, and is
+imported, with a warning that names the keys; see
+[Importing a `.env` file](#importing-a-env-file).)
+
+### Size limits, checked when you store, not when you next open the vault
+
+Everything cloakenv can read back has a limit, and every limit is enforced
+**before anything is written** (`set` and `import`), so a vault can
+never be saved in a state it cannot be opened from again. The errors name the
+key or the limit and never repeat a value:
+
+| limit | value | what happens beyond it |
+|-------|-------|------------------------|
+| one variable, `KEY=VALUE` together | 131,071 bytes (128 KiB minus one) | `set` and `import` refuse it, naming the key: `cloakenv: error: BIG: the variable would be 131072 bytes as KEY=VALUE, over the limit of 131071 bytes for one environment variable`. Linux refuses to start a command with a single environment string over 128 KiB (`E2BIG`); the same limit applies on every platform so a vault stays usable wherever it is copied. This also bounds the length of a key. |
+| the vault file | 16 MiB (16,777,216 bytes) | any write that would produce a larger file is refused with `the vault would be N bytes, over the 16 MiB limit ...; nothing was written`. `import` is all or nothing: the merged result is checked first, and if one entry is too large or the total is, nothing is imported and the vault is untouched. |
+| the `.env` file for `import` | 16 MiB | refused up front, see [Importing a `.env` file](#importing-a-env-file) |
+| a value on stdin to `set` | 1 MiB (plus one line ending) | refused while reading; this is only the read limit, the per-variable limit above is stricter |
+| the environment of the command (Linux) | a quarter of the stack limit (`ulimit -s`; 2 MiB by default), at most 6 MiB, at least 128 KiB | `run` fails with exit 125 before starting anything and names the largest vault entries: `the environment for the command would be N bytes, over the M bytes this system lets a program start with ... Largest vault entries: A (n bytes), B (n bytes)`. The total counts the inherited environment, the command's arguments and the pointers the kernel adds. |
+
+The entry count has no limit of its own; it is bounded by the 16 MiB file size.
+The total-environment check only runs on Linux, where the exact kernel rule is
+known; elsewhere the operating system's own error (`Argument list too long`)
+is all you get. A vault written before these checks existed can already hold an
+entry over the per-variable limit: it still opens, `list` and `unset` work, and
+`run` on Linux names the key.
+
+## Secrets are text
+
+Names must match `[A-Za-z_][A-Za-z0-9_]*` and values must be **valid UTF-8 text
+without a NUL byte**, because they live in environment variables and are
+replaced in output as text. A binary secret (a key file, a keystore) is not
+supported: `set` and `import` refuse input that is not UTF-8 or contains a NUL,
+without echoing it. Store such a secret encoded (for example base64) and decode
+it in the command that uses it.
 
 ## Passphrase sources
 
@@ -77,6 +121,23 @@ In order of precedence:
    64 KiB). Handy for a machine-local key:
    `head -c 32 /dev/urandom | base64 > ~/.config/cloakenv.key && chmod 600 ~/.config/cloakenv.key`.
 3. Interactive prompt (only when stdin is a terminal).
+
+### The interactive prompt
+
+On a terminal the passphrase (and the value for `set`) is typed at a hidden
+prompt: echo is switched off, nothing you type is shown, and line editing and
+Ctrl-C keep working. The terminal is put back **on every way out**: a normal
+return, an error, Ctrl-D, a wrong passphrase, and Ctrl-C, `kill` (`SIGINT`,
+`SIGTERM`, `SIGHUP`, `SIGQUIT`), which still end cloakenv *by that signal*
+(a shell reports 130 for Ctrl-C) but no longer leave your shell without echo.
+Ctrl-Z stops cloakenv with the terminal restored, and hides input again when
+you `fg` it. Only `SIGKILL` cannot be handled; `reset` fixes a terminal after
+one. A signal that was ignored when cloakenv started (`nohup`) stays ignored.
+
+Ctrl-D at the prompt (nothing typed) reports `no passphrase entered (end of
+input at the prompt)` and exits 1. If there is no terminal and neither
+`CLOAKENV_PASSPHRASE` nor `CLOAKENV_PASSPHRASE_FILE` is set, the error says
+so instead.
 
 ### Exactly what counts as the passphrase
 
@@ -148,6 +209,16 @@ warns (see [Permission warnings](#permission-warnings)) but still uses it.
 
 ## Vault location
 
+**Only that path is used.** The vault is looked for at exactly one place, the
+path given (`.cloak/vault.bin` in the current directory by default). cloakenv
+does **not** search parent directories the way git does, on purpose: a parent
+directory that someone else can write to could hold a vault that injects
+variables of their choosing (a `PATH`, say) into every command you run from
+below it. When there is no vault the error gives the absolute path that was
+tried: `no vault found at /abs/path/.cloak/vault.bin (only this path is tried; parent directories are not searched)`.
+An empty `CLOAKENV_VAULT` (or `--vault ""`) is an error that says so, rather
+than a silent fallback to the default.
+
 `.cloak/vault.bin` relative to the current directory by default; override with
 `--vault <path>` or `CLOAKENV_VAULT`. On Unix the file is written atomically
 with mode `0600`, inside a `0700` directory if cloakenv has to create it (an
@@ -177,6 +248,24 @@ add an ignore rule yourself. `git add -f` can still force the file in; don't.
 A committed vault is exposed to offline passphrase guessing by anyone who can
 read the repository, forever.
 
+### Replacing a vault, changing the passphrase
+
+There is no `passwd` command yet: the passphrase of a vault cannot be changed
+in place (see the proposal in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#proposed-vault-format-v2)). The only
+way is `cloakenv init --force`, which starts a new, **empty** vault under a new
+passphrase. Because that destroys the old contents, it is guarded:
+
+* On a terminal it asks `Type 'yes' to continue:` and does nothing for any other
+  answer. With no terminal (scripts, CI) it refuses unless you add `--yes`
+  (`init --force --yes`).
+* Before replacing anything, it saves the old file next to it as
+  `vault.bin.bak-YYYYMMDDTHHMMSSZ` (UTC; mode 0600; byte for byte the old
+  ciphertext, so it needs the **old** passphrase) and tells you where. To keep
+  your secrets, `set` them again or `import` them, then delete the backup.
+  cloakenv never overwrites or removes a backup (and `.cloak/.gitignore` keeps it
+  out of git); delete them when you no longer need the old passphrase, because
+  a backup is a vault encrypted with a passphrase you chose to retire.
+
 ### Permission warnings
 
 On Unix, cloakenv checks permissions each time it opens the vault and prints
@@ -187,11 +276,32 @@ did not create.
 
 | condition | warning |
 |-----------|---------|
-| vault directory group/world-writable | `cloakenv: warning: vault directory <dir> is group/world-writable (mode 0777, expected 0700); others could replace the vault` |
+| vault directory world-writable (and not sticky) | `cloakenv: warning: vault directory <dir> is world-writable (mode 0777, expected 0700); anyone on this machine could replace the vault` |
+| vault directory group-writable, group not private to you | `cloakenv: warning: vault directory <dir> is writable by a group that is not private to you (mode 0770, expected 0700); the members of that group could replace the vault` |
 | vault file group/world-readable or writable | `cloakenv: warning: vault file <file> is group/world-readable or writable (mode 0644, expected 0600)` |
 | passphrase file group/world-readable or writable | `cloakenv: warning: passphrase file <file> is group/world-readable or writable (mode 0666, expected 0600); anyone who can read it can decrypt the vault` |
 | vault directory is a symlink | `cloakenv: warning: vault directory <dir> is a symbolic link; cloakenv follows it, so make sure its target is private` |
 | vault file is a symlink | `cloakenv: warning: vault file <file> is a symbolic link; reads follow it, but saving replaces the link with a regular file` |
+
+**The exact rule for the vault directory.** A directory that others can write
+to lets them replace the vault with one of their own, but an ordinary project
+directory is group-writable (`0775`) on Debian and Ubuntu, where the default
+umask is `0002` and every user has a private one-member group, and a warning
+on every command there would only teach people to ignore warnings. So:
+
+1. World-writable (`o+w`) and **not** sticky: always a warning. (A sticky
+   world-writable directory such as `/tmp` does not let others rename or
+   delete your files, so that alone is not reported.)
+2. Group-writable (`g+w`): a warning **unless** the directory's group is a
+   *private group of yours*, meaning all of: it is your primary group in
+   `/etc/passwd`; no other account has it as a primary group; and `/etc/group`
+   has an entry for it with your user name whose member list names nobody
+   else (the "user private group" convention). Any group that is shared, or
+   that cannot be found in those two files (a network directory service is not
+   consulted), counts as shared and warns.
+3. Otherwise nothing. The mode of the vault *file* (`0600`) and of the
+   passphrase file are still checked strictly, as in the table, whatever the
+   group.
 
 A loose passphrase file is a warning rather than an error on purpose:
 container secret mounts (Docker, Kubernetes) are commonly mode 0444/0644 and
@@ -213,6 +323,19 @@ cloakenv: error: unsupported key-derivation parameters (memory 1048576 KiB, iter
 New vaults use 64 MiB / 3 passes / 1 lane, well inside the limit. There is no
 flag or variable to raise it. It only matters if you created a vault through
 the library API with stronger-than-default settings above the cap.
+
+### Leftover temporary files
+
+Every save writes the new vault to a temporary file next to it
+(`.vault.bin.tmp-<12 hex digits>`, mode 0600, ciphertext only) and renames it into
+place, so the vault is never half-written. If cloakenv is killed (`kill -9`,
+power loss, the out-of-memory killer) between those two steps, the temporary
+file stays behind, as large as the vault. The next command that **writes** (`set`,
+`unset`, `import`, `init`) removes such leftovers once it holds the vault lock, but
+only files that are: regular files (not links or directories), named exactly as
+a save names them for this vault, owned by you, and not modified for 5 minutes
+(a running save finishes in seconds). Read-only commands do not clean up.
+Nothing else in the directory is ever deleted.
 
 ### Key-derivation settings are upgraded on save
 
@@ -240,12 +363,35 @@ A header below 8 MiB / 1 pass / 1 lane is rejected as unsupported.
 
 ### Importing a `.env` file
 
-The syntax is blank lines, `# comments`, an optional `export ` prefix, `KEY=value`
-(an unquoted value ends at the first trailing ` #` comment), `KEY='literal'` and
-`KEY="text"` with the escapes `\n \r \t \\ \"`. Multi-line values are not supported. A
-line that does not parse stops the import with its line number (never its
-content) and nothing is imported; existing entries with the same name are
-overwritten.
+`cloakenv import FILE` reads a `.env` file with the grammar below and adds or
+replaces those entries in the vault. This is cloakenv's own small grammar,
+close to what python-dotenv and the Node `dotenv` package accept, **not** a
+shell: nothing is executed and **nothing is expanded**.
+
+| form | supported | notes |
+|------|-----------|-------|
+| blank lines, `# comment` lines | yes | ignored |
+| `KEY=value` | yes | the value is trimmed; an unquoted value ends at the first `␣#` or tab-`#` (a trailing comment); a `#` with no whitespace before it is part of the value |
+| `export KEY=value` | yes | the `export` prefix (followed by a space or tab) is ignored |
+| spaces around `=`, indentation | yes | `KEY = value` is `KEY=value` |
+| `KEY='literal'` | yes | everything up to the next `'` is taken as is: no escapes, no way to include a `'` |
+| `KEY="text"` | yes | escapes `\n`, `\r`, `\t`, `\\` and `\"`; any other backslash sequence (`\$`, `\x`) stays as written |
+| **multi-line** `"..."` and `'...'` values | yes | a quoted value may span lines (PEM keys, JSON); an error is reported on the line where the quote opened |
+| text after a closing quote | only a `# comment` | anything else is an error |
+| `KEY=` (empty value) | yes | stored as an empty value, and `import` prints a warning naming the keys. This differs from `cloakenv set` on purpose: a `KEY=` line is an explicit, visible statement, while empty stdin is usually a failed command |
+| UTF-8 byte order mark at the start of the file | ignored | Windows editors add one |
+| line breaks | `\n`, `\r\n` and a lone `\r` | all are line breaks, including inside quotes (python-dotenv and Node `dotenv` do the same), so a CRLF file never leaves a `\r` in a value. To store a real carriage return use the `\r` escape in double quotes |
+| the same variable twice | **error** | the import stops (nothing is imported) and names both line numbers: duplicates are resolved differently by different tools, and silently taking the last (or first) value is how a wrong secret gets in. Remove one of them |
+| `$VAR`, `${VAR}` (interpolation) | **not supported** | stored **literally**, e.g. `postgres://$HOST/db` really is that string. The import prints a warning with the line numbers of values (outside single quotes) that look like references. Expand them first (`envsubst`) or write the final value |
+| `KEY` with no `=`, `KEY: value`, `\` line continuations | no | an error (or, for a continuation, part of the value) |
+| backticks as quotes, command substitution `$(...)` | no | not special: part of the literal value |
+| invalid names (not `[A-Za-z_][A-Za-z0-9_]*`), a NUL byte in a value, `CLOAKENV_PASSPHRASE` and `CLOAKENV_PASSPHRASE_FILE` | error | |
+
+A line that does not parse stops the import with its **line number and a fixed
+reason, never its content or the name** (a misplaced secret may be in either),
+and nothing is imported; entries already in the vault with the same name are
+overwritten. All values must be valid UTF-8 text (see
+[Secrets are text](#secrets-are-text)).
 
 `cloakenv import <file>` reads the file the same careful way: it opens it once
 and checks the open handle, refuses anything that is not a regular file (a
@@ -270,6 +416,8 @@ or hanging:
 cloakenv: error: /dev/zero is not a regular file (it is a directory, device, pipe or socket); refusing to read it as a vault
 cloakenv: error: vault file is too large (the limit is 16 MiB)
 ```
+
+(cloakenv itself never writes a file that large: see [Size limits](#size-limits-checked-when-you-store-not-when-you-next-open-the-vault).)
 
 A symbolic link to a regular file keeps working (with the warning above).
 
@@ -341,6 +489,47 @@ filter the output. It then
 
 Windows is unsupported: there `run` is a plain spawn-and-wait with none of the
 above.
+
+### Variables that change what runs
+
+Most variables only change what the command *knows*. A few change what it
+*executes*, for the command and for everything it starts:
+
+| variable | effect |
+|----------|--------|
+| `PATH` | which `true`, `python`, `git` ... is found and run |
+| `LD_*` (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT` ...) | the dynamic loader loads code of the vault's choosing into every program |
+| `DYLD_*` (macOS equivalents) | the same on macOS (the system strips them for protected programs) |
+| `BASH_ENV` | a file every non-interactive bash runs first |
+
+A vault entry with one of these names is applied like any other (an entry
+overrides the inherited variable, as always), but cloakenv announces it with
+one line on its **own** stderr, naming the keys and never the values:
+
+```
+cloakenv: warning: the vault sets PATH, LD_PRELOAD, which change what programs and libraries run (see the README); check it is meant, and remove it with `cloakenv unset KEY` if not
+```
+
+The line is printed when the entry is stored (`set`, `import`) and on every
+`run`, before the command starts, and never goes through the `--shield`
+stream. It is only a warning: nothing is blocked and exit codes do not change.
+The list is deliberately short. `PYTHONPATH`, `NODE_OPTIONS`, `RUBYOPT` and the
+like affect one language runtime and are common, legitimate project settings,
+so they are not flagged; anything that makes you want to set them is for you
+to review. Treat a vault you did not create as you would a script you did not
+write.
+
+### cloakenv is not an init system
+
+cloakenv starts your command and waits for **that one process**. It does not
+adopt orphaned grandchildren (it is not a "subreaper") and does not reap
+anything but its direct child. If cloakenv is **PID 1 of a container** (the
+usual case of `docker run image cloakenv run --shield -- ...`), a process your
+command leaves behind, or a grandchild that outlives its parent, is re-parented
+to cloakenv and stays a zombie until the container stops, and signals other
+than the ones forwarded to the child are not handled the way an init would.
+Run a real init as PID 1 and cloakenv under it (`docker run --init`, `tini`,
+`dumb-init`, or Kubernetes `shareProcessNamespace` with a pause container).
 
 ## Exit codes
 
@@ -453,6 +642,15 @@ Several protections described above are implemented with Unix-only APIs
 On Windows, cloakenv would use default inherited ACLs, would not prevent
 concurrent `set` calls from losing updates, and has not been checked at all.
 
+**macOS limitations in one place:** no `PR_SET_DUMPABLE`, so same-user processes
+can read cloakenv's own environment and memory (the passphrase variable
+included); no `PR_SET_PDEATHSIG`, so `SIGKILL` on cloakenv under `--shield` leaves the
+command running; the total-environment-size check before `run` and the
+per-process hardening are Linux only; the pseudo-terminal tests of the
+prompt's terminal restoration are the least portable part of the test suite;
+the Ctrl-Z/`fg` behaviour of the prompt is tested on Linux only. The details
+follow.
+
 **`PR_SET_DUMPABLE` and `PR_SET_PDEATHSIG` are Linux only.** `exec` without
 `--shield`, signal forwarding with it and the zero core-file limit work the same
 on macOS. The hardening that keeps same-user processes from reading cloakenv's
@@ -522,7 +720,7 @@ the sections it links to and in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
   where others can write. A generation counter with a high-water mark kept
   outside the directory could catch this for attackers confined to the
   directory; it needs a new file format and is written up as a proposal, not
-  built ([Rollback and replacement](docs/ARCHITECTURE.md#rollback-and-replacement-limit-with-a-design-proposal)).
+  built ([Proposed: vault format v2](docs/ARCHITECTURE.md#proposed-vault-format-v2)).
 - **Memory and swap.** Decrypted values are held in buffers that are wiped when
   dropped, and `exec` without `--shield` leaves nothing behind, but this is best
   effort: cloakenv does not lock memory (`mlock`), so the OS may write pages
@@ -532,8 +730,15 @@ the sections it links to and in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
   is and is not covered, with measurements). Use an encrypted swap if that is in
   your threat model.
 - **Weak passphrases.** See above: cloakenv warns, it does not refuse.
-- **Metadata.** File size (roughly how much you store), modification time and
+- **Metadata: the file size is the exact total length of your secrets.**
+  Names and values are encrypted, but the file is not padded: its size is 84
+  bytes plus, for each entry, 8 bytes and the length of the name and of the
+  value. A vault holding `K=a` is 94 bytes and one holding `K=aaaaaaaaaa` is 103,
+  so anyone who can see the size (and changes to it) learns the exact total
+  length, and that a rotated secret changed length. The modification time and
   the existence of a vault are visible to anyone who can list the directory.
+  Padding is part of the [vault format v2 proposal](docs/ARCHITECTURE.md#proposed-vault-format-v2),
+  not built.
 
 ## More detail
 

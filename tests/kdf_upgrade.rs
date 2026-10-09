@@ -24,7 +24,7 @@ fn header_params(env: &Env) -> KdfParams {
     }
 }
 
-/// Writes a vault the way a pre-C14 version could have: the key-derivation
+/// Writes a vault the way an older version could have: the key-derivation
 /// settings are whatever the caller asks for (even below today's minimum).
 fn write_vault_with(env: &Env, params: KdfParams, entries: &[(&str, &str)]) {
     let mut payload = (entries.len() as u32).to_le_bytes().to_vec();
@@ -49,7 +49,7 @@ fn write_vault_with(env: &Env, params: KdfParams, entries: &[(&str, &str)]) {
     std::fs::write(env.vault(), [header.as_slice(), &ct].concat()).unwrap();
 }
 
-const WEAK: KdfParams = KdfParams::FLOOR; // 8 MiB, t=1: valid before C14
+const WEAK: KdfParams = KdfParams::FLOOR; // 8 MiB, t=1: valid before the minimum was raised
 const MID: KdfParams = KdfParams {
     m_cost_kib: 32 * 1024,
     t_cost: 2,
@@ -248,7 +248,7 @@ fn the_upgrade_notice_follows_the_save_it_describes() {
     assert_eq!(header_params(&env), KdfParams::DEFAULT);
 }
 
-/// C1 + C14: writers queued on the lock while the first one upgrades a weak
+/// Writers queued on the lock while the first one upgrades a weak
 /// vault all see a consistent vault: no update is lost, the file ends up with
 /// the upgraded settings, and only the writer that actually upgraded says so.
 #[test]

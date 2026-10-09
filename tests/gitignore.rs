@@ -1,4 +1,4 @@
-//! `cloakenv init` keeps the vault out of version control (audit C11).
+//! `cloakenv init` keeps the vault out of version control.
 
 mod common;
 
@@ -107,7 +107,7 @@ fn an_existing_gitignore_is_not_clobbered() {
     );
     assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
     // Nor on a forced re-init.
-    env.ok(&["init", "--force"]);
+    env.ok(&["init", "--force", "--yes"]);
     assert_eq!(
         fs::read_to_string(env.path().join(".cloak/.gitignore")).unwrap(),
         "custom\n"
