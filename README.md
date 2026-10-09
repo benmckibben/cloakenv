@@ -103,6 +103,15 @@ is all you get. A vault written before these checks existed can already hold an
 entry over the per-variable limit: it still opens, `list` and `unset` work, and
 `run` on Linux names the key.
 
+## Secrets are text
+
+Names must match `[A-Za-z_][A-Za-z0-9_]*` and values must be **valid UTF-8 text
+without a NUL byte**, because they live in environment variables and are
+replaced in output as text. A binary secret (a key file, a keystore) is not
+supported: `set` and `import` refuse input that is not UTF-8 or contains a NUL,
+without echoing it. Store such a secret encoded (for example base64) and decode
+it in the command that uses it.
+
 ## Passphrase sources
 
 In order of precedence:
@@ -242,7 +251,7 @@ read the repository, forever.
 ### Replacing a vault, changing the passphrase
 
 There is no `passwd` command yet: the passphrase of a vault cannot be changed
-in place (see the proposal in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)). The only
+in place (see the proposal in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#proposed-vault-format-v2)). The only
 way is `cloakenv init --force`, which starts a new, **empty** vault under a new
 passphrase. Because that destroys the old contents, it is guarded:
 
@@ -510,6 +519,18 @@ so they are not flagged; anything that makes you want to set them is for you
 to review. Treat a vault you did not create as you would a script you did not
 write.
 
+### cloakenv is not an init system
+
+cloakenv starts your command and waits for **that one process**. It does not
+adopt orphaned grandchildren (it is not a "subreaper") and does not reap
+anything but its direct child. If cloakenv is **PID 1 of a container** (the
+usual case of `docker run image cloakenv run --shield -- ...`), a process your
+command leaves behind, or a grandchild that outlives its parent, is re-parented
+to cloakenv and stays a zombie until the container stops, and signals other
+than the ones forwarded to the child are not handled the way an init would.
+Run a real init as PID 1 and cloakenv under it (`docker run --init`, `tini`,
+`dumb-init`, or Kubernetes `shareProcessNamespace` with a pause container).
+
 ## Exit codes
 
 | situation                                      | code          |
@@ -621,6 +642,15 @@ Several protections described above are implemented with Unix-only APIs
 On Windows, cloakenv would use default inherited ACLs, would not prevent
 concurrent `set` calls from losing updates, and has not been checked at all.
 
+**macOS limitations in one place:** no `PR_SET_DUMPABLE`, so same-user processes
+can read cloakenv's own environment and memory (the passphrase variable
+included); no `PR_SET_PDEATHSIG`, so `SIGKILL` on cloakenv under `--shield` leaves the
+command running; the total-environment-size check before `run` and the
+per-process hardening are Linux only; the pseudo-terminal tests of the
+prompt's terminal restoration are the least portable part of the test suite;
+the Ctrl-Z/`fg` behaviour of the prompt is tested on Linux only. The details
+follow.
+
 **`PR_SET_DUMPABLE` and `PR_SET_PDEATHSIG` are Linux only.** `exec` without
 `--shield`, signal forwarding with it and the zero core-file limit work the same
 on macOS. The hardening that keeps same-user processes from reading cloakenv's
@@ -690,7 +720,7 @@ the sections it links to and in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
   where others can write. A generation counter with a high-water mark kept
   outside the directory could catch this for attackers confined to the
   directory; it needs a new file format and is written up as a proposal, not
-  built ([Rollback and replacement](docs/ARCHITECTURE.md#rollback-and-replacement-limit-with-a-design-proposal)).
+  built ([Proposed: vault format v2](docs/ARCHITECTURE.md#proposed-vault-format-v2)).
 - **Memory and swap.** Decrypted values are held in buffers that are wiped when
   dropped, and `exec` without `--shield` leaves nothing behind, but this is best
   effort: cloakenv does not lock memory (`mlock`), so the OS may write pages
@@ -700,8 +730,15 @@ the sections it links to and in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
   is and is not covered, with measurements). Use an encrypted swap if that is in
   your threat model.
 - **Weak passphrases.** See above: cloakenv warns, it does not refuse.
-- **Metadata.** File size (roughly how much you store), modification time and
+- **Metadata: the file size is the exact total length of your secrets.**
+  Names and values are encrypted, but the file is not padded: its size is 84
+  bytes plus, for each entry, 8 bytes and the length of the name and of the
+  value. A vault holding `K=a` is 94 bytes and one holding `K=aaaaaaaaaa` is 103,
+  so anyone who can see the size (and changes to it) learns the exact total
+  length, and that a rotated secret changed length. The modification time and
   the existence of a vault are visible to anyone who can list the directory.
+  Padding is part of the [vault format v2 proposal](docs/ARCHITECTURE.md#proposed-vault-format-v2),
+  not built.
 
 ## More detail
 

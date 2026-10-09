@@ -107,6 +107,15 @@ this release:
 
 ### Fixed
 
+- The README now states plainly what was only implied: secrets must be UTF-8
+  text (binary secrets are unsupported), cloakenv is not an init system (as
+  PID 1 of a container it does not reap orphaned processes), the macOS
+  limitations, and that the vault's file size reveals the exact total length of
+  all secrets and its contents can be rolled back by someone who can write the
+  directory. A concrete design for a version 2 vault format (padding, a
+  wrapped data key for passphrase change, a rollback counter, an optional
+  export command) is written up in docs/ARCHITECTURE.md as a proposal; none of
+  it is built.
 - `init --force` (the only way to change a vault's passphrase) destroyed the
   old vault without asking or keeping anything. It now asks for confirmation on
   a terminal, needs `--yes` when there is none (so existing scripts that run
