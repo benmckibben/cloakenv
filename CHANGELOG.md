@@ -104,6 +104,18 @@ Findings from a security audit of the first version, all fixed before release
 
 ### Fixed
 
+- `init --force` (the only way to change a vault's passphrase) destroyed the
+  old vault without asking or keeping anything. It now asks for confirmation on
+  a terminal, needs `--yes` when there is none (so existing scripts that run
+  `init --force` must add `--yes`), and saves a backup copy of the old vault
+  first, as `vault.bin.bak-YYYYMMDDTHHMMSSZ` (mode 0600).
+- An empty `CLOAKENV_VAULT` (or `--vault ""`) gave `one of the values isn't
+  valid for an argument`; it is now a plain error saying the vault path is
+  empty.
+- The `no vault found` error shows the absolute path that was tried and says
+  that parent directories are not searched. (They never were, deliberately; the
+  README now explains why.)
+- `cloakenv --help` and the help of every subcommand now list the exit codes.
 - A save that was killed (`kill -9`, power loss) between writing its temporary
   file and renaming it left `.vault.bin.tmp-*` behind forever, as large as the
   vault. The next writing command (`set`, `unset`, `import`, `init`) now removes

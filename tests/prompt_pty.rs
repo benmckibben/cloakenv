@@ -475,3 +475,43 @@ fn ctrl_z_restores_the_terminal_while_stopped_and_hides_input_again_after_contin
     assert!(!out.contains("correct horse"), "{out}");
     s.assert_terminal_untouched("after continuing and finishing");
 }
+
+#[test]
+fn init_force_asks_on_a_terminal_and_only_a_yes_replaces_the_vault() {
+    let env = Env::init();
+    env.set("K", "old");
+    let before = std::fs::read(env.vault()).unwrap();
+    let new_pass = "another long passphrase";
+    let cmd = |input_pass: &str| {
+        let mut cmd = env.cmd(Some(input_pass));
+        cmd.args(["init", "--force"]);
+        Session::launch(cmd)
+    };
+
+    // Anything but yes: nothing happens.
+    for answer in ["no\n", "\n", "yes please\n"] {
+        let mut s = cmd(new_pass);
+        s.wait_for("Type 'yes' to continue: ");
+        s.type_text(answer);
+        let status = s.finish();
+        let out = s.text();
+        assert_eq!(status.code(), Some(1), "{answer:?}: {out}");
+        assert!(
+            out.contains("not confirmed; the vault was left as it was"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(env.vault()).unwrap(), before);
+        s.assert_terminal_untouched("after declining");
+    }
+
+    // Yes: the old vault is kept and replaced.
+    let mut s = cmd(new_pass);
+    s.wait_for("Type 'yes' to continue: ");
+    assert!(s.text().contains("replaces the vault at"), "{}", s.text());
+    s.type_text("yes\n");
+    let status = s.finish();
+    let out = s.text();
+    assert!(status.success(), "{status}: {out}");
+    assert!(out.contains("kept a copy of the old vault at"), "{out}");
+    assert_ne!(std::fs::read(env.vault()).unwrap(), before);
+}

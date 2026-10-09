@@ -620,6 +620,84 @@ impl VaultLock {
     }
 }
 
+/// Copies the vault file at `path` to a new file next to it before it is
+/// replaced (`init --force`), and returns the copy's path. The copy is named
+/// `<vault file name>.bak-YYYYMMDDTHHMMSSZ` (UTC; a counter is added if that
+/// name is taken), created with mode 0600, and is only ever the ciphertext. It
+/// is never overwritten or removed by cloakenv, and it does not match the
+/// pattern of the temporary files that are cleaned up. Fails, leaving
+/// everything as it was, if the copy cannot be made.
+pub fn backup_vault(path: &Path) -> Result<PathBuf, VaultError> {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    backup_vault_at(path, secs)
+}
+
+fn backup_vault_at(path: &Path, unix_secs: u64) -> Result<PathBuf, VaultError> {
+    let mut source =
+        fs::File::open(path).map_err(|e| VaultError::io("cannot back up the vault", path, e))?;
+    let name = path.file_name().ok_or_else(|| {
+        VaultError::io(
+            "invalid vault path",
+            path,
+            io::ErrorKind::InvalidInput.into(),
+        )
+    })?;
+    let stamp = utc_stamp(unix_secs);
+    for attempt in 0..1000u32 {
+        let mut backup_name = name.to_os_string();
+        backup_name.push(format!(".bak-{stamp}"));
+        if attempt > 0 {
+            backup_name.push(format!("-{attempt}"));
+        }
+        let backup = path.with_file_name(backup_name);
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut dest = match opts.open(&backup) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(VaultError::io("cannot back up the vault", &backup, e)),
+        };
+        let copied = io::copy(&mut source, &mut dest).and_then(|_| dest.sync_all());
+        if let Err(e) = copied {
+            drop(dest);
+            let _ = fs::remove_file(&backup);
+            return Err(VaultError::io("cannot back up the vault", &backup, e));
+        }
+        return Ok(backup);
+    }
+    Err(VaultError::io(
+        "cannot back up the vault (too many backups with this timestamp)",
+        path,
+        io::ErrorKind::AlreadyExists.into(),
+    ))
+}
+
+/// `YYYYMMDDTHHMMSSZ` for a Unix time, in UTC (civil-from-days, after
+/// H. Hinnant), so that no date library is needed for one file name.
+fn utc_stamp(unix_secs: u64) -> String {
+    let days = i64::try_from(unix_secs / 86_400).unwrap_or(0);
+    let rem = unix_secs % 86_400;
+    let (hour, minute, second) = (rem / 3600, rem % 3600 / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
 /// A temporary file left by a save that was killed (`SIGKILL`, power loss, an
 /// out-of-memory kill) between creating it and renaming it over the vault is
 /// never reused and never removed by the save that made it. It holds only
@@ -1307,6 +1385,54 @@ mod tests {
         assert!(d.join(".a.bin.tmp-000000000002").exists());
         drop(lock);
         let _ = theirs;
+    }
+
+    #[test]
+    fn utc_stamps_are_right_around_leap_days_and_epochs() {
+        for (secs, want) in [
+            (0, "19700101T000000Z"),
+            (86_399, "19700101T235959Z"),
+            (951_782_400, "20000229T000000Z"),
+            (1_000_000_000, "20010909T014640Z"),
+            (1_700_000_000, "20231114T221320Z"),
+            (4_102_444_800, "21000101T000000Z"),
+        ] {
+            assert_eq!(utc_stamp(secs), want, "{secs}");
+        }
+    }
+
+    #[test]
+    fn a_backup_is_a_private_byte_for_byte_copy_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault.bin");
+        let mut v = Vault::new();
+        v.set("K", Zeroizing::new("old secret".into())).unwrap();
+        v.save(&vault, b"old passphrase").unwrap();
+        let original = fs::read(&vault).unwrap();
+
+        let first = backup_vault_at(&vault, 1_700_000_000).unwrap();
+        let second = backup_vault_at(&vault, 1_700_000_000).unwrap();
+        assert_eq!(first.file_name().unwrap(), "vault.bin.bak-20231114T221320Z");
+        assert_eq!(
+            second.file_name().unwrap(),
+            "vault.bin.bak-20231114T221320Z-1"
+        );
+        for b in [&first, &second] {
+            assert_eq!(fs::read(b).unwrap(), original);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(fs::metadata(b).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+        }
+        // The copy is a vault in its own right, under the old passphrase.
+        assert_eq!(Vault::load(&first, b"old passphrase").unwrap().len(), 1);
+        // The original is untouched, and a missing vault is an error.
+        assert_eq!(fs::read(&vault).unwrap(), original);
+        assert!(backup_vault_at(&dir.path().join("nope.bin"), 0).is_err());
+        // A backup never looks like a temporary file to the cleanup.
+        let name = first.file_name().unwrap();
+        assert!(!is_temp_file_name(name, std::ffi::OsStr::new("vault.bin")));
     }
 
     #[test]

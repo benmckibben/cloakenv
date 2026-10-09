@@ -199,7 +199,7 @@ fn existing_loose_dir_is_warned_about_on_init_and_never_tightened() {
     assert_eq!(mode(&env.vault()), 0o600);
     chmod(&env.vault(), 0o666);
     chmod(&dir, 0o700);
-    let out = env.ok(&["init", "--force"]);
+    let out = env.ok(&["init", "--force", "--yes"]);
     assert!(warnings(&out).is_empty(), "{}", stderr(&out));
     assert_eq!(mode(&env.vault()), 0o600);
 }

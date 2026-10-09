@@ -46,7 +46,7 @@ What this does and does not protect against is in the [Threat model](#threat-mod
 
 | command | what it does |
 |---------|--------------|
-| `cloakenv init [--force]` | create an empty vault; refuses to overwrite an existing one unless `--force` (which erases its contents) |
+| `cloakenv init [--force [--yes]]` | create an empty vault; refuses to overwrite an existing one unless `--force`, which asks for confirmation (or `--yes`) and first saves a backup copy, see [Replacing a vault, changing the passphrase](#replacing-a-vault-changing-the-passphrase) |
 | `cloakenv set [--allow-empty] KEY` | store or replace one value, from a hidden prompt or stdin (never from the command line); empty input is refused unless `--allow-empty` |
 | `cloakenv unset KEY` | remove one entry (an error if there is no such key) |
 | `cloakenv import FILE` | add or replace the entries of a `.env` file, see [Importing a `.env` file](#importing-a-env-file) |
@@ -199,6 +199,16 @@ warns (see [Permission warnings](#permission-warnings)) but still uses it.
 
 ## Vault location
 
+**Only that path is used.** The vault is looked for at exactly one place, the
+path given (`.cloak/vault.bin` in the current directory by default). cloakenv
+does **not** search parent directories the way git does, on purpose: a parent
+directory that someone else can write to could hold a vault that injects
+variables of their choosing (a `PATH`, say) into every command you run from
+below it. When there is no vault the error gives the absolute path that was
+tried: `no vault found at /abs/path/.cloak/vault.bin (only this path is tried; parent directories are not searched)`.
+An empty `CLOAKENV_VAULT` (or `--vault ""`) is an error that says so, rather
+than a silent fallback to the default.
+
 `.cloak/vault.bin` relative to the current directory by default; override with
 `--vault <path>` or `CLOAKENV_VAULT`. On Unix the file is written atomically
 with mode `0600`, inside a `0700` directory if cloakenv has to create it (an
@@ -227,6 +237,24 @@ say) nothing is written, because a `*` there would hide your whole project:
 add an ignore rule yourself. `git add -f` can still force the file in; don't.
 A committed vault is exposed to offline passphrase guessing by anyone who can
 read the repository, forever.
+
+### Replacing a vault, changing the passphrase
+
+There is no `passwd` command yet: the passphrase of a vault cannot be changed
+in place (see the proposal in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)). The only
+way is `cloakenv init --force`, which starts a new, **empty** vault under a new
+passphrase. Because that destroys the old contents, it is guarded:
+
+* On a terminal it asks `Type 'yes' to continue:` and does nothing for any other
+  answer. With no terminal (scripts, CI) it refuses unless you add `--yes`
+  (`init --force --yes`).
+* Before replacing anything, it saves the old file next to it as
+  `vault.bin.bak-YYYYMMDDTHHMMSSZ` (UTC; mode 0600; byte for byte the old
+  ciphertext, so it needs the **old** passphrase) and tells you where. To keep
+  your secrets, `set` them again or `import` them, then delete the backup.
+  cloakenv never overwrites or removes a backup (and `.cloak/.gitignore` keeps it
+  out of git); delete them when you no longer need the old passphrase, because
+  a backup is a vault encrypted with a passphrase you chose to retire.
 
 ### Permission warnings
 

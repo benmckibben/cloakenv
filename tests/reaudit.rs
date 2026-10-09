@@ -19,6 +19,12 @@ fn assert_untouched(env: &Env) {
 fn writers_without_a_vault_leave_no_directory_or_lock_file_behind() {
     let env = Env::new();
     fs::write(env.path().join("a.env"), "A=1\n").unwrap();
+    // The error gives the absolute path that was tried (as the process sees
+    // its working directory, so symlinked temp directories are resolved).
+    let expected = fs::canonicalize(env.path())
+        .unwrap()
+        .join(".cloak")
+        .join("vault.bin");
     for out in [
         env.run_stdin(&["set", "K"], "value"),
         env.run(&["unset", "K"]),
@@ -26,7 +32,7 @@ fn writers_without_a_vault_leave_no_directory_or_lock_file_behind() {
     ] {
         assert_eq!(out.status.code(), Some(1));
         assert!(
-            stderr(&out).contains("no vault found at .cloak/vault.bin (run `cloakenv init`"),
+            stderr(&out).contains(&format!("no vault found at {} (", expected.display())),
             "{}",
             stderr(&out)
         );

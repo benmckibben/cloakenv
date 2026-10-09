@@ -24,6 +24,7 @@ fn assert_no_echo(args: &[&str], stderr: &str) {
         "--shield",
         "--vault",
         "--force",
+        "--yes",
         "--allow-empty",
         "init",
         "set",
