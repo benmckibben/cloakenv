@@ -12,6 +12,7 @@
 //!   `--shield` streaming redactor.
 //! * [`input`]: reading secret text (stdin, passphrase files) into a single
 //!   wiped buffer, with a size cap.
+//! * [`envcheck`]: pre-flight checks of the environment `run` will build.
 //! * [`hardening`]: process-level protections (non-dumpable on Linux) applied
 //!   before any secret is handled.
 //! * [`perms`]: advisory warnings about loose permissions on the vault, its
@@ -27,6 +28,7 @@
 
 pub mod crypto;
 pub mod diag;
+pub mod envcheck;
 pub mod hardening;
 pub mod input;
 pub mod passphrase;

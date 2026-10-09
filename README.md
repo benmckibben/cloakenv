@@ -63,10 +63,30 @@ Variable names must match `[A-Za-z_][A-Za-z0-9_]*`; `CLOAKENV_PASSPHRASE` and
 stdin is not a terminal (never from the command line). From stdin it takes at
 most **1 MiB**, with one trailing newline (`\n` or `\r\n`) removed and nothing
 else; anything larger, or not valid UTF-8, is refused with an error that does
-not repeat any of it, and nothing is stored. (Linux itself will not start a
-command whose single environment variable is over 128 KiB, so a value that large
-can be stored but not injected.) The input is read into one buffer that is wiped
+not repeat any of it, and nothing is stored. The input is read into one buffer that is wiped
 afterwards; see "Memory hygiene" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#memory-hygiene-best-effort).
+
+### Size limits, checked when you store, not when you next open the vault
+
+Everything cloakenv can read back has a limit, and every limit is enforced
+**before anything is written** (`set` and `import`), so a vault can
+never be saved in a state it cannot be opened from again. The errors name the
+key or the limit and never repeat a value:
+
+| limit | value | what happens beyond it |
+|-------|-------|------------------------|
+| one variable, `KEY=VALUE` together | 131,071 bytes (128 KiB minus one) | `set` and `import` refuse it, naming the key: `cloakenv: error: BIG: the variable would be 131072 bytes as KEY=VALUE, over the limit of 131071 bytes for one environment variable`. Linux refuses to start a command with a single environment string over 128 KiB (`E2BIG`); the same limit applies on every platform so a vault stays usable wherever it is copied. This also bounds the length of a key. |
+| the vault file | 16 MiB (16,777,216 bytes) | any write that would produce a larger file is refused with `the vault would be N bytes, over the 16 MiB limit ...; nothing was written`. `import` is all or nothing: the merged result is checked first, and if one entry is too large or the total is, nothing is imported and the vault is untouched. |
+| the `.env` file for `import` | 16 MiB | refused up front, see [Importing a `.env` file](#importing-a-env-file) |
+| a value on stdin to `set` | 1 MiB (plus one line ending) | refused while reading; this is only the read limit, the per-variable limit above is stricter |
+| the environment of the command (Linux) | a quarter of the stack limit (`ulimit -s`; 2 MiB by default), at most 6 MiB, at least 128 KiB | `run` fails with exit 125 before starting anything and names the largest vault entries: `the environment for the command would be N bytes, over the M bytes this system lets a program start with ... Largest vault entries: A (n bytes), B (n bytes)`. The total counts the inherited environment, the command's arguments and the pointers the kernel adds. |
+
+The entry count has no limit of its own; it is bounded by the 16 MiB file size.
+The total-environment check only runs on Linux, where the exact kernel rule is
+known; elsewhere the operating system's own error (`Argument list too long`)
+is all you get. A vault written before these checks existed can already hold an
+entry over the per-variable limit: it still opens, `list` and `unset` work, and
+`run` on Linux names the key.
 
 ## Passphrase sources
 
@@ -270,6 +290,8 @@ or hanging:
 cloakenv: error: /dev/zero is not a regular file (it is a directory, device, pipe or socket); refusing to read it as a vault
 cloakenv: error: vault file is too large (the limit is 16 MiB)
 ```
+
+(cloakenv itself never writes a file that large: see [Size limits](#size-limits-checked-when-you-store-not-when-you-next-open-the-vault).)
 
 A symbolic link to a regular file keeps working (with the warning above).
 

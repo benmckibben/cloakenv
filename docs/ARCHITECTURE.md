@@ -8,6 +8,7 @@
 | `src/passphrase.rs` | the passphrase rules (what each source yields; line-break and length checks) |
 | `src/input.rs`  | reading secret text (stdin value, passphrase file) into one wiped, size-capped buffer |
 | `src/crypto.rs` | Argon2id key derivation, XChaCha20-Poly1305 seal/open, OS RNG           |
+| `src/envcheck.rs` | pre-flight checks of the environment `run` will build (per-variable and total size, with the offending keys named) |
 | `src/vault.rs`  | vault file format, in-memory map, atomic writes (0600 on Unix), `.env` parser |
 | `src/perms.rs`  | advisory permission/symlink warnings for the vault and passphrase file (Unix) |
 | `src/hardening.rs` | process hardening (`PR_SET_DUMPABLE` on Linux, zero soft core limit on Unix) |

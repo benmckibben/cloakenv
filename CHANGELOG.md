@@ -104,6 +104,15 @@ Findings from a security audit of the first version, all fixed before release
 
 ### Fixed
 
+- Every limit on what the vault can hold is now enforced when something is
+  stored, before anything is written. Previously two imports could together
+  produce a vault larger than the 16 MiB cloakenv will read, after which every
+  command failed with `vault file is too large`. `set` and `import` now
+  refuse a vault over 16 MiB, and `import` is all or nothing. A variable over
+  128 KiB (`KEY=VALUE`, the most Linux can start a command with) is refused by
+  `set` and `import` with its key named, instead of failing later as
+  `failed to spawn: Argument list too long`; on Linux `run` also reports which
+  vault entries make the whole environment too large for the kernel.
 - A missing vault no longer creates a vault directory or lock file when `set`,
   `unset` or `import` fail, and error causes are printed once.
 - The key-derivation upgrade notice is only printed after the vault was

@@ -14,10 +14,12 @@ use cloakenv::crypto::{CryptoError, KdfParams};
 use cloakenv::input::{self, InputError};
 use cloakenv::passphrase as rules;
 use cloakenv::vault::{
-    Vault, VaultError, VaultLock, is_valid_key, parse_dotenv, read_env_file, vault_dir,
-    write_gitignore,
+    Vault, VaultError, VaultLock, check_entry, is_valid_key, parse_dotenv, read_env_file,
+    vault_dir, write_gitignore,
 };
-use cloakenv::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, hardening, is_reserved_key, perms, runner};
+use cloakenv::{
+    PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, envcheck, hardening, is_reserved_key, perms, runner,
+};
 use cloakenv::{diag, elog};
 
 /// Lightweight encrypted local secret vault and zero-leak process injection engine.
@@ -206,6 +208,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             // Gather input before taking the lock so a pending prompt never
             // blocks other writers.
             let value = read_value(&key)?;
+            // Before the lock and the key derivation: a value too large to
+            // inject is refused with its key named.
+            check_entry(&key, &value)?;
             let _lock = lock(path)?;
             let mut update = load_for_update(path, &pass)?;
             update.vault.set(&key, value)?;
@@ -240,8 +245,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let _lock = lock(path)?;
             let mut update = load_for_update(path, &pass)?;
             let count = pairs.len();
+            // All or nothing: the merged vault is only saved if every entry
+            // is acceptable and the whole still fits the size limit.
             for (key, value) in pairs {
-                update.vault.set(&key, value)?;
+                update
+                    .vault
+                    .set(&key, value)
+                    .map_err(|e| anyhow!("{e}; nothing was imported"))?;
             }
             update.save(path, &pass)?;
             elog!("cloakenv: imported {count} key(s) from {}", file.display());
@@ -262,6 +272,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let pass = passphrase(false)?;
             let vault = load(path, &pass)?;
             drop(pass);
+            envcheck::check_run_environment(&vault, &command)?;
             if shield {
                 warn_short_values(&vault);
             }
