@@ -2,13 +2,12 @@
 
 ## Supported versions
 
-cloakenv is pre-1.0 and its first release (0.1.0) has not been published yet
-(the `cloakenv` crate on crates.io is only a `0.0.0` placeholder). Security fixes go
-into the default branch and, once releases exist, into the latest release only.
+cloakenv is pre-1.0. Security fixes go into the default branch and into the latest
+release only.
 
 | Version | Supported |
 |---|---|
-| latest release (once there is one) | yes |
+| latest release | yes |
 | `main` | yes |
 | anything older | no |
 
