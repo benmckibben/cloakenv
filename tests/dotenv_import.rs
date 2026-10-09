@@ -62,7 +62,7 @@ fn windows_and_old_mac_line_endings_import_cleanly() {
 #[test]
 fn a_multi_line_pem_key_in_double_quotes_is_imported_whole() {
     let env = Env::init();
-    let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\nhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----";
+    let pem = "-----BEGIN CERTIFICATE-----\nMIIEvQIBADANBgkq\nhkiG9w0BAQEFAASC\n-----END CERTIFICATE-----";
     let file = format!("PRIVATE_KEY=\"{pem}\"\nAFTER=ok\n");
     let out = import_bytes(&env, "pem.env", file.as_bytes());
     assert!(out.status.success(), "{}", stderr(&out));

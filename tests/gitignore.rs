@@ -1,4 +1,4 @@
-//! `cloakenv init` keeps the vault out of version control (audit C11).
+//! `cloakenv init` keeps the vault out of version control.
 
 mod common;
 

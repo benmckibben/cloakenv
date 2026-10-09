@@ -1,4 +1,4 @@
-//! Re-audit of the vault write lock (C1): writers must have no side effects
+//! The vault write lock: writers must have no side effects
 //! when there is no vault, and error causes must be printed once.
 #![cfg(unix)]
 

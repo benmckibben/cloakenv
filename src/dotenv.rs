@@ -331,13 +331,13 @@ mod tests {
 
     #[test]
     fn multi_line_values_in_either_kind_of_quote() {
-        let pem = "KEY=\"-----BEGIN PRIVATE KEY-----\nMIIE\n\nabc=\n-----END PRIVATE KEY-----\"\nNEXT=1\n";
+        let pem = "KEY=\"-----BEGIN CERTIFICATE-----\nMIIE\n\nabc=\n-----END CERTIFICATE-----\"\nNEXT=1\n";
         assert_eq!(
             parsed(pem),
             pairs(&[
                 (
                     "KEY",
-                    "-----BEGIN PRIVATE KEY-----\nMIIE\n\nabc=\n-----END PRIVATE KEY-----"
+                    "-----BEGIN CERTIFICATE-----\nMIIE\n\nabc=\n-----END CERTIFICATE-----"
                 ),
                 ("NEXT", "1")
             ])

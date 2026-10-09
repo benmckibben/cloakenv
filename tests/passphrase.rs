@@ -38,7 +38,7 @@ fn a_passphrase_ending_in_a_line_break_is_refused_at_init_from_every_source() {
     assert!(!err.contains("twelve chars"), "{err}");
     assert!(!env.vault().exists());
 
-    // "x\n\n" in a file is the passphrase "x\n": the case from the audit.
+    // "x\n\n" in a file is the passphrase "x\n": a regression case.
     for contents in [
         &b"a long enough passphrase\n\n"[..],
         b"a long enough passphrase\r\n\r\n",

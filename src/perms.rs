@@ -308,11 +308,11 @@ mod tests {
 
     const PASSWD: &str = "\
 root:x:0:0:root:/root:/bin/bash
-ben:x:1000:1000:Ben:/home/ben:/bin/bash
-alice:x:1001:100:Alice:/home/alice:/bin/bash
-bob:x:1002:100:Bob:/home/bob:/bin/bash
-carol:x:1003:1003::/home/carol:/bin/bash
-dave:x:1004:1003::/home/dave:/bin/bash
+ben:x:1000:1000:Ben:/h/ben:/bin/bash
+alice:x:1001:100:Alice:/h/alice:/bin/bash
+bob:x:1002:100:Bob:/h/bob:/bin/bash
+carol:x:1003:1003::/h/carol:/bin/bash
+dave:x:1004:1003::/h/dave:/bin/bash
 ";
     const GROUP: &str = "\
 root:x:0:

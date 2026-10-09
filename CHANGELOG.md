@@ -7,9 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing has been released yet. This section lists everything the first release
-will contain. (The crate name is reserved on crates.io by a `0.0.0` placeholder
-that has no functionality; it is not a release of this code.)
+## [0.1.0] - unreleased
+
+The first release, not published yet: this section lists everything it will
+contain, and its date is filled in when it is tagged. (The crate name is held on
+crates.io by a `0.0.0` placeholder with no functionality; `cargo install cloakenv`
+currently installs that placeholder, not this program.)
 
 ### Added
 
@@ -44,60 +47,60 @@ that has no functionality; it is not a release of this code.)
 
 ### Security
 
-Findings from a security audit of the first version, all fixed before release
-(`C` numbers are the audit's finding numbers):
+Problems found in a security review of the first version, all fixed before
+this release:
 
-- C1: writers (`init`, `set`, `unset`, `import`) hold an exclusive `flock` for
+- writers (`init`, `set`, `unset`, `import`) hold an exclusive `flock` for
   their whole load-modify-save cycle, so concurrent `cloakenv set` calls no
   longer lose updates. A filesystem without working locks makes writers refuse
   to run instead of going ahead unprotected.
-- C2, C5: on Linux cloakenv marks itself non-dumpable at startup
+- on Linux cloakenv marks itself non-dumpable at startup
   (`PR_SET_DUMPABLE`), so other processes of the same user can't read the
   passphrase from `/proc/<pid>/environ`, inspect its memory, or write around
   `--shield` through `/proc/<pid>/fd`, and no core file is written. On every
   Unix it also lowers its own core-file size limit to 0 (covering
   `fs.suid_dumpable=2` and macOS) and hands the original limit back to the
   command.
-- C3, C4: no secret is ever read from, or echoed back from, the command line.
+- no secret is ever read from, or echoed back from, the command line.
   `cloakenv set KEY VALUE` is refused with an error that doesn't repeat the value;
   invalid variable names are not echoed; usage errors are rendered by cloakenv
   rather than clap (which quotes the offending argument) and exit with code 2.
-- C6: key-derivation parameters in the (not yet authenticated) vault header are
+- key-derivation parameters in the (not yet authenticated) vault header are
   capped (256 MiB, 8 passes, 8 lanes), so a hostile file can't force a huge
   allocation or many seconds of CPU.
-- C7: the vault is opened once and the open handle is checked; only regular
+- the vault is opened once and the open handle is checked; only regular
   files of at most 16 MiB are read (no `/dev/zero`, FIFO, directory or huge file),
   with a hard read cap.
-- C8: `run` without `--shield` replaces cloakenv with the command (`execve`), so
+- `run` without `--shield` replaces cloakenv with the command (`execve`), so
   there is no cloakenv process left to probe or orphan, and signals and exit
   status are the command's own. With `--shield` cloakenv forwards `SIGTERM`,
   `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGUSR1` and `SIGUSR2` to the command, and on
   Linux has the kernel kill the command if cloakenv dies. Output pumps stop
   shortly after the command exits even if a leftover background process holds
   the pipes open.
-- C9: `run --shield` warns, naming the keys, about vault values shorter than 6
+- `run --shield` warns, naming the keys, about vault values shorter than 6
   bytes, which are redacted so broadly that the marker confirms a guess.
-- C11: `init` writes `.cloak/.gitignore` so the vault never shows up in
+- `init` writes `.cloak/.gitignore` so the vault never shows up in
   `git add .`.
-- C12: warnings (not errors) for a vault directory that is group/world-writable,
+- warnings (not errors) for a vault directory that is group/world-writable,
   a vault or passphrase file that is group/world-readable or writable, and a
   symlinked vault or vault directory.
-- C13: decrypted values, the passphrase and the raw child output are kept in
+- decrypted values, the passphrase and the raw child output are kept in
   buffers that are wiped, and no longer in stale copies left by growing reads;
   the vault is dropped as soon as the command has started.
-- C14: new vaults are never weaker than OWASP's minimum Argon2id setting
+- new vaults are never weaker than OWASP's minimum Argon2id setting
   (19 MiB, 2 passes). Older, weaker vaults still open, with a warning, and are
   upgraded the next time `set`, `unset` or `import` saves them.
-- C15: a closed output pipe (`cloakenv list | head -1`) ends quietly instead of
+- a closed output pipe (`cloakenv list | head -1`) ends quietly instead of
   panicking.
-- C16: one set of passphrase rules for all three sources. A source that is set
+- one set of passphrase rules for all three sources. A source that is set
   but unusable is an error, never a silent fallback; `init` refuses a passphrase
   ending in a line break (which the sources would read differently) and warns
   about one shorter than 12 characters.
-- C18: `Debug` output of the parsed command line never shows an argument.
+- `Debug` output of the parsed command line never shows an argument.
 - `import` reads its file with the same care as the vault: regular files only, at
   most 16 MiB, into a buffer that is wiped afterwards.
-- C10, C17, C18: the README documents what `--shield` does and doesn't catch,
+- the README documents what `--shield` does and doesn't catch,
   platform differences, and an end-to-end threat model, including the known
   rollback limit (anyone who can write the vault's directory can put back an
   older valid vault).
@@ -171,3 +174,4 @@ Findings from a security audit of the first version, all fixed before release
   actually saved.
 
 [Unreleased]: https://github.com/benmckibben/cloakenv/commits/main
+[0.1.0]: https://github.com/benmckibben/cloakenv/commits/main
