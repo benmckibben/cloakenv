@@ -14,7 +14,7 @@ use cloakenv::crypto::{CryptoError, KdfParams};
 use cloakenv::input::{self, InputError};
 use cloakenv::passphrase as rules;
 use cloakenv::vault::{
-    Vault, VaultError, VaultLock, check_entry, is_valid_key, parse_dotenv, read_env_file,
+    Vault, VaultError, VaultLock, check_entry, is_valid_key, parse_dotenv_entries, read_env_file,
     vault_dir, write_gitignore,
 };
 use cloakenv::{
@@ -253,23 +253,51 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let content = read_env_file(&file)?;
             let text =
                 std::str::from_utf8(&content).map_err(|_| VaultError::NotUtf8(file.clone()))?;
-            let pairs = parse_dotenv(text)?;
-            for (key, _) in &pairs {
-                refuse_reserved(key)?;
+            let entries = parse_dotenv_entries(text)?;
+            for e in &entries {
+                refuse_reserved(&e.key)?;
             }
+            // Advisory notes, gathered while the values are still at hand and
+            // printed once the import has succeeded. Names and line numbers
+            // only, never a value.
+            let empty: Vec<&str> = entries
+                .iter()
+                .filter(|e| e.value.is_empty())
+                .map(|e| e.key.as_str())
+                .collect();
+            let empty_note = (!empty.is_empty()).then(|| {
+                format!(
+                    "cloakenv: warning: {} imported with an empty value (a `KEY=` line is stored as an empty value, and the variable is set to it)",
+                    names(&empty)
+                )
+            });
+            let interpolated: Vec<String> = entries
+                .iter()
+                .filter(|e| e.looks_interpolated)
+                .map(|e| e.line.to_string())
+                .collect();
+            let interpolation_note = (!interpolated.is_empty()).then(|| {
+                format!(
+                    "cloakenv: warning: the value on line {} contains `$NAME` or `${{NAME}}`, which is stored exactly as written: cloakenv does not expand variables. Put the final value in the file, or use single quotes if the dollar sign is meant literally",
+                    names(&interpolated)
+                )
+            });
             let pass = passphrase(false)?;
             let _lock = lock(path)?;
             let mut update = load_for_update(path, &pass)?;
-            let count = pairs.len();
+            let count = entries.len();
             // All or nothing: the merged vault is only saved if every entry
             // is acceptable and the whole still fits the size limit.
-            for (key, value) in pairs {
+            for entry in entries {
                 update
                     .vault
-                    .set(&key, value)
+                    .set(&entry.key, entry.value)
                     .map_err(|e| anyhow!("{e}; nothing was imported"))?;
             }
             update.save(path, &pass)?;
+            for note in empty_note.iter().chain(&interpolation_note) {
+                elog!("{note}");
+            }
             elog!("cloakenv: imported {count} key(s) from {}", file.display());
         }
         Cmd::List => {
@@ -307,6 +335,17 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Joins at most a few names (or line numbers) for a message, saying how many
+/// were left out.
+fn names<T: std::fmt::Display>(items: &[T]) -> String {
+    const SHOWN: usize = 10;
+    let mut shown: Vec<String> = items.iter().take(SHOWN).map(ToString::to_string).collect();
+    if items.len() > SHOWN {
+        shown.push(format!("and {} more", items.len() - SHOWN));
+    }
+    shown.join(", ")
 }
 
 /// Warns (on our own stderr, before the child starts, so never through the

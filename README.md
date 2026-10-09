@@ -274,12 +274,35 @@ A header below 8 MiB / 1 pass / 1 lane is rejected as unsupported.
 
 ### Importing a `.env` file
 
-The syntax is blank lines, `# comments`, an optional `export ` prefix, `KEY=value`
-(an unquoted value ends at the first trailing ` #` comment), `KEY='literal'` and
-`KEY="text"` with the escapes `\n \r \t \\ \"`. Multi-line values are not supported. A
-line that does not parse stops the import with its line number (never its
-content) and nothing is imported; existing entries with the same name are
-overwritten.
+`cloakenv import FILE` reads a `.env` file with the grammar below and adds or
+replaces those entries in the vault. This is cloakenv's own small grammar,
+close to what python-dotenv and the Node `dotenv` package accept, **not** a
+shell: nothing is executed and **nothing is expanded**.
+
+| form | supported | notes |
+|------|-----------|-------|
+| blank lines, `# comment` lines | yes | ignored |
+| `KEY=value` | yes | the value is trimmed; an unquoted value ends at the first `␣#` or tab-`#` (a trailing comment); a `#` with no whitespace before it is part of the value |
+| `export KEY=value` | yes | the `export` prefix (followed by a space or tab) is ignored |
+| spaces around `=`, indentation | yes | `KEY = value` is `KEY=value` |
+| `KEY='literal'` | yes | everything up to the next `'` is taken as is: no escapes, no way to include a `'` |
+| `KEY="text"` | yes | escapes `\n`, `\r`, `\t`, `\\` and `\"`; any other backslash sequence (`\$`, `\x`) stays as written |
+| **multi-line** `"..."` and `'...'` values | yes | a quoted value may span lines (PEM keys, JSON); an error is reported on the line where the quote opened |
+| text after a closing quote | only a `# comment` | anything else is an error |
+| `KEY=` (empty value) | yes | stored as an empty value, and `import` prints a warning naming the keys. This differs from `cloakenv set` on purpose: a `KEY=` line is an explicit, visible statement, while empty stdin is usually a failed command |
+| UTF-8 byte order mark at the start of the file | ignored | Windows editors add one |
+| line breaks | `\n`, `\r\n` and a lone `\r` | all are line breaks, including inside quotes (python-dotenv and Node `dotenv` do the same), so a CRLF file never leaves a `\r` in a value. To store a real carriage return use the `\r` escape in double quotes |
+| the same variable twice | **error** | the import stops (nothing is imported) and names both line numbers: duplicates are resolved differently by different tools, and silently taking the last (or first) value is how a wrong secret gets in. Remove one of them |
+| `$VAR`, `${VAR}` (interpolation) | **not supported** | stored **literally**, e.g. `postgres://$HOST/db` really is that string. The import prints a warning with the line numbers of values (outside single quotes) that look like references. Expand them first (`envsubst`) or write the final value |
+| `KEY` with no `=`, `KEY: value`, `\` line continuations | no | an error (or, for a continuation, part of the value) |
+| backticks as quotes, command substitution `$(...)` | no | not special: part of the literal value |
+| invalid names (not `[A-Za-z_][A-Za-z0-9_]*`), a NUL byte in a value, `CLOAKENV_PASSPHRASE` and `CLOAKENV_PASSPHRASE_FILE` | error | |
+
+A line that does not parse stops the import with its **line number and a fixed
+reason, never its content or the name** (a misplaced secret may be in either),
+and nothing is imported; entries already in the vault with the same name are
+overwritten. All values must be valid UTF-8 text (see
+[Secrets are text](#secrets-are-text)).
 
 `cloakenv import <file>` reads the file the same careful way: it opens it once
 and checks the open handle, refuses anything that is not a regular file (a

@@ -41,6 +41,8 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{self, CryptoError, KdfParams, NONCE_LEN, SALT_LEN, TAG_LEN};
 
+pub use crate::dotenv::{DotenvEntry, parse_dotenv, parse_dotenv_entries};
+
 /// File magic.
 pub const MAGIC: &[u8; 8] = b"CLOAKENV";
 /// Current format version.
@@ -114,6 +116,11 @@ pub enum VaultError {
     NulInValue(String),
     #[error(".env parse error on line {line}: {reason}")]
     Dotenv { line: usize, reason: &'static str },
+    // Lines only: a name could be a misplaced secret.
+    #[error(
+        ".env parse error on line {line}: this variable is already set on line {first}; remove one of them (a duplicate is never resolved silently)"
+    )]
+    DotenvDuplicate { line: usize, first: usize },
     #[error(transparent)]
     Crypto(#[from] CryptoError),
     // The cause is the `source`, not part of this message, so `{:#}` (which
@@ -759,98 +766,6 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
     builder.create(dir)
 }
 
-/// Parses `.env`-style content into `(KEY, value)` pairs.
-///
-/// Supported syntax: blank lines, `# comments`, an optional `export ` prefix,
-/// unquoted values (the earliest trailing ` #` or `\t#` comment is stripped),
-/// single-quoted literal values and double-quoted values with `\n \r \t \\ \"`
-/// escapes. Multi-line values are not supported. Errors reference line numbers
-/// only, never content.
-pub fn parse_dotenv(content: &str) -> Result<Vec<(String, Zeroizing<String>)>, VaultError> {
-    let mut out = Vec::new();
-    for (idx, raw) in content.lines().enumerate() {
-        let line_no = idx + 1;
-        let err = |reason| VaultError::Dotenv {
-            line: line_no,
-            reason,
-        };
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line
-            .strip_prefix("export")
-            .filter(|rest| rest.starts_with([' ', '\t']))
-            .map(str::trim_start)
-            .unwrap_or(line);
-        let (key, rest) = line
-            .split_once('=')
-            .ok_or_else(|| err("expected KEY=VALUE"))?;
-        let key = key.trim();
-        if !is_valid_key(key) {
-            return Err(err("invalid variable name"));
-        }
-        let rest = rest.trim_start();
-        let value = if let Some(body) = rest.strip_prefix('\'') {
-            let end = body
-                .find('\'')
-                .ok_or_else(|| err("unterminated single quote"))?;
-            if !trailing_ok(&body[end + 1..]) {
-                return Err(err("unexpected characters after closing quote"));
-            }
-            Zeroizing::new(body[..end].to_owned())
-        } else if let Some(body) = rest.strip_prefix('"') {
-            let mut value = Zeroizing::new(String::with_capacity(body.len()));
-            let mut chars = body.char_indices();
-            let mut closed_at = None;
-            while let Some((i, c)) = chars.next() {
-                match c {
-                    '"' => {
-                        closed_at = Some(i);
-                        break;
-                    }
-                    '\\' => match chars.next().map(|(_, c)| c) {
-                        Some('n') => value.push('\n'),
-                        Some('r') => value.push('\r'),
-                        Some('t') => value.push('\t'),
-                        Some('\\') => value.push('\\'),
-                        Some('"') => value.push('"'),
-                        Some(other) => {
-                            value.push('\\');
-                            value.push(other);
-                        }
-                        None => return Err(err("unterminated double quote")),
-                    },
-                    c => value.push(c),
-                }
-            }
-            let end = closed_at.ok_or_else(|| err("unterminated double quote"))?;
-            if !trailing_ok(&body[end + 1..]) {
-                return Err(err("unexpected characters after closing quote"));
-            }
-            value
-        } else {
-            // Earliest marker wins. `or_else` would ignore a leading `\t#`
-            // whenever a later ` #` is also present.
-            let value = match rest.find(" #").into_iter().chain(rest.find("\t#")).min() {
-                Some(i) => &rest[..i],
-                None => rest,
-            };
-            Zeroizing::new(value.trim_end().to_owned())
-        };
-        if value.contains('\0') {
-            return Err(err("value contains a NUL byte"));
-        }
-        out.push((key.to_owned(), value));
-    }
-    Ok(out)
-}
-
-fn trailing_ok(rest: &str) -> bool {
-    let rest = rest.trim();
-    rest.is_empty() || rest.starts_with('#')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,85 +903,6 @@ mod tests {
             Vault::decode_payload(&bytes, KdfParams::MIN),
             Err(VaultError::Malformed)
         ));
-    }
-
-    fn parsed(input: &str) -> Vec<(String, String)> {
-        parse_dotenv(input)
-            .unwrap()
-            .into_iter()
-            .map(|(k, v)| (k, v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn dotenv_syntax() {
-        let input = concat!(
-            "# header\n",
-            "\n",
-            "PLAIN=value\n",
-            "  SPACED = padded value  \n",
-            "export EXPORTED=1\n",
-            "exporter=not-an-export\n",
-            "COMMENTED=abc # note\n",
-            "HASH=abc#def\n",
-            r"SQ='a \n # b'",
-            "\n",
-            r#"DQ="tab\tquote\" nl\n" # note"#,
-            "\n",
-            "EMPTY=\n",
-            "EQ=a=b=c\n",
-            "CRLF=x\r\n",
-        );
-        let want: Vec<(String, String)> = [
-            ("PLAIN", "value"),
-            ("SPACED", "padded value"),
-            ("EXPORTED", "1"),
-            ("exporter", "not-an-export"),
-            ("COMMENTED", "abc"),
-            ("HASH", "abc#def"),
-            ("SQ", r"a \n # b"),
-            ("DQ", "tab\tquote\" nl\n"),
-            ("EMPTY", ""),
-            ("EQ", "a=b=c"),
-            ("CRLF", "x"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
-        .collect();
-        assert_eq!(parsed(input), want);
-    }
-
-    #[test]
-    fn unquoted_comment_uses_earliest_marker() {
-        let cases = [
-            ("TAB=val\t# comment\n", "TAB", "val"),
-            ("BOTH=val\t#comment #note\n", "BOTH", "val"),
-            ("SPACE_FIRST=val #note\t#later\n", "SPACE_FIRST", "val"),
-            ("HASH=abc#def\n", "HASH", "abc#def"),
-        ];
-        for (input, key, value) in cases {
-            assert_eq!(
-                parsed(input),
-                vec![(key.to_owned(), value.to_owned())],
-                "{input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn dotenv_errors_report_line_only() {
-        for (input, line) in [
-            ("A=1\nnot a pair\n", 2),
-            ("1BAD=x\n", 1),
-            ("A=1\nB=\"open\n", 2),
-            ("A='open\n", 1),
-            ("A='x' trailing\n", 1),
-        ] {
-            match parse_dotenv(input) {
-                Err(VaultError::Dotenv { line: l, .. }) => assert_eq!(l, line, "{input:?}"),
-                other => panic!("{input:?}: unexpected {other:?}"),
-            }
-        }
     }
 
     #[test]

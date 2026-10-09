@@ -104,6 +104,15 @@ Findings from a security audit of the first version, all fixed before release
 
 ### Fixed
 
+- `import` reads `.env` files the way people write them. A UTF-8 byte order
+  mark is ignored (it used to fail with `invalid variable name`), a lone `\r`
+  is a line break instead of ending up inside a value, double-quoted and
+  single-quoted values may span several lines (PEM keys, JSON), and a variable
+  that appears twice is an error instead of silently keeping the last value.
+  `$VAR` and `${VAR}` are stored literally, as before, and now the README
+  says so and `import` warns about values that look like references. A `KEY=`
+  line is imported as an empty value, with a warning. The README documents the
+  exact grammar in a table.
 - `cloakenv set` refuses an empty value (empty stdin, a lone line break, or an
   Enter at the prompt) instead of storing it: `false | cloakenv set API_KEY`
   used to replace a good secret with an empty string and exit 0. Use the new

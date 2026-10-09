@@ -4,6 +4,7 @@
 //! The crate is split into three layers:
 //!
 //! * [`crypto`]: Argon2id key derivation and XChaCha20-Poly1305 AEAD.
+//! * [`dotenv`]: the `.env` grammar of `import`.
 //! * [`vault`]: the on-disk vault format, in-memory key/value storage and
 //!   `.env` import parsing.
 //! * [`runner`]: running commands with secrets injected straight into their
@@ -28,6 +29,7 @@
 
 pub mod crypto;
 pub mod diag;
+pub mod dotenv;
 pub mod envcheck;
 pub mod hardening;
 pub mod input;

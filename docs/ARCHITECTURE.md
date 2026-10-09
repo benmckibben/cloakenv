@@ -9,7 +9,8 @@
 | `src/input.rs`  | reading secret text (stdin value, passphrase file) into one wiped, size-capped buffer |
 | `src/crypto.rs` | Argon2id key derivation, XChaCha20-Poly1305 seal/open, OS RNG           |
 | `src/envcheck.rs` | pre-flight checks of the environment `run` will build (per-variable and total size, with the offending keys named) |
-| `src/vault.rs`  | vault file format, in-memory map, atomic writes (0600 on Unix), `.env` parser |
+| `src/dotenv.rs` | the `.env` grammar for `import` (multi-line quotes, BOM, line endings, duplicates; no interpolation) |
+| `src/vault.rs`  | vault file format, in-memory map, size limits, atomic writes (0600 on Unix) |
 | `src/perms.rs`  | advisory permission/symlink warnings for the vault and passphrase file (Unix) |
 | `src/hardening.rs` | process hardening (`PR_SET_DUMPABLE` on Linux, zero soft core limit on Unix) |
 | `src/runner.rs` | env injection: `exec` into the command, or spawn it; `--shield` streaming redactor |
