@@ -6,10 +6,14 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::io::{self, Write};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
 #[cfg(not(unix))]
 use std::thread;
 
-use aho_corasick::{AhoCorasick, MatchKind};
+use aho_corasick::automaton::Automaton;
+use aho_corasick::dfa;
+use aho_corasick::nfa::contiguous;
+use aho_corasick::{Anchored, Input, MatchKind, StartKind};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -80,12 +84,189 @@ impl RunError {
     }
 }
 
+/// Total secret bytes up to which the matcher is a full DFA (fastest scan).
+/// A DFA is built by following failure links for every state and byte class, which
+/// is quadratic for a long value that overlaps itself (`xxxx…`): 16 KiB of
+/// `x` took 0.5 s and 64 KiB took 8 s. Up to this size even that worst case
+/// builds in tens of milliseconds; above it the matcher is a contiguous NFA,
+/// which builds in linear time (1 MiB of `x` in a few milliseconds) and scans
+/// about as fast on typical output.
+const DFA_MAX_PATTERN_BYTES: usize = 4096;
+
+/// The compiled automaton, either flavour.
+enum Engine {
+    Dfa(dfa::DFA),
+    Nfa(contiguous::NFA),
+}
+
+/// All secrets compiled into one leftmost-longest automaton, plus what the
+/// redactor needs to know about their *prefixes*.
+struct Matcher {
+    engine: Engine,
+    max_len: usize,
+    /// Which bytes can begin a secret. A byte that cannot is never held
+    /// back. (Derived from the automaton's own start state, so no separate
+    /// copy of the secrets exists.)
+    first: [bool; 256],
+}
+
+impl Matcher {
+    fn build(patterns: &[&[u8]], max_len: usize) -> Result<Self, RunError> {
+        let total: usize = patterns.iter().map(|p| p.len()).sum();
+        let engine = if total <= DFA_MAX_PATTERN_BYTES {
+            // Both starts: the anchored one is how prefixes are tested.
+            dfa::DFA::builder()
+                .match_kind(MatchKind::LeftmostLongest)
+                .start_kind(StartKind::Both)
+                // The prefilter (memchr/Teddy/Rabin-Karp) is a speed-up that
+                // keeps its own contiguous copy of the patterns; without it
+                // the secrets exist only as automaton transitions, which a
+                // plain scan of the process's memory for the secret does not
+                // find.
+                .prefilter(false)
+                .build(patterns)
+                .map(Engine::Dfa)
+        } else {
+            contiguous::NFA::builder()
+                .match_kind(MatchKind::LeftmostLongest)
+                .prefilter(false)
+                .build(patterns)
+                .map(Engine::Nfa)
+        }
+        .map_err(|_| RunError::Shield)?;
+        let mut matcher = Matcher {
+            engine,
+            max_len,
+            first: [false; 256],
+        };
+        // Fail closed: both kinds of search must be possible.
+        match &matcher.engine {
+            Engine::Dfa(a) => prepare(a, &mut matcher.first),
+            Engine::Nfa(a) => prepare(a, &mut matcher.first),
+        }?;
+        Ok(matcher)
+    }
+
+    /// Calls `f(start, end)` for every leftmost-longest match in `hay`, in
+    /// order, until `f` returns false.
+    fn for_each_match(&self, hay: &[u8], f: impl FnMut(usize, usize) -> bool) -> io::Result<()> {
+        match &self.engine {
+            Engine::Dfa(a) => scan(a, hay, f),
+            Engine::Nfa(a) => scan(a, hay, f),
+        }
+    }
+
+    /// The index in `hay` (at least `from`) from which everything must be held
+    /// back: the start of the longest suffix of `hay[from..]` that is a
+    /// *proper* prefix of some secret, i.e. that more input could still
+    /// complete into a match. `hay.len()` if there is none. Bytes before it
+    /// cannot take part in a match that is not already fully in `hay`.
+    fn hold_start(&self, hay: &[u8], from: usize) -> usize {
+        match &self.engine {
+            Engine::Dfa(a) => hold_start(a, &self.first, self.max_len, hay, from),
+            Engine::Nfa(a) => hold_start(a, &self.first, self.max_len, hay, from),
+        }
+    }
+}
+
+/// Checks that `a` supports unanchored and anchored searches, and fills
+/// `first` from the anchored start state.
+fn prepare<A: Automaton>(a: &A, first: &mut [bool; 256]) -> Result<(), RunError> {
+    a.start_state(Anchored::No).map_err(|_| RunError::Shield)?;
+    let start = a.start_state(Anchored::Yes).map_err(|_| RunError::Shield)?;
+    for (byte, slot) in (0..=u8::MAX).zip(first.iter_mut()) {
+        *slot = !a.is_dead(a.next_state(Anchored::Yes, start, byte));
+    }
+    Ok(())
+}
+
+fn scan<A: Automaton>(
+    a: &A,
+    hay: &[u8],
+    mut f: impl FnMut(usize, usize) -> bool,
+) -> io::Result<()> {
+    // Cannot fail for a searchable automaton (checked in `prepare`); if it
+    // ever did, failing the write is the closed way out: nothing unredacted
+    // is printed.
+    let iter = a
+        .try_find_iter(Input::new(hay))
+        .map_err(|_| io::Error::other("the redaction filter failed"))?;
+    for m in iter {
+        if !f(m.start(), m.end()) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn hold_start<A: Automaton>(
+    a: &A,
+    first: &[bool; 256],
+    max_len: usize,
+    hay: &[u8],
+    from: usize,
+) -> usize {
+    let len = hay.len();
+    // A proper prefix of a secret is at most `max_len - 1` bytes long.
+    let window = len.saturating_sub(max_len.saturating_sub(1)).max(from);
+    let Ok(start) = a.start_state(Anchored::Yes) else {
+        return window;
+    };
+    // Typical output costs a handful of steps; a stream built to look like
+    // the start of a self-overlapping secret (`xxxx…` against `xxxx…y`) would
+    // cost quadratic time. Past this budget fall back to holding the whole
+    // window, which is always a safe superset.
+    let mut budget = 8 * (len - window) + 1024;
+    for p in window..len {
+        if !first[usize::from(hay[p])] {
+            continue;
+        }
+        let mut sid = start;
+        let mut alive = true;
+        for &byte in &hay[p..] {
+            if budget == 0 {
+                return window;
+            }
+            budget -= 1;
+            sid = a.next_state(Anchored::Yes, sid, byte);
+            if a.is_dead(sid) {
+                alive = false;
+                break;
+            }
+        }
+        if !alive {
+            continue;
+        }
+        // `hay[p..]` is a prefix of some secret. It is a *proper* one (so more
+        // input could still extend it) unless it is a secret that nothing
+        // longer continues. A state that is not a match state cannot be a
+        // leaf, so only a match state needs the look at its successors.
+        if !a.is_match(sid) {
+            return p;
+        }
+        if budget < 256 {
+            return window;
+        }
+        budget -= 256;
+        if (0..=u8::MAX).any(|b| !a.is_dead(a.next_state(Anchored::Yes, sid, b))) {
+            return p;
+        }
+    }
+    len
+}
+
 /// Streaming find-and-replace of secret values over an arbitrary byte stream.
 ///
-/// Matches can straddle chunk boundaries: the redactor holds back the last
-/// `max_secret_len - 1` bytes of input until it can prove that no secret
-/// starting inside them is still in flight. Matching is leftmost-longest, so
-/// when one secret is a prefix of another the longer one is redacted whole.
+/// Matches can straddle chunk boundaries, so the redactor holds back exactly
+/// those trailing bytes that could still turn out to be the beginning of a
+/// secret: the longest suffix of the input that is a proper prefix of some
+/// secret (`sk-li` of an `sk-live-…` token, say). Every other byte (a line
+/// of ordinary output, a prompt) is released at once. Held bytes wait for
+/// more input or for the end of the stream; there is deliberately no timer
+/// that releases them, because they are precisely the bytes that begin a
+/// secret, and a slow writer would otherwise leak its first half.
+/// Matching is leftmost-longest, so when one secret is a prefix of another the
+/// longer one is redacted whole.
 ///
 /// The buffer of held-back input (raw child output, which may contain secrets
 /// that have not been redacted yet) is allocated once and wiped on drop, and
@@ -93,8 +274,7 @@ impl RunError {
 /// automaton itself cannot be wiped: the library has no way to do it (see
 /// "Memory hygiene" in `docs/ARCHITECTURE.md`).
 pub struct Redactor {
-    matcher: Option<AhoCorasick>,
-    holdback: usize,
+    matcher: Option<Arc<Matcher>>,
     pending: Zeroizing<Vec<u8>>,
 }
 
@@ -114,8 +294,7 @@ impl Redactor {
         I: IntoIterator<Item = P>,
         P: AsRef<[u8]>,
     {
-        let (matcher, max_len) = build_matcher(secrets)?;
-        Ok(Self::with_matcher(matcher, max_len))
+        Ok(Self::with_matcher(build_matcher(secrets)?))
     }
 
     /// Builds two independent redactors (one per output stream) that share a
@@ -126,20 +305,25 @@ impl Redactor {
         I: IntoIterator<Item = P>,
         P: AsRef<[u8]>,
     {
-        let (matcher, max_len) = build_matcher(secrets)?;
-        // Cloning an AhoCorasick only bumps a reference count.
+        let matcher = build_matcher(secrets)?;
         Ok((
-            Self::with_matcher(matcher.clone(), max_len),
-            Self::with_matcher(matcher, max_len),
+            Self::with_matcher(matcher.clone()),
+            Self::with_matcher(matcher),
         ))
     }
 
-    fn with_matcher(matcher: Option<AhoCorasick>, max_len: usize) -> Self {
+    fn with_matcher(matcher: Option<Arc<Matcher>>) -> Self {
+        let max_len = matcher.as_ref().map_or(0, |m| m.max_len);
         Self {
             matcher,
-            holdback: max_len.saturating_sub(1),
             pending: Zeroizing::new(Vec::with_capacity(CHUNK + max_len)),
         }
+    }
+
+    /// How many bytes are being held back right now, waiting to find out
+    /// whether they start a secret.
+    pub fn held(&self) -> usize {
+        self.pending.len()
     }
 
     /// Feeds a chunk of input, writing every byte that is now known to be
@@ -171,33 +355,48 @@ impl Redactor {
     }
 
     fn drain<W: Write + ?Sized>(&mut self, out: &mut W, eof: bool) -> io::Result<()> {
-        let Some(matcher) = &self.matcher else {
+        let Some(matcher) = self.matcher.clone() else {
             out.write_all(&self.pending)?;
             self.pending.zeroize();
             return Ok(());
         };
-        // Any match starting before "safe" is fully determined by the bytes
-        // we already have: it (and any longer alternative at the same start)
-        // must end within the buffer.
-        let safe = if eof {
-            self.pending.len()
+        let len = self.pending.len();
+        // Everything before `hold` is settled: a match starting there is
+        // fully inside the buffer (it, and any longer alternative at the same
+        // start, would otherwise make that start a proper prefix and hold it).
+        let mut hold = if eof {
+            len
         } else {
-            self.pending.len().saturating_sub(self.holdback)
+            matcher.hold_start(&self.pending, 0)
         };
         let mut cursor = 0;
-        for m in matcher.find_iter(&self.pending) {
-            if m.start() >= safe {
-                break;
+        let mut failed = None;
+        matcher.for_each_match(&self.pending, |start, end| {
+            if start >= hold {
+                return false;
             }
-            out.write_all(&self.pending[cursor..m.start()])?;
-            out.write_all(REDACTION)?;
-            cursor = m.end();
+            let wrote = out
+                .write_all(&self.pending[cursor..start])
+                .and_then(|()| out.write_all(REDACTION));
+            if let Err(e) = wrote {
+                failed = Some(e);
+                return false;
+            }
+            cursor = end;
+            if cursor > hold {
+                // The match swallowed the old hold point; what is left of the
+                // buffer needs its own.
+                hold = matcher.hold_start(&self.pending, cursor);
+            }
+            true
+        })?;
+        if let Some(e) = failed {
+            return Err(e);
         }
-        let emit_to = cursor.max(safe);
+        let emit_to = cursor.max(hold);
         out.write_all(&self.pending[cursor..emit_to])?;
         // Shift the held-back tail to the front and wipe what is left behind it
         // (`Vec::drain` would leave stale copies of the emitted bytes there).
-        let len = self.pending.len();
         self.pending.copy_within(emit_to.., 0);
         let new_len = len - emit_to;
         self.pending[new_len..].zeroize();
@@ -206,31 +405,23 @@ impl Redactor {
     }
 }
 
-/// Compiles the non-empty `secrets` into one automaton. Returns it (`None` if
-/// there is nothing to match) and the length of the longest secret.
-fn build_matcher<I, P>(secrets: I) -> Result<(Option<AhoCorasick>, usize), RunError>
+/// Compiles the non-empty `secrets` into one automaton (`None` if there is
+/// nothing to match).
+fn build_matcher<I, P>(secrets: I) -> Result<Option<Arc<Matcher>>, RunError>
 where
     I: IntoIterator<Item = P>,
     P: AsRef<[u8]>,
 {
-    let patterns: Vec<P> = secrets
+    let owned: Vec<P> = secrets
         .into_iter()
         .filter(|s| !s.as_ref().is_empty())
         .collect();
-    let max_len = patterns.iter().map(|p| p.as_ref().len()).max().unwrap_or(0);
-    if patterns.is_empty() {
-        return Ok((None, 0));
+    if owned.is_empty() {
+        return Ok(None);
     }
-    let matcher = AhoCorasick::builder()
-        .match_kind(MatchKind::LeftmostLongest)
-        // The prefilter (memchr/Teddy/Rabin-Karp) is a speed-up that keeps
-        // its own contiguous copy of the patterns; without it the secrets
-        // exist only as automaton transitions, which a plain scan of the
-        // process's memory for the secret does not find.
-        .prefilter(false)
-        .build(&patterns)
-        .map_err(|_| RunError::Shield)?;
-    Ok((Some(matcher), max_len))
+    let patterns: Vec<&[u8]> = owned.iter().map(AsRef::as_ref).collect();
+    let max_len = patterns.iter().map(|p| p.len()).max().unwrap_or(0);
+    Matcher::build(&patterns, max_len).map(|m| Some(Arc::new(m)))
 }
 
 /// Redacts a complete in-memory buffer. Convenience wrapper over [`Redactor`].
@@ -241,8 +432,9 @@ where
 {
     let mut r = Redactor::new(secrets)?;
     let mut out = Vec::with_capacity(input.len());
-    r.push(input, &mut out).expect("writing to Vec cannot fail");
-    r.finish(&mut out).expect("writing to Vec cannot fail");
+    // Writing to a Vec cannot fail; an error here would be the filter's own.
+    r.push(input, &mut out).map_err(|_| RunError::Shield)?;
+    r.finish(&mut out).map_err(|_| RunError::Shield)?;
     Ok(out)
 }
 
@@ -456,16 +648,16 @@ mod tests {
         let mut r = Redactor::new(["abcdef"]).unwrap();
         let mut out = Vec::new();
         r.push(b"xxxxxxxxxxabc", &mut out).unwrap();
-        assert_eq!(out, b"xxxxxxxx");
-        assert_eq!(&r.pending[..], b"xxabc");
+        assert_eq!(out, b"xxxxxxxxxx");
+        assert_eq!(&r.pending[..], b"abc");
         assert!(stale_bytes(&r, 13).iter().all(|b| *b == 0));
 
         // A redacted secret leaves no copy behind either.
         let mut r = Redactor::new(["abcdef"]).unwrap();
         let mut out = Vec::new();
         r.push(b"..abcdef..ab", &mut out).unwrap();
-        assert_eq!(out, b"..[REDACTED_BY_CLOAKENV]");
-        assert_eq!(&r.pending[..], b"..ab");
+        assert_eq!(out, b"..[REDACTED_BY_CLOAKENV]..");
+        assert_eq!(&r.pending[..], b"ab");
         assert!(stale_bytes(&r, 12).iter().all(|b| *b == 0));
     }
 
@@ -499,7 +691,7 @@ mod tests {
         let mut r = Redactor::new(["abcdef"]).unwrap();
         let mut out = Vec::new();
         r.push(b"xyzabc", &mut out).unwrap();
-        assert_eq!(out, b"x"); // "yzabc" could still begin a match
+        assert_eq!(out, b"xyz"); // only "abc" could still begin a match
         r.finish(&mut out).unwrap();
         assert_eq!(out, b"xyzabc");
     }

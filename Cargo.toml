@@ -65,3 +65,8 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# The shield matcher is built and run by the debug-profile tests too, on
+# values up to 1 MiB.
+[profile.dev.package.aho-corasick]
+opt-level = 3

@@ -24,6 +24,13 @@ that has no functionality; it is not a release of this code.)
   to disk. `--shield` streams the command's stdout and stderr through an
   in-memory redactor that replaces literal secret values with
   `[REDACTED_BY_CLOAKENV]`, including values split across read boundaries.
+- `--shield` releases output as soon as it is read, holding back only the
+  trailing bytes that could still be the beginning of a secret (and never
+  releasing those on a timer). A line of output, a prompt without a newline or a
+  server's "listening" message appears while the command is still running.
+- `--shield` builds its matcher in linear time, so a long value that overlaps
+  itself (up to the 1 MiB `set` accepts) no longer takes seconds to minutes
+  before the command starts.
 - `run` takes its command only after `--` (`cloakenv run [OPTIONS] -- COMMAND
   [ARGS]...`). Everything after the command's name belongs to the command, so a
   `--shield` typed after it can no longer be passed to the command silently (and

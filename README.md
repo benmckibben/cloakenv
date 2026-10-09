@@ -420,10 +420,17 @@ What it does **not** catch:
   (see [How `run` starts your command](#how-run-starts-your-command)): what
   they print after the grace period is not shown at all, filtered or not.
 - **A partial secret at the end of the output.** To match across chunk
-  boundaries the filter holds back the last (longest secret − 1) bytes of each
-  stream. If the stream ends in the middle of what *would* have been a match
-  (the child is killed, or prints only the first part of a token and exits), the
-  held-back prefix is flushed as is, in clear.
+  boundaries the filter holds back the trailing bytes of each stream that could
+  still turn out to be the beginning of a secret, and only those: the longest
+  suffix of the output so far that is a prefix of some secret (`sk-li` for a
+  `sk-live-…` token). A line, a prompt without a newline (`Enter name: `) or a
+  server's `listening on …` message is shown at once. Held bytes wait for more
+  output or for the end of the stream, and are never released by a timer: they
+  are exactly the bytes that begin a secret, so a slow writer would otherwise
+  leak its first half. If the stream ends in the middle of what *would* have
+  been a match (the child is killed, or prints only the first part of a token
+  and exits), the held-back prefix is flushed as is, in clear; it is not the
+  secret.
 
 These are known limitations, documented here rather than fixed in this
 version; see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#--shield-streaming-redaction).

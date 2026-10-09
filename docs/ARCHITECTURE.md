@@ -357,13 +357,47 @@ chunks and feeds them through a `Redactor` (Aho-Corasick, leftmost-longest)
 before writing and flushing to the parent's corresponding stream. stdin is
 inherited.
 
-**Chunk boundaries:** with `L` = longest secret length, the redactor holds back
-the last `L − 1` bytes of its buffer. Any match starting before that window is
-fully determined by bytes already seen (including any longer alternative at the
-same start), so it is safe to emit or redact; matches that might still be in
-flight wait for more input or EOF. Output is therefore byte-for-byte identical
-to redacting the whole stream at once, independent of how the OS splits reads —
-tests check every chunk size from 1 to the input length.
+**Chunk boundaries:** the redactor holds back exactly the trailing bytes that
+could still become the beginning of a match: the longest suffix of its buffer
+that is a *proper* prefix of some secret (a secret that nothing longer
+continues is complete, so it is redacted at once). Any match starting before
+that point is fully determined by bytes already seen (a longer alternative at
+the same start would make that start a proper prefix and hold it), so it is
+safe to emit or redact; everything else, such as ordinary output or a prompt
+without a newline, is released immediately. Held bytes wait for more input or
+EOF and are *never* released by a timer: they are the bytes that start a
+secret, so releasing them on idle would leak a secret prefix from any slow
+writer. Output is therefore byte-for-byte identical to redacting the whole
+stream at once, independent of how the OS splits reads. The tests compare the
+redactor with a naive leftmost-longest reference on random overlapping,
+prefix-related and binary secrets and random chunkings, check after every push
+that the held-back length is exactly the reference's, and that no secret ever
+appears in the output.
+
+How the held-back suffix is found: a first-byte table (derived from the
+automaton's anchored start state, so there is no second copy of the secrets)
+skips every position that cannot start a secret; for the others an anchored
+walk of the same automaton from that position tells whether the rest of the
+buffer is a prefix of some secret (and, for a match state, whether anything
+longer continues it). Only the last `L − 1` bytes (`L` = longest secret) are
+candidates. The work per push is bounded (about eight steps per candidate
+byte plus a constant); a stream built to look like the beginning of a long
+self-overlapping secret exceeds it, and the redactor then holds the whole
+`L − 1` window, which is always a safe superset (the old behaviour for every
+stream).
+
+**Building the automaton:** a DFA is the fastest matcher but its construction
+follows failure links for every state and byte class, which is quadratic for a
+value that overlaps itself (`x` repeated: 16 KiB took 0.5 s, 32 KiB 2.1 s, 64 KiB
+8.7 s, 200 KB more than 20 s; `set` accepts values up to 1 MiB, although Linux
+will inject at most 128 KiB per variable). Up to 4 KiB of secret bytes in total
+the matcher is therefore still a DFA (worst case about 30 ms to build); beyond
+that it is a contiguous NFA, which builds in linear time (a 1 MiB value of
+`x`: a few milliseconds; roughly 12 bytes of automaton per secret byte) and
+scans typical output at 200 to 550 MB/s in a release build against 650 to 710
+for the DFA. Measured on the pump's 8 KiB chunks with 100 MB of output without a
+newline: 0.14 s (DFA) and 0.19 to 0.59 s (NFA). There is no limit on the secret
+bytes: the build cost no longer depends on their structure.
 
 **Known limitations** (by design for v0.1):
 
@@ -375,8 +409,12 @@ tests check every chunk size from 1 to the input length.
   stderr in the output is not guaranteed to match the child's write order.
 * If a stream ends while the held-back tail is a proper prefix of a secret
   (child killed, output cut off), that prefix is written in clear at EOF.
-* Up to `L − 1` trailing bytes are delayed until more output arrives or the
-  stream closes; a prompt without a newline may appear late.
+* A trailing partial secret is delayed until more output arrives or the stream
+  closes (and is never released by a timer); nothing else is held back, so a
+  prompt without a newline appears at once. An opt-in idle flush was
+  considered and not built: the held bytes are by definition a prefix of a
+  secret, so flushing them when the writer pauses would reveal the start of
+  a secret to anyone watching the output of a slow writer.
 * When two *different* secrets overlap in the output (e.g. `hunter2` and
   `2fa-token` printed as `hunter2fa-token`), leftmost-longest redacts the
   first and the non-overlapping tail of the second remains visible.
