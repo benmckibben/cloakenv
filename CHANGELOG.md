@@ -104,6 +104,14 @@ Findings from a security audit of the first version, all fixed before release
 
 ### Fixed
 
+- The hidden passphrase prompt no longer leaves the terminal broken. Ctrl-C,
+  `kill`, a hangup or Ctrl-Z at the prompt used to leave echo and line editing
+  switched off in the user's shell; the terminal is now restored on every way
+  out (cloakenv still ends by the signal), and Ctrl-D reports `no passphrase
+  entered (end of input at the prompt)` instead of the misleading `no
+  passphrase available ... or run on a terminal`. The prompt is now cloakenv's
+  own small terminal code (no more `rpassword` on Unix), with tests on a real
+  pseudo-terminal.
 - `import` reads `.env` files the way people write them. A UTF-8 byte order
   mark is ignored (it used to fail with `invalid variable name`), a lone `\r`
   is a line break instead of ending up inside a value, double-quoted and

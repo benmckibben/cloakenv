@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use cloakenv::crypto::{CryptoError, KdfParams};
 use cloakenv::input::{self, InputError};
 use cloakenv::passphrase as rules;
+use cloakenv::prompt::{self, PromptError};
 use cloakenv::vault::{
     Vault, VaultError, VaultLock, check_entry, is_valid_key, parse_dotenv_entries, read_env_file,
     vault_dir, write_gitignore,
@@ -580,13 +581,11 @@ fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
                 "no passphrase available: set {PASSPHRASE_ENV} or {PASSPHRASE_FILE_ENV}, or run on a terminal"
             );
         }
-        let p = Zeroizing::new(
-            rpassword::prompt_password("cloakenv passphrase: ").with_context(|| {
-                format!("no passphrase available: set {PASSPHRASE_ENV} or {PASSPHRASE_FILE_ENV}, or run on a terminal")
-            })?,
-        );
+        let p = prompt::read_hidden("cloakenv passphrase: ")
+            .map_err(|e| prompt_error(e, "passphrase"))?;
         if confirm {
-            let again = Zeroizing::new(rpassword::prompt_password("confirm passphrase: ")?);
+            let again = prompt::read_hidden("confirm passphrase: ")
+                .map_err(|e| prompt_error(e, "passphrase"))?;
             if *again != *p {
                 bail!("passphrases do not match");
             }
@@ -597,6 +596,21 @@ fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
         bail!("passphrase must not be empty");
     }
     Ok(pass)
+}
+
+/// Turns a failed prompt into a message that says what happened: a closed
+/// input (Ctrl-D) is not "no passphrase available". Nothing typed is shown.
+fn prompt_error(err: PromptError, what: &str) -> anyhow::Error {
+    match err {
+        PromptError::EndOfInput => {
+            anyhow!("no {what} entered (end of input at the prompt); nothing was changed")
+        }
+        PromptError::TooLong => anyhow!("the {what} typed is longer than 64 KiB"),
+        PromptError::NotUtf8 => anyhow!("the {what} typed is not valid UTF-8"),
+        PromptError::Io(e) => anyhow::Error::new(e).context(format!(
+            "cannot read the {what} from the terminal (set {PASSPHRASE_ENV} or {PASSPHRASE_FILE_ENV} to avoid the prompt)"
+        )),
+    }
 }
 
 /// Reads the passphrase file into one wiped buffer (at most 64 KiB; a FIFO or
@@ -624,7 +638,7 @@ fn read_passphrase_file(file: &Path) -> Result<Zeroizing<String>> {
 /// holds for the prompt (an Enter with nothing typed) as well.
 fn read_value(key: &str, allow_empty: bool) -> Result<Zeroizing<String>> {
     let value = if io::stdin().is_terminal() {
-        Zeroizing::new(rpassword::prompt_password(format!("value for {key}: "))?)
+        prompt::read_hidden(&format!("value for {key}: ")).map_err(|e| prompt_error(e, "value"))?
     } else {
         read_value_from_stdin()?
     };

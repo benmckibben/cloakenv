@@ -112,6 +112,23 @@ In order of precedence:
    `head -c 32 /dev/urandom | base64 > ~/.config/cloakenv.key && chmod 600 ~/.config/cloakenv.key`.
 3. Interactive prompt (only when stdin is a terminal).
 
+### The interactive prompt
+
+On a terminal the passphrase (and the value for `set`) is typed at a hidden
+prompt: echo is switched off, nothing you type is shown, and line editing and
+Ctrl-C keep working. The terminal is put back **on every way out**: a normal
+return, an error, Ctrl-D, a wrong passphrase, and Ctrl-C, `kill` (`SIGINT`,
+`SIGTERM`, `SIGHUP`, `SIGQUIT`), which still end cloakenv *by that signal*
+(a shell reports 130 for Ctrl-C) but no longer leave your shell without echo.
+Ctrl-Z stops cloakenv with the terminal restored, and hides input again when
+you `fg` it. Only `SIGKILL` cannot be handled; `reset` fixes a terminal after
+one. A signal that was ignored when cloakenv started (`nohup`) stays ignored.
+
+Ctrl-D at the prompt (nothing typed) reports `no passphrase entered (end of
+input at the prompt)` and exits 1. If there is no terminal and neither
+`CLOAKENV_PASSPHRASE` nor `CLOAKENV_PASSPHRASE_FILE` is set, the error says
+so instead.
+
 ### Exactly what counts as the passphrase
 
 The passphrase is the text you supply, byte for byte, with one exception per

@@ -10,6 +10,7 @@
 | `src/crypto.rs` | Argon2id key derivation, XChaCha20-Poly1305 seal/open, OS RNG           |
 | `src/envcheck.rs` | pre-flight checks of the environment `run` will build (per-variable and total size, with the offending keys named) |
 | `src/dotenv.rs` | the `.env` grammar for `import` (multi-line quotes, BOM, line endings, duplicates; no interpolation) |
+| `src/prompt.rs` | the hidden terminal prompt: echo off through a guard that restores the terminal on every exit (return, error, EOF, SIGINT/TERM/HUP/QUIT, SIGTSTP), reading into a wiped buffer |
 | `src/vault.rs`  | vault file format, in-memory map, size limits, atomic writes (0600 on Unix) |
 | `src/perms.rs`  | advisory permission/symlink warnings for the vault and passphrase file (Unix) |
 | `src/hardening.rs` | process hardening (`PR_SET_DUMPABLE` on Linux, zero soft core limit on Unix) |
@@ -213,10 +214,9 @@ described here:
   duplicate of the stdin descriptor so that std's 8 KiB stdin buffer never
   holds a copy, then *moved* (not copied) into the `String` that goes into the
   vault. Previously `read_to_string` regrew its buffer, leaving unwiped copies
-  of the first bytes behind. The interactive prompt uses `rpassword`, whose
-  line buffer grows character by character: a few short stale copies of what
-  was typed may remain on the heap for the (brief) life of the process.
-  Accepted: the interactive path, bounded by the length of one line.
+  of the first bytes behind. The interactive prompt (`src/prompt.rs`) reads into one
+  preallocated, wiped buffer in the same way (at most 64 KiB), so it leaves no
+  stale copies either.
 * **Passphrase.** From `CLOAKENV_PASSPHRASE` it is copied into a `Zeroizing`
   string, but the original sits in the process's environment block until the
   process execs or exits, and a safe Rust program cannot unset it. That is
