@@ -204,5 +204,29 @@ this release:
 - The key-derivation upgrade notice is only printed after the vault was
   actually saved.
 
+### Known limitations
+
+What 0.1.0 does not do, and what nobody has checked. The README's threat model
+has the detail; this is the short version.
+
+- **`--shield` is a filter, not a boundary.** It replaces the exact bytes of a
+  stored value on the command's stdout and stderr. A transformed value (base64,
+  hex, reversed, escaped), a value split across the two streams, a value the
+  command writes to a file or sends over the network, and very short values are
+  not handled the way you might expect.
+- **The command holds your secrets.** After `exec` the kernel makes the
+  command's `/proc/<pid>/environ` readable to other processes of your user (and
+  root), with or without `--shield`.
+- **Not protected:** root and the kernel; code running as you before cloakenv
+  starts; the short window before cloakenv marks itself non-dumpable (Linux);
+  swap and hibernation images (no `mlock`); a vault replaced by an older valid
+  copy (no rollback protection); the vault file's size, which reveals the total
+  length of your secrets. macOS has no non-dumpable flag; Windows is unsupported.
+- **Tests run natively on x86_64 Linux and Apple-silicon macOS only.** The
+  aarch64 Linux and Intel macOS release binaries are smoke-tested, not
+  test-suite-tested.
+- **No external security review.** The code had an internal review and fixes
+  before this release, which is not the same thing.
+
 [Unreleased]: https://github.com/benmckibben/cloakenv/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/benmckibben/cloakenv/releases/tag/v0.1.0

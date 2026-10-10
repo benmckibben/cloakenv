@@ -24,7 +24,7 @@ use cloakenv::{
 };
 use cloakenv::{diag, elog};
 
-/// Lightweight encrypted local secret vault and zero-leak process injection engine.
+/// Lightweight encrypted local secret vault and process injection engine with output redaction.
 ///
 /// The vault passphrase is read from $CLOAKENV_PASSPHRASE, else from the file
 /// named by $CLOAKENV_PASSPHRASE_FILE, else prompted for on the terminal.
