@@ -1,6 +1,6 @@
 # cloakenv
 
-Lightweight encrypted local secret vault and zero-leak process injection engine.
+Lightweight encrypted local secret vault and process injection engine with output redaction.
 
 `cloakenv` replaces plaintext `.env` files with an encrypted vault
 (`.cloak/vault.bin`) and injects secrets **directly into a child process's

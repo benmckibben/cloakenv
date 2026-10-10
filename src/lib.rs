@@ -1,5 +1,5 @@
-//! `cloakenv`: a lightweight encrypted local secret vault and zero-leak
-//! process injection engine.
+//! `cloakenv`: a lightweight encrypted local secret vault and process
+//! injection engine with output redaction.
 //!
 //! The crate is split into three layers:
 //!
