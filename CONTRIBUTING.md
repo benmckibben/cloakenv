@@ -88,13 +88,16 @@ trailing comment; Dependabot proposes updates.
 
 ## Releasing (maintainer)
 
-The release workflow (`.github/workflows/release.yml`) only **builds**: it runs on a
-`v*` tag (or manually), checks that the tag matches `Cargo.toml`, that the commit is
-on `main` and that the changelog has a section for the version, runs the CI checks,
-runs `cargo package` as a packaging check, builds static Linux (x86_64, aarch64)
-and macOS (aarch64, x86_64) binaries, smoke-tests them, and leaves the archives and
-`SHA256SUMS` as artifacts of the workflow run. It has a read-only token, uses no
-secrets, and publishes nothing. Publishing is done by hand:
+The release workflow (`.github/workflows/release.yml`) runs on a `v*` tag (or
+manually), checks that the tag matches `Cargo.toml`, that the commit is on `main`
+and that the changelog has a section for the version, runs the CI checks, runs
+`cargo package` as a packaging check, builds static Linux (x86_64, aarch64) and
+macOS (aarch64, x86_64) binaries, smoke-tests them, and writes `SHA256SUMS`. For a
+real tag it then creates a **draft** GitHub release with those files and the
+changelog section as the notes. A manual run has no tag, so it stops after
+uploading the archives as artifacts. The token is read-only except in the one job
+that creates the draft; it uses no secrets and publishes nothing: you publish the
+draft and run `cargo publish` by hand:
 
 1. Bump `version` in `Cargo.toml` and `Cargo.lock`; in `CHANGELOG.md`, the section
    for the version must exist as `## [X.Y.Z] - YYYY-MM-DD` (the release workflow
@@ -102,8 +105,10 @@ secrets, and publishes nothing. Publishing is done by hand:
    update the two link lines at the bottom. 0.1.0 did this already.
 2. Merge that to `main` once CI is green.
 3. Tag the merge commit `vX.Y.Z` and push the tag. Wait for the "Release build" run
-   to go green.
-4. Download the `release-assets-X.Y.Z` artifact, verify it
-   (`sha256sum --check SHA256SUMS`), and try an archive.
-5. Create the GitHub release from the tag and attach the archives and `SHA256SUMS`;
-   run `cargo publish` from the same commit.
+   to go green; its last job, "draft GitHub release", creates the draft (it fails,
+   and creates nothing, if a release for the tag already exists).
+4. Check the draft on the Releases page: the notes are the changelog section for
+   the version, and the archives and `SHA256SUMS` are attached. Download them,
+   verify (`sha256sum --check SHA256SUMS`), and try an archive. The same files are
+   also the `release-assets-X.Y.Z` artifact of the run.
+5. Publish the draft, and run `cargo publish` from the same commit.
