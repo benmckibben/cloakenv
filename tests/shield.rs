@@ -3,6 +3,8 @@
 mod common;
 
 use cloakenv::runner::{REDACTION, Redactor, redact_all};
+// Only the Unix-only CLI tests below use the helpers.
+#[cfg(unix)]
 use common::*;
 
 const R: &str = "[REDACTED_BY_CLOAKENV]";

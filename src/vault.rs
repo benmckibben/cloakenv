@@ -450,6 +450,15 @@ fn open_regular(path: &Path, kind: FileKind) -> Result<(fs::File, u64), VaultErr
         // controlling terminal. Both are irrelevant for a regular file.
         opts.custom_flags((OFlags::NONBLOCK | OFlags::NOCTTY).bits() as i32);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Without FILE_FLAG_BACKUP_SEMANTICS, CreateFileW refuses to open a
+        // directory at all ("Access is denied"), which would hide the
+        // "not a regular file" check below behind a confusing I/O error.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        opts.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
     let file = opts.open(path).map_err(|e| kind.io(path, e))?;
     let meta = file.metadata().map_err(|e| kind.io(path, e))?;
     if !meta.is_file() {
