@@ -1,5 +1,4 @@
 //! Concurrent writers must not lose each other's updates (vault locking).
-#![cfg(unix)]
 
 mod common;
 
@@ -41,14 +40,18 @@ fn concurrent_sets_do_not_lose_writes() {
 
     let want: Vec<String> = (0..WRITERS).map(|i| format!("KEY_{i}")).collect();
     assert_eq!(keys(&env), want);
-    let out = env.ok(&[
-        "run",
-        "--",
-        "sh",
-        "-c",
-        r#"printf '%s,' "$KEY_0" "$KEY_3" "$KEY_7""#,
-    ]);
-    assert_eq!(stdout(&out), "value-0,value-3,value-7,");
+    // The values must also have been stored intact, not just the names.
+    #[cfg(unix)]
+    {
+        let out = env.ok(&[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            r#"printf '%s,' "$KEY_0" "$KEY_3" "$KEY_7""#,
+        ]);
+        assert_eq!(stdout(&out), "value-0,value-3,value-7,");
+    }
 }
 
 #[test]
