@@ -153,7 +153,9 @@ jobs:
           & $exe run -- cmd /c 'exit 0'; Check 'exit code 0 passes through' ($LASTEXITCODE -eq 0) "exit $LASTEXITCODE"
           $out = (& $exe run -- cmd /c 'echo %CLOAKENV_PASSPHRASE%') -join ''
           Check 'passphrase variable is not passed to the command' ($out.Trim() -eq '%CLOAKENV_PASSPHRASE%') $out
-          $vault = '.cloak/vault.bin'
+          # .NET resolves relative paths against the process cwd, not
+          # PowerShell's location, so build an absolute path.
+          $vault = Join-Path $work '.cloak/vault.bin'
           $bytes = [IO.File]::ReadAllBytes($vault)
           $text = [Text.Encoding]::Latin1.GetString($bytes)
           Check 'vault holds no plaintext' (-not ($text.Contains('zedsecret') -or $text.Contains('alphasecret'))) ''
@@ -162,7 +164,7 @@ jobs:
           & $exe list 2>$null | Out-Null; Check 'tampered vault is refused' ($LASTEXITCODE -ne 0) "exit $LASTEXITCODE"
           # Informational, not a pass/fail: who can read the vault by default?
           Write-Host '--- ACL of the vault file and directory (informational) ---'
-          icacls $vault; icacls .cloak
+          icacls $vault; icacls (Join-Path $work '.cloak')
           Write-Host "--- smoke: $failed check(s) failed ---"
           if ($failed -gt 0) { exit 1 }
       - name: summary
