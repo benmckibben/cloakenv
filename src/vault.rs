@@ -589,8 +589,9 @@ fn decode_header(h: &[u8]) -> Result<(KdfParams, [u8; SALT_LEN], [u8; NONCE_LEN]
 /// intentionally never removed: deleting it would let a waiter and a newcomer
 /// lock two different inodes at once.
 ///
-/// The lock is advisory: it coordinates cloakenv processes only. On non-Unix
-/// platforms it is currently a no-op.
+/// The lock is advisory: it coordinates cloakenv processes only. It is
+/// `flock` on Unix and `LockFileEx` on Windows; on any other platform it is a
+/// no-op.
 #[derive(Debug)]
 pub struct VaultLock {
     _file: fs::File,
@@ -820,7 +821,13 @@ fn lock_file(file: &fs::File, block: bool) -> io::Result<()> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn lock_file(file: &fs::File, block: bool) -> io::Result<()> {
+    crate::winsys::lock_file(file, block)
+}
+
+/// No locking primitive is wired up for this platform.
+#[cfg(not(any(unix, windows)))]
 fn lock_file(_file: &fs::File, _block: bool) -> io::Result<()> {
     Ok(())
 }
@@ -909,7 +916,7 @@ fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        fs::rename(&tmp, path)?;
+        replace_file(&tmp, path)?;
         #[cfg(unix)]
         if let Ok(dir) = fs::File::open(&parent) {
             let _ = dir.sync_all();
@@ -921,6 +928,19 @@ fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
         return Err(VaultError::io("cannot write vault", path, e));
     }
     Ok(())
+}
+
+/// Renames `from` over `to`. On Windows this also waits for the move to reach
+/// the disk (the counterpart of the directory fsync on Unix).
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::winsys::replace_file(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
 }
 
 fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -1085,20 +1105,21 @@ mod tests {
         assert!(!t.path().join(".gitignore").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn vault_lock_is_exclusive_and_released_on_drop() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path().join("sub").join("vault.bin");
         let held = VaultLock::acquire(&vault).unwrap();
         let lock_path = VaultLock::path_for(&vault);
         assert_eq!(lock_path, dir.path().join("sub").join(".vault.bin.lock"));
-        let mode = fs::metadata(&lock_path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        // flock locks belong to the open file description, so a second open in
-        // the same process contends exactly like another process would.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&lock_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // flock and LockFileEx locks belong to the open handle, so a second
+        // open in the same process contends exactly like another process would.
         assert!(VaultLock::try_acquire(&vault).unwrap().is_none());
 
         let waiter = std::thread::spawn({

@@ -218,6 +218,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "thiserror",
+ "windows-sys",
  "zeroize",
 ]
 

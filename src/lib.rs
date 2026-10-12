@@ -25,7 +25,7 @@
 //! They are never written to disk, and never included in error messages.
 
 // `unsafe` is denied crate-wide; the few calls that need it live in `sys`
-// (Unix only), each with a SAFETY comment.
+// (Unix) and `winsys` (Windows), each with a SAFETY comment.
 #![deny(unsafe_code)]
 
 pub mod crypto;
@@ -45,6 +45,8 @@ mod supervise;
 #[cfg(unix)]
 mod sys;
 pub mod vault;
+#[cfg(windows)]
+mod winsys;
 
 /// Environment variable consulted for the vault passphrase.
 ///
