@@ -223,7 +223,10 @@ mod tests {
                     shown.contains("TOKEN") && shown.contains("token"),
                     "{shown}"
                 );
-                assert!(!shown.contains("val-aaa") && !shown.contains("val-bbb"), "{shown}");
+                assert!(
+                    !shown.contains("val-aaa") && !shown.contains("val-bbb"),
+                    "{shown}"
+                );
             }
             other => panic!("unexpected {other:?}"),
         }
