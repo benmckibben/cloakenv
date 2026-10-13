@@ -11,7 +11,7 @@ transcripts, CI logs or terminal scrollback.
 
 ## Install
 
-Rust 1.87 or newer; Linux or macOS (see [Platform support](#platform-support)).
+Rust 1.87 or newer; Linux, macOS or Windows on x86_64 (see [Platform support](#platform-support)).
 
 ```sh
 cargo install --locked cloakenv       # installs `cloakenv` into ~/.cargo/bin
@@ -105,8 +105,16 @@ key or the limit and never repeat a value:
 
 The entry count has no limit of its own; it is bounded by the 16 MiB file size.
 The total-environment check only runs on Linux, where the exact kernel rule is
-known; elsewhere the operating system's own error (`Argument list too long`)
-is all you get. A vault written before these checks existed can already hold an
+known; on macOS the operating system's own error (`Argument list too long`)
+is all you get. **Windows has no such limit in practice:** in a measurement on
+the CI runner, 640 variables of 100,000 characters each (64 MB, far more than a
+vault holds) reached a child intact, as did a single 1,000,000-character
+variable. (The 32,767-character limit you may have read about applies to
+setting a variable in the running process, not to a new process's environment.)
+On Windows `run` instead refuses a vault in which two names differ only in case
+(for example `Token` and `TOKEN`): environment names are not case-sensitive
+there, so one would silently replace the other. It exits 125 and names both
+keys; unset or rename one. A vault written before these checks existed can already hold an
 entry over the per-variable limit: it still opens, `list` and `unset` work, and
 `run` on Linux names the key.
 
@@ -229,10 +237,13 @@ than a silent fallback to the default.
 `.cloak/vault.bin` relative to the current directory by default; override with
 `--vault <path>` or `CLOAKENV_VAULT`. On Unix the file is written atomically
 with mode `0600`, inside a `0700` directory if cloakenv has to create it (an
-existing directory is left as it is). Commands that modify the vault
+existing directory is left as it is). On Windows the files and a directory
+cloakenv creates get a protected ACL (nothing inherited) that gives access to
+you, SYSTEM and Administrators only, set when the file is created, and a save
+replaces the vault with a write-through move. Commands that modify the vault
 serialise on an advisory lock file next to it (`.cloak/.vault.bin.lock`), so
-concurrent `cloakenv set` calls never lose updates (Unix only; see
-[Platform support](#platform-support)). A writer holds the lock for its whole
+concurrent `cloakenv set` calls never lose updates (`flock` on Unix,
+`LockFileEx` on Windows; see [Platform support](#platform-support)). A writer holds the lock for its whole
 load-modify-save cycle, which includes two key derivations (a fraction of a
 second each at the default settings), so simultaneous writers queue up (the
 ones that have to wait say so on stderr); reads (`list`, `run`) never take it
@@ -501,8 +512,22 @@ filter the output. It then
   (Without this a leftover would hold cloakenv, and so, say, a CI step, up for
   as long as it lived.)
 
-Windows is unsupported: there `run` is a plain spawn-and-wait with none of the
-above.
+**On Windows** there is no `exec`, so `run` always stays the parent, with or
+without `--shield`, and there are no signals. Instead:
+
+- The command runs inside a **job object** that kills it and everything it
+  started if cloakenv dies in any way (killed, crashed, console window closed).
+  The command is created suspended and put in the job before it runs, so
+  nothing it starts can escape. When the command exits normally the job is
+  released, so a background process it left behind keeps running, as on Unix.
+  If a job cannot be created or joined, cloakenv prints a warning and runs the
+  command without one.
+- **Ctrl-C and Ctrl-Break** go to the command, which gets them from the console
+  itself; cloakenv stays alive, waits for the command and reports how it ended.
+  Closing the console window, logging off and shutting down end cloakenv and,
+  through the job object, the command.
+- With `--shield`, after the command exits cloakenv waits at most 3 seconds for
+  leftover processes that still hold the output pipes, then stops.
 
 ### What the command inherits, in both modes
 
@@ -604,8 +629,10 @@ usage error is 2 but every other cloakenv failure is 125 (not 1, which other
 subcommands use and which a command may return too). `cloakenv run --help`
 prints this table.
 
-Exit codes are 0–255 on Unix. A child exit status above 255 (possible on
-Windows only, which is unsupported) is reported as `1`.
+Exit codes are 0–255 on Unix. On Windows exit codes are 32 bits wide and are
+reported unchanged (a crash is `0xC0000005`, Ctrl-C is `0xC000013A`; PowerShell
+shows them as signed numbers, e.g. `-1073741819`). There is no `128 + N`
+mapping on Windows, because there are no signals.
 
 **Output that cannot be written.** Under `run --shield`, cloakenv waits for its
 stdout and stderr to become writable if they are non-blocking (a parent that made
@@ -713,29 +740,53 @@ version; see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#--shield-streaming-re
 |----------|--------|
 | Linux | supported; tested in CI (Ubuntu 24.04, stable Rust and the 1.87 MSRV) |
 | macOS | supported; tested in CI (macOS 15, stable Rust) |
-| Windows | **unsupported and untested**: not built or tested in CI, integration tests are Unix-only |
+| Windows | supported on **x86_64 (MSVC)** only; built, linted and tested in CI (Windows Server 2025) and tried by hand on one Windows machine. See the limitations below. 32-bit and Arm Windows are not supported |
 
 The release workflow ([CONTRIBUTING.md](CONTRIBUTING.md#releasing-maintainer))
 builds static musl binaries for Linux (x86_64 and aarch64) and binaries for
 macOS (Apple silicon and Intel). The test suite runs natively on x86_64 Linux
-(glibc, and musl in the release workflow) and on Apple-silicon macOS; the
-aarch64 Linux and Intel macOS builds are smoke-tested (under QEMU and Rosetta)
-but their tests are not run.
+(glibc, and musl in the release workflow), on Apple-silicon macOS and on
+x86_64 Windows; the aarch64 Linux and Intel macOS builds are smoke-tested (under
+QEMU and Rosetta) but their tests are not run.
 
 Several protections described above are implemented with Unix-only APIs
-(`cfg(unix)`), and silently do not exist elsewhere:
+(`cfg(unix)`) and have a different Windows counterpart:
 
-- file mode `0600` for the vault and lock file, and `0700` for a directory
-  cloakenv creates;
-- the directory `fsync` after the atomic rename (durability across power loss);
-- the advisory `flock` that serialises concurrent writers;
-- replacing cloakenv with the command (`exec`) without `--shield`, and signal
-  forwarding with it (neither exists on Windows);
-- the permission warnings (symlink warnings do apply);
-- `128 + N` exit codes for a child killed by a signal.
+| Unix | Windows |
+|------|---------|
+| file mode `0600` for the vault and lock file, `0700` for a directory cloakenv creates | a protected ACL (no inheritance) for you, SYSTEM and Administrators, set when the file or directory is created |
+| the permission warnings (modes) | warnings when an existing vault file or passphrase file gives *any* access to Everyone, Users or Authenticated Users, or the vault directory gives them *write* access; warnings only, nothing is changed. Symlink warnings apply everywhere |
+| directory `fsync` after the atomic rename | the rename is done with `MoveFileExW` `WRITE_THROUGH` |
+| advisory `flock` | `LockFileEx` on the same lock file |
+| replacing cloakenv with the command (`exec`) without `--shield`; signal forwarding | cloakenv stays the parent; job object and console Ctrl-C/Ctrl-Break handling (see [`run`](#what-the-command-inherits-in-both-modes) above) |
+| `PR_SET_PDEATHSIG` (Linux) | the job object (also covers the command's descendants) |
+| `128 + N` exit codes for a child killed by a signal | the 32-bit exit code, unchanged |
 
-On Windows, cloakenv would use default inherited ACLs, would not prevent
-concurrent `set` calls from losing updates, and has not been checked at all.
+**Windows limitations in one place:**
+
+- **Same-user processes are not kept out.** There is no `PR_SET_DUMPABLE`
+  equivalent in use, so another process of your account can read cloakenv's own
+  environment and memory (`CLOAKENV_PASSPHRASE` included) and the command's
+  environment, as on macOS. Prefer the prompt or a passphrase file readable
+  only by you. Memory is not locked, so it may reach the page file or a
+  hibernation image. No crash-dump suppression is implemented.
+- **Permissions are ACLs, and cloakenv only warns.** It never changes the ACL of
+  a file or directory that already exists, so a vault in a folder others can
+  write to warns until you fix the folder (for example `icacls <dir> /inheritance:r`
+  and then grant yourself access). A save replaces the vault file with a private
+  one, but not the directory.
+- **`--shield` filters bytes on the two pipes.** A program that writes UTF-16,
+  or writes to the console directly instead of to standard output or standard
+  error, is not covered. The other shield limits above apply too.
+- **Environment limits** are checked before `run`: see the limits table.
+- **Tried by hand** in PowerShell only (prompts, Ctrl-C, closing the window,
+  killing cloakenv, ACLs). **Not tried:** cmd.exe, Windows Terminal, Git Bash and
+  mintty (which has no real console), Ctrl-Break, a vault in a OneDrive or
+  Dropbox folder, on a network share or on an exFAT drive, a second Windows
+  account, domain accounts, and a program that is itself running in another job
+  object.
+- **Release binaries are not signed**; SmartScreen or antivirus software may
+  warn about them.
 
 **macOS limitations in one place:** no `PR_SET_DUMPABLE`, so same-user processes
 can read cloakenv's own environment and memory (the passphrase variable
@@ -797,8 +848,8 @@ the sections it links to and in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
   exported variable is visible in your shell's own environment. Use the prompt or
   a `0600` passphrase file where that matters.
 - **Platforms.** On macOS there is no dumpable flag, so cloakenv's own environment
-  and memory are not protected from same-user processes; Windows is unsupported
-  ([Platform support](#platform-support)).
+  and memory are not protected from same-user processes, and nor are they on
+  Windows ([Platform support](#platform-support)).
 - **A shield is a filter, not a boundary.** Transformed secrets (base64, hex,
   escaped, masked, split) pass through; so do secrets split across stdout and
   stderr, and anything not on those two pipes; and values shorter than 6 bytes

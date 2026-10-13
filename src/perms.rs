@@ -299,7 +299,7 @@ fn vault_warnings_with(
         let who = acl_exposure(&acl, true);
         if !who.is_empty() {
             out.push(format!(
-                "vault directory {} can be written to by {} (Windows ACL); they could replace the vault. cloakenv creates a directory it makes for you, SYSTEM and Administrators only",
+                "vault directory {} can be written to by {} (Windows ACL); they could replace the vault. A directory cloakenv creates is open only to you, SYSTEM and Administrators",
                 dir.display(),
                 join_names(&who)
             ));

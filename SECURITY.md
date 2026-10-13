@@ -70,7 +70,9 @@ command only through its environment. The README's
 - **A weak passphrase**, or one kept in an environment variable on a shared
   machine (use the prompt or a `0600` passphrase file).
 - **macOS**: there is no non-dumpable flag, so cloakenv's own environment and
-  memory aren't protected from same-user processes there. Windows is unsupported.
+  memory aren't protected from same-user processes there, and nor are they on
+  Windows (x86_64 is supported; see the README's platform section for what is
+  and is not covered).
 - **Rollback**: anyone who can write the vault's directory can put back an older
   valid vault (rotated secrets revert); they can't read or forge one.
 - **Memory and swap**: wiping is best effort and memory isn't locked, so pages

@@ -113,7 +113,7 @@ silently overwriting each other. The lock lives on a separate file because the
 vault inode is replaced on every save. Readers (`list`, `run`) take no lock;
 the atomic rename already guarantees they see a complete vault. Passphrase and
 value prompts happen *before* the lock is taken, so an idle prompt never
-blocks other writers. `flock` is Unix only; elsewhere the lock is a no-op.
+blocks other writers. The lock is `flock` on Unix and `LockFileEx` on Windows (byte 0 of the same file, tied to the handle, so it is released if the process dies); on any other platform it is a no-op.
 
 **Reading the vault is bounded.** `Vault::load` opens the path once
 (`O_NONBLOCK | O_NOCTTY` on Unix, so opening a FIFO or terminal cannot block
@@ -208,19 +208,29 @@ are routinely 0444/0644 and rely on the container boundary.
   they end at EOF, or once the pipe has been silent for 250 ms, or 3 seconds
   after the exit (not counting time blocked writing to our own stdout), and
   flush their redactor either way. Leftover processes are not killed.
-* `unsafe` is denied crate-wide and allowed in `src/sys.rs` only, for two
-  calls with no safe wrapper (`sigaction` read-only query, `pre_exec`).
+* `unsafe` is denied crate-wide and allowed in `src/sys.rs` (Unix: two calls
+  with no safe wrapper, the `sigaction` read-only query and `pre_exec`) and in
+  `src/winsys.rs` (Windows: file locking, write-through replace, private ACLs
+  and reading an ACL, the job object, the console control handlers) only, each
+  call with a SAFETY comment.
   Each has a SAFETY comment; the `pre_exec` closure only makes raw syscalls.
 
 ## Platform support
 
-Linux and macOS are supported and tested in CI. Windows is unsupported and
-untested (not built in CI; integration tests are `cfg(unix)`). Unix-only
-pieces: file modes 0600/0700, directory fsync, `flock`, permission warnings,
-`exec` into the command, signal forwarding and exit codes (`128 + N`; on other
-platforms any exit status above 255 becomes 1). `PR_SET_DUMPABLE` and
-`PR_SET_PDEATHSIG` are Linux only (see invariant 6): on macOS `exec` and signal
-forwarding behave the same, but a `SIGKILL` of cloakenv under `--shield` leaves
+Linux, macOS and Windows (x86_64) are supported and tested in CI. Unix-only
+pieces and their Windows counterparts: file modes 0600/0700 (a protected ACL for
+the user, SYSTEM and Administrators, set at creation), the permission warnings
+(ACL warnings: any access for Everyone, Users or Authenticated Users to the
+vault or passphrase file, write access to the directory), directory fsync
+(`MoveFileExW` with `WRITE_THROUGH`), `flock` (`LockFileEx`), `exec` into the
+command and signal forwarding (cloakenv stays the parent: the command runs in a
+kill-on-close job object, created suspended and resumed once it is in the job,
+and cloakenv swallows Ctrl-C and Ctrl-Break while it waits, so the command
+decides what to do with them), and exit codes (`128 + N`; on Windows the 32-bit
+status is passed through). `PR_SET_DUMPABLE` and `PR_SET_PDEATHSIG` are Linux
+only (see invariant 6; Windows has the job object for the second, and nothing
+for the first): on macOS `exec` and signal forwarding behave the same, but a
+`SIGKILL` of cloakenv under `--shield` leaves
 the command running.
 
 ## Memory hygiene (best effort)
