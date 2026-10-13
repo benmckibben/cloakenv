@@ -87,6 +87,9 @@ try {
   if (Test-Path 'ran-anyway') { Fail 'the command ran despite a wrong passphrase' }
 
   Write-Host 'smoke test passed'
+  # pwsh -command exits with the last native command's code, which here is the
+  # deliberate wrong-passphrase run (125); say explicitly that all is well.
+  exit 0
 }
 finally {
   Set-Location $env:RUNNER_TEMP
