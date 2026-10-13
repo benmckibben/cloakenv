@@ -744,7 +744,8 @@ version; see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#--shield-streaming-re
 
 The release workflow ([CONTRIBUTING.md](CONTRIBUTING.md#releasing-maintainer))
 builds static musl binaries for Linux (x86_64 and aarch64) and binaries for
-macOS (Apple silicon and Intel). The test suite runs natively on x86_64 Linux
+macOS (Apple silicon and Intel), and a zip with a `cloakenv.exe` (C runtime
+linked in) for x86_64 Windows. The test suite runs natively on x86_64 Linux
 (glibc, and musl in the release workflow), on Apple-silicon macOS and on
 x86_64 Windows; the aarch64 Linux and Intel macOS builds are smoke-tested (under
 QEMU and Rosetta) but their tests are not run.

@@ -110,7 +110,9 @@ draft and run `cargo publish` by hand:
    to go green; its last job, "draft GitHub release", creates the draft (it fails,
    and creates nothing, if a release for the tag already exists).
 4. Check the draft on the Releases page: the notes are the changelog section for
-   the version, and the archives and `SHA256SUMS` are attached. Download them,
-   verify (`sha256sum --check SHA256SUMS`), and try an archive. The same files are
+   the version, and the archives (four `.tar.gz` and the Windows `.zip`) and `SHA256SUMS` are
+   attached. Download them, verify (`sha256sum --check SHA256SUMS`; on Windows
+   compare `Get-FileHash -Algorithm SHA256 <file>` with its line in
+   `SHA256SUMS`), and try an archive. The same files are
    also the `release-assets-X.Y.Z` artifact of the run.
 5. Publish the draft, and run `cargo publish` from the same commit.

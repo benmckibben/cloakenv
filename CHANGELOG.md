@@ -7,10 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-13
+
+Windows support. Nothing else changed.
+
 ### Added
 
 - **Windows support (x86_64, MSVC).** Built, linted and tested in CI on every
-  change, and tried by hand in PowerShell. See the README's platform section for
+  change, and tried by hand in PowerShell. A release archive for it
+  (`cloakenv-VERSION-x86_64-pc-windows-msvc.zip`, with the C runtime linked in
+  statically so no Visual C++ redistributable is needed) is attached to the
+  GitHub release and covered by `SHA256SUMS`; it is not code-signed. See the README's platform section for
   the limits. 32-bit and Arm Windows are not supported.
   - The vault lock (`LockFileEx`), so concurrent `cloakenv set` calls no longer
     lose updates, and a save that is moved into place write-through.
@@ -45,6 +52,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The README, SECURITY.md, CONTRIBUTING.md and docs/ARCHITECTURE.md describe
   Windows as supported on x86_64, with its known limitations and what has and
   has not been tried.
+
+### Known limitations
+
+What 0.2.0 does not do on Windows, and what nobody has checked. The limitations
+listed for 0.1.0 still apply on every platform; the README's platform section
+has the detail.
+
+- **Same-user processes are not kept out.** There is no equivalent of the
+  non-dumpable flag in use, so another process of your account can read
+  cloakenv's own environment and memory (the passphrase variable included) and
+  the command's environment. Memory is not locked and may reach the page file
+  or a hibernation image; crash dumps are not suppressed.
+- **Permissions are ACLs, and cloakenv only warns.** It never changes the ACL of
+  a file or directory that already exists.
+- **`--shield` filters bytes on the two pipes.** A program that writes UTF-16, or
+  writes to the console directly, is not covered.
+- **Tried by hand in PowerShell, on one machine, and by CI on Windows Server
+  2025.** Not tried: cmd.exe, Windows Terminal, Git Bash and mintty, Ctrl-Break,
+  a vault in a OneDrive or Dropbox folder, on a network share or on an exFAT
+  drive, a second Windows account, domain accounts, and a command that is itself
+  running in another job object.
+- **x86_64 only.** 32-bit and Arm Windows are not supported, and the Windows
+  binary is not code-signed, so SmartScreen or antivirus software may warn.
+- **Unchanged from 0.1.0:** the aarch64 Linux and Intel macOS release binaries
+  are smoke-tested, not test-suite-tested, and there has been no external
+  security review.
 
 ## [0.1.0] - 2026-10-12
 
@@ -267,5 +300,6 @@ has the detail; this is the short version.
 - **No external security review.** The code had an internal review and fixes
   before this release, which is not the same thing.
 
-[Unreleased]: https://github.com/benmckibben/cloakenv/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/benmckibben/cloakenv/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/benmckibben/cloakenv/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/benmckibben/cloakenv/releases/tag/v0.1.0
