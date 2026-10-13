@@ -451,6 +451,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             let status = runner::run(&command, vault, shield)?;
             let code = runner::exit_code(status);
+            // Exit codes on Windows are 32 bits wide (a crash is 0xC0000005, Ctrl-C
+            // is 0xC000013A) and ExitCode::from only takes a u8, which would turn
+            // all of them into 1. Nothing is left to clean up here: the vault
+            // was wiped when it was handed to run.
+            #[cfg(windows)]
+            std::process::exit(code);
+            #[cfg(not(windows))]
             return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
         }
     }

@@ -86,13 +86,12 @@ jobs:
           key: ${{ matrix.toolchain }}
       - run: cargo test --locked --no-fail-fast
 
-# Windows is not a supported platform yet (README, Platform support). This job
-  # MEASURES what works there: it never gates a merge (every step is
-  # continue-on-error, and it is not a required check). The summary at the end
-  # lists each step's outcome. Once the failures are fixed, the continue-on-error
-  # lines come out and the job becomes a normal required check.
+  # x86_64 Windows (MSVC). The README still lists Windows as unsupported until
+  # the remaining work lands, but this job is a required check so that what
+  # already works cannot regress. It is named like the test matrix; besides
+  # `cargo test` it builds, runs clippy and a scripted smoke test of the binary.
   windows:
-    name: windows (measuring, non-gating)
+    name: test (windows-2025, stable)
     runs-on: windows-2025
     if: github.event_name != 'schedule'
     timeout-minutes: 30
@@ -109,23 +108,15 @@ jobs:
         with:
           key: windows-stable
       - name: build
-        id: build
-        continue-on-error: true
         run: cargo build --locked --target x86_64-pc-windows-msvc
       - name: clippy
-        id: clippy
-        continue-on-error: true
         run: cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
       - name: test
-        id: test
-        continue-on-error: true
         run: cargo test --locked --no-fail-fast --target x86_64-pc-windows-msvc
       # Scripted end-to-end behaviour of the built binary. Passphrase comes from
       # the environment (there is no terminal in CI); the throwaway secrets are
       # random-looking strings that exist only in this job.
       - name: smoke
-        id: smoke
-        continue-on-error: true
         shell: pwsh
         run: |
           $exe = Join-Path $PWD 'target/x86_64-pc-windows-msvc/debug/cloakenv.exe'
@@ -167,20 +158,6 @@ jobs:
           icacls $vault; icacls (Join-Path $work '.cloak')
           Write-Host "--- smoke: $failed check(s) failed ---"
           if ($failed -gt 0) { exit 1 }
-      - name: summary
-        if: always()
-        shell: pwsh
-        run: |
-          $rows = @(
-            @('build', '${{ steps.build.outcome }}'),
-            @('clippy', '${{ steps.clippy.outcome }}'),
-            @('test', '${{ steps.test.outcome }}'),
-            @('smoke', '${{ steps.smoke.outcome }}')
-          )
-          $md = "### Windows measurement (non-gating)`n`n| step | outcome |`n|---|---|`n"
-          foreach ($r in $rows) { $md += "| $($r[0]) | $($r[1]) |`n" }
-          $md | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
-          $md
 
   # Dependency audit against deny.toml: RustSec advisories (vulnerable, unsound,
   # unmaintained, yanked), licence allow-list, bans (wildcards, duplicates) and

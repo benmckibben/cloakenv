@@ -8,7 +8,11 @@ use std::io::{self, Write};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 #[cfg(not(unix))]
+use std::sync::mpsc;
+#[cfg(not(unix))]
 use std::thread;
+#[cfg(not(unix))]
+use std::time::Instant;
 
 use aho_corasick::automaton::Automaton;
 use aho_corasick::dfa;
@@ -507,8 +511,13 @@ fn build_command(program: &OsStr, args: &[OsString], vault: &Vault) -> Command {
 ///   command exits even if a leftover background process still holds the
 ///   pipes open (see `DRAIN_IDLE` / `DRAIN_MAX` in the supervisor).
 ///
-/// The CLI only uses this for `--shield`; without it, it replaces itself with
-/// the command via [`exec_replace`].
+/// On Windows cloakenv also stays the parent, with or without `--shield`: the
+/// command runs in a job object that kills it and its descendants if cloakenv
+/// dies, Ctrl-C and Ctrl-Break are left to the command, and its full 32-bit
+/// exit code is reported (see [`exit_code`]).
+///
+/// On Unix the CLI only uses this for `--shield`; without it, it replaces
+/// itself with the command via [`exec_replace`].
 pub fn run(command: &[OsString], vault: Vault, shield: bool) -> Result<ExitStatus, RunError> {
     let (program, args) = command.split_first().ok_or(RunError::NoCommand)?;
 
@@ -532,22 +541,83 @@ pub fn run(command: &[OsString], vault: Vault, shield: bool) -> Result<ExitStatu
     }
     #[cfg(not(unix))]
     {
-        let mut child = cmd.spawn().map_err(|e| spawn_error(e, program))?;
-        // The child has its copy; wipe ours (and free the Command's).
-        drop(cmd);
-        drop(vault);
-        let Some((out_redactor, err_redactor)) = redactors else {
-            return child.wait().map_err(RunError::Wait);
-        };
-        let stdout = child.stdout.take().expect("stdout is piped");
-        let stderr = child.stderr.take().expect("stderr is piped");
-        let out_thread = thread::spawn(move || pump(stdout, io::stdout(), out_redactor));
-        let err_thread = thread::spawn(move || pump(stderr, io::stderr(), err_redactor));
+        supervise_portable(cmd, program, redactors, vault)
+    }
+}
+
+/// How long to keep pumping output after the command has exited, when a
+/// leftover background process still holds the pipes open (the counterpart of
+/// `DRAIN_MAX` in the Unix supervisor).
+#[cfg(not(unix))]
+const DRAIN_MAX: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `run` where there is no Unix supervisor (Windows). The command is a child of
+/// cloakenv for the whole run.
+///
+/// On Windows it runs inside a job object that kills it and everything it
+/// started if cloakenv dies, and cloakenv stays alive through Ctrl-C and
+/// Ctrl-Break so the command, which receives them from the console itself,
+/// handles them and cloakenv reports how it ended. When the command exits
+/// normally the job is released, so a background process it left behind keeps
+/// running, as on Unix.
+#[cfg(not(unix))]
+fn supervise_portable(
+    mut cmd: Command,
+    program: &OsStr,
+    redactors: Option<(Redactor, Redactor)>,
+    vault: Vault,
+) -> Result<ExitStatus, RunError> {
+    #[cfg(windows)]
+    let _interrupts = crate::winsys::InterruptGuard::install();
+    #[cfg(windows)]
+    let (mut child, job) =
+        crate::winsys::spawn_confined(&mut cmd).map_err(|e| spawn_error(e, program))?;
+    #[cfg(not(windows))]
+    let mut child = cmd.spawn().map_err(|e| spawn_error(e, program))?;
+    // The child has its copy; wipe ours (and free the Command's).
+    drop(cmd);
+    drop(vault);
+    let Some((out_redactor, err_redactor)) = redactors else {
         let status = child.wait().map_err(RunError::Wait);
+        #[cfg(windows)]
+        if let Some(job) = job {
+            job.release();
+        }
+        return status;
+    };
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let out_done = done_tx.clone();
+    let out_thread = thread::spawn(move || {
+        pump(stdout, io::stdout(), out_redactor);
+        let _ = out_done.send(());
+    });
+    let err_thread = thread::spawn(move || {
+        pump(stderr, io::stderr(), err_redactor);
+        let _ = done_tx.send(());
+    });
+    let status = child.wait().map_err(RunError::Wait);
+    #[cfg(windows)]
+    if let Some(job) = job {
+        job.release();
+    }
+    // Normally both pipes reach EOF as the command exits. A leftover background
+    // process that inherited them keeps them open, so wait for a bounded time
+    // and then leave the pumps behind (they end with the process).
+    let deadline = Instant::now() + DRAIN_MAX;
+    let mut finished = 0;
+    while finished < 2 {
+        match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(()) => finished += 1,
+            Err(_) => break,
+        }
+    }
+    if finished == 2 {
         let _ = out_thread.join();
         let _ = err_thread.join();
-        status
     }
+    status
 }
 
 /// Replaces the cloakenv process with `command` (`execve`), with every vault

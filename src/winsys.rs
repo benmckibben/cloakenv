@@ -9,22 +9,44 @@
 //!   MOVEFILE_WRITE_THROUGH`, so the rename that publishes a new vault does not
 //!   return before it has reached the disk (the equivalent of the directory
 //!   `fsync` after the rename on Unix).
+//! * [`spawn_confined`] and [`Job`]: start the command inside a job object that
+//!   kills every process in it when cloakenv goes away, however it goes (the
+//!   counterpart of `PR_SET_PDEATHSIG` on Linux, and stronger: it covers the
+//!   command's descendants too).
+//! * [`InterruptGuard`]: keeps cloakenv alive through Ctrl-C and Ctrl-Break
+//!   while the command runs, so the command (which gets them from the console
+//!   itself) decides what to do and cloakenv reports its exit status.
 
+use std::ffi::c_void;
 use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::process::CommandExt;
 use std::path::Path;
+use std::process::{Child, Command};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_REPLACE_EXISTING,
     MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
+use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
 use windows_sys::Win32::System::IO::OVERLAPPED;
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+};
+use windows_sys::Win32::System::Threading::{
+    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+};
 
 /// Takes an exclusive lock on the first byte of `file`. With `block` false, a
 /// lock held elsewhere is reported as [`io::ErrorKind::WouldBlock`], as the
@@ -91,4 +113,184 @@ pub fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
         }
     }
     Err(last.unwrap_or_else(|| io::Error::other("replace failed")))
+}
+
+/// A job object that kills every process in it when its last handle is closed
+/// (which also happens if cloakenv is killed or crashes).
+pub struct Job {
+    handle: OwnedHandle,
+}
+
+impl Job {
+    #[allow(unsafe_code)]
+    fn new() -> io::Result<Self> {
+        // SAFETY: no security attributes and no name; the returned handle, if
+        // not null, is a new job object that nothing else owns.
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a valid handle that we own and wrap exactly once.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let job = Self { handle };
+        job.set_kill_on_close(true)?;
+        Ok(job)
+    }
+
+    #[allow(unsafe_code)]
+    fn set_kill_on_close(&self, on: bool) -> io::Result<()> {
+        // SAFETY: the struct is plain data for which all-zero is a valid value.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        if on {
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        }
+        // SAFETY: `info` outlives the call and the size passed is its size;
+        // the handle is a live job object owned by `self`.
+        let ok = unsafe {
+            SetInformationJobObject(
+                self.handle.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast::<c_void>(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[allow(unsafe_code)]
+    fn assign(&self, child: &Child) -> io::Result<()> {
+        // SAFETY: both handles are live and owned by `self` and `child`.
+        let ok =
+            unsafe { AssignProcessToJobObject(self.handle.as_raw_handle(), child.as_raw_handle()) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Stops the job from killing anything when it is closed: the command has
+    /// exited normally, and a background process it left behind is none of our
+    /// business (on Unix such a process is left alone too). Without this call,
+    /// dropping the job kills everything still in it.
+    pub fn release(self) {
+        let _ = self.set_kill_on_close(false);
+    }
+}
+
+/// Starts `cmd` inside a new job object that kills the whole process tree if
+/// cloakenv dies, and returns the child and the job.
+///
+/// The process is created suspended, put in the job, and only then resumed, so
+/// that nothing it starts can run before it is confined. If the job cannot be
+/// created or joined (an old Windows, or a parent job that forbids it) this says
+/// so on stderr and starts the command without one: cloakenv worked that way
+/// before, and refusing to run would be worse. If the process cannot be
+/// resumed it is killed and the error returned.
+pub fn spawn_confined(cmd: &mut Command) -> io::Result<(Child, Option<Job>)> {
+    let job = match Job::new() {
+        Ok(job) => job,
+        Err(e) => {
+            crate::elog!(
+                "cloakenv: warning: cannot create a job object ({e}); the command will keep running if cloakenv is killed"
+            );
+            return Ok((cmd.spawn()?, None));
+        }
+    };
+    cmd.creation_flags(CREATE_SUSPENDED);
+    let mut child = cmd.spawn()?;
+    let job = match job.assign(&child) {
+        Ok(()) => Some(job),
+        Err(e) => {
+            crate::elog!(
+                "cloakenv: warning: cannot put the command in a job object ({e}); it will keep running if cloakenv is killed"
+            );
+            None
+        }
+    };
+    if let Err(e) = resume_process(child.id()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    Ok((child, job))
+}
+
+/// Resumes the (single) thread of a process created with `CREATE_SUSPENDED`.
+/// std does not hand out the primary thread's handle, so find it by process id.
+#[allow(unsafe_code)]
+fn resume_process(pid: u32) -> io::Result<()> {
+    // SAFETY: a thread snapshot of the whole system; no pointers involved.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: valid handle returned just above, wrapped exactly once.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    // SAFETY: plain data for which all-zero is valid; dwSize is set below as
+    // the API requires.
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut resumed = false;
+    // SAFETY: the snapshot handle is live and `entry` is a valid, sized struct.
+    let mut more = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) };
+    while more != 0 {
+        if entry.th32OwnerProcessID == pid {
+            // SAFETY: opening a thread by id; the result is checked.
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if !thread.is_null() {
+                // SAFETY: valid handle, wrapped exactly once (closed on drop).
+                let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
+                // SAFETY: live thread handle opened with suspend/resume access.
+                if unsafe { ResumeThread(thread.as_raw_handle()) } != u32::MAX {
+                    resumed = true;
+                }
+            }
+        }
+        // SAFETY: as for Thread32First.
+        more = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) };
+    }
+    if resumed {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "cannot start the command (its main thread could not be resumed)",
+        ))
+    }
+}
+
+/// The console control handler: swallow Ctrl-C and Ctrl-Break, pass everything
+/// else (console close, logoff, shutdown) to the next handler, which ends
+/// cloakenv and, through the job object, the command.
+#[allow(unsafe_code)]
+unsafe extern "system" fn swallow_interrupts(ctrl_type: u32) -> i32 {
+    i32::from(ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT)
+}
+
+/// While alive, cloakenv does not die from Ctrl-C or Ctrl-Break.
+///
+/// Both are delivered to every process attached to the console, so the command
+/// receives them directly and handles them (or dies of them) on its own. If
+/// cloakenv died first, the job object would kill the command before it could
+/// clean up. The handler is a routine, not the "ignore" flag, so the command
+/// does not inherit it.
+pub struct InterruptGuard;
+
+impl InterruptGuard {
+    #[allow(unsafe_code)]
+    pub fn install() -> Self {
+        // SAFETY: registers a plain function with no state.
+        unsafe { SetConsoleCtrlHandler(Some(swallow_interrupts), 1) };
+        Self
+    }
+}
+
+impl Drop for InterruptGuard {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: removes the routine registered by `install`.
+        unsafe { SetConsoleCtrlHandler(Some(swallow_interrupts), 0) };
+    }
 }
