@@ -6,7 +6,12 @@
 //!   the entries responsible. Otherwise the only symptom is the operating
 //!   system's `failed to spawn: Argument list too long`, which names nothing.
 //!   The limits are those of Linux (see [`MAX_ENV_ENTRY_LEN`] and
-//!   [`kernel_arg_limit`]); other platforms are not checked.
+//!   [`kernel_arg_limit`]); other platforms are not checked. Windows has no
+//!   such limit in practice: 640 variables of 100,000 characters each (64 MB,
+//!   far more than a vault can hold) were passed to a child in a measurement.
+//! * On Windows, names are not case-sensitive, so two vault entries that differ
+//!   only in case would collapse into one variable, the last one silently
+//!   winning. [`case_collision`] finds such a pair and `run` refuses to start.
 
 use std::ffi::OsString;
 
@@ -22,7 +27,12 @@ use crate::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV};
 /// language-specific variables such as `PYTHONPATH` and `NODE_OPTIONS` only
 /// affect one runtime and are common, legitimate project settings.
 pub fn is_loader_variable(key: &str) -> bool {
-    key == "PATH" || key == "BASH_ENV" || key.starts_with("LD_") || key.starts_with("DYLD_")
+    // On Windows `Path` and `path` are the same variable as `PATH`.
+    #[cfg(windows)]
+    let named = |name: &str| key.eq_ignore_ascii_case(name);
+    #[cfg(not(windows))]
+    let named = |name: &str| key == name;
+    named("PATH") || named("BASH_ENV") || key.starts_with("LD_") || key.starts_with("DYLD_")
 }
 
 /// One line, naming the keys (never a value), for vault keys that
@@ -64,11 +74,29 @@ pub fn kernel_arg_limit() -> Option<usize> {
     }
 }
 
+/// The first pair of keys (in the order given) that differ only in ASCII case,
+/// as `(earlier, later)`. Windows treats such names as one variable.
+pub fn case_collision<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<(String, String)> {
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for key in keys {
+        if let Some(first) = seen.insert(key.to_ascii_uppercase(), key) {
+            if first != key {
+                return Some((first.to_owned(), key.to_owned()));
+            }
+        }
+    }
+    None
+}
+
 /// Checks the environment of the command about to be started: every vault
 /// entry must fit in one environment string, and all of it together with the
 /// inherited environment and `argv` must fit in what the kernel allows. The
 /// error names the vault entries to remove, never a value.
 pub fn check_run_environment(vault: &Vault, argv: &[OsString]) -> Result<(), VaultError> {
+    #[cfg(windows)]
+    if let Some((first, second)) = case_collision(vault.iter().map(|(k, _)| k)) {
+        return Err(VaultError::KeysDifferOnlyInCase { first, second });
+    }
     let Some(limit) = kernel_arg_limit() else {
         return Ok(());
     };
@@ -148,6 +176,61 @@ pub fn budget_overrun(
 mod tests {
     use super::*;
 
+    #[cfg(not(windows))]
+    #[test]
+    fn on_unix_names_are_case_sensitive_for_the_loader_list() {
+        assert!(!is_loader_variable("path"));
+        assert!(!is_loader_variable("Bash_Env"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_path_and_bash_env_match_in_any_case() {
+        for key in ["PATH", "Path", "path", "BASH_ENV", "bash_env"] {
+            assert!(is_loader_variable(key), "{key}");
+        }
+        assert!(!is_loader_variable("PATHEXT"));
+        assert!(!is_loader_variable("MY_PATH"));
+    }
+
+    #[test]
+    fn case_collisions_are_found_in_any_order_and_exact_repeats_are_not_one() {
+        assert_eq!(case_collision(["A", "B"]), None);
+        assert_eq!(
+            case_collision(["API_KEY", "Api_Key"]),
+            Some(("API_KEY".to_owned(), "Api_Key".to_owned()))
+        );
+        assert_eq!(
+            case_collision(["x", "Y", "X"]),
+            Some(("x".to_owned(), "X".to_owned()))
+        );
+        // A vault never holds the same key twice, but the helper must not call an
+        // exact repeat a collision.
+        assert_eq!(case_collision(["A", "A"]), None);
+        assert_eq!(case_collision(std::iter::empty::<&str>()), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_run_refuses_a_vault_with_two_spellings_of_one_name() {
+        let mut v = Vault::new();
+        v.set("TOKEN", "one".to_owned().into()).unwrap();
+        v.set("token", "two".to_owned().into()).unwrap();
+        match check_run_environment(&v, &[]) {
+            Err(e @ VaultError::KeysDifferOnlyInCase { .. }) => {
+                let shown = e.to_string();
+                assert!(
+                    shown.contains("TOKEN") && shown.contains("token"),
+                    "{shown}"
+                );
+                assert!(!shown.contains("one") && !shown.contains("two"), "{shown}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        v.remove("token");
+        assert!(check_run_environment(&v, &[]).is_ok());
+    }
+
     #[test]
     fn loader_variables_are_a_short_documented_list() {
         for key in [
@@ -172,7 +255,6 @@ mod tests {
             "LD",
             "DYLD",
             "API_KEY",
-            "path",
         ] {
             assert!(!is_loader_variable(key), "{key}");
         }

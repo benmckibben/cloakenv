@@ -61,5 +61,14 @@ pub const PASSPHRASE_FILE_ENV: &str = "CLOAKENV_PASSPHRASE_FILE";
 /// stripped from child environments, so the CLI refuses to store them: a
 /// vault entry under either name would be silently dropped at `run` time.
 pub fn is_reserved_key(key: &str) -> bool {
-    key == PASSPHRASE_ENV || key == PASSPHRASE_FILE_ENV
+    // Windows environment names are not case-sensitive: `cloakenv_passphrase` is
+    // the same variable there.
+    #[cfg(windows)]
+    {
+        key.eq_ignore_ascii_case(PASSPHRASE_ENV) || key.eq_ignore_ascii_case(PASSPHRASE_FILE_ENV)
+    }
+    #[cfg(not(windows))]
+    {
+        key == PASSPHRASE_ENV || key == PASSPHRASE_FILE_ENV
+    }
 }

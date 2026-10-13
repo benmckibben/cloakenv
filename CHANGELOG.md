@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Windows support (x86_64, MSVC).** Built, linted and tested in CI on every
+  change, and tried by hand in PowerShell. See the README's platform section for
+  the limits. 32-bit and Arm Windows are not supported.
+  - The vault lock (`LockFileEx`), so concurrent `cloakenv set` calls no longer
+    lose updates, and a save that is moved into place write-through.
+  - `run` always stays the parent. The command runs in a job object that kills
+    it and everything it started if cloakenv dies, and a command that exits
+    normally leaves any background process it started running, as on Unix.
+  - Ctrl-C and Ctrl-Break go to the command; cloakenv waits for it and reports
+    how it ended. `--shield` waits at most 3 seconds for leftover processes
+    that hold the output pipes.
+  - The command's exit code is reported as the full 32-bit value (a crash is
+    `0xC0000005`); it used to become `1` above 255.
+  - A directory, the vault, its lock file and the other files cloakenv creates
+    get a protected ACL that gives access to you, SYSTEM and Administrators
+    only. Existing files and directories are never changed.
+  - Warnings (not errors) when an existing vault file or passphrase file is
+    accessible to Everyone, Users or Authenticated Users, or when the vault
+    directory is writable by them.
+  - `run` refuses, exit 125, a vault with two names that differ only in case
+    (environment names are not case-sensitive on Windows), naming both. The
+    `PATH` and `BASH_ENV` warning and the reserved passphrase names match in any
+    case there.
+
+### Fixed
+
+- Windows: `cloakenv import <directory>` now reports "not a regular file" like
+  it does elsewhere, instead of "Access is denied".
+- Windows: pressing Ctrl-C at a hidden prompt no longer leaves the console
+  without echo and line input for the next program that reads a line.
+
+### Changed
+
+- The README, SECURITY.md, CONTRIBUTING.md and docs/ARCHITECTURE.md describe
+  Windows as supported on x86_64, with its known limitations and what has and
+  has not been tried.
+
 ## [0.1.0] - 2026-10-12
 
 The first release.

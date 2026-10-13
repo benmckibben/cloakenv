@@ -96,6 +96,10 @@ pub enum VaultError {
         largest: String,
     },
     #[error(
+        "{first} and {second} differ only in case, and environment variable names are not case-sensitive on Windows, so only one of them would reach the command; unset or rename one (`cloakenv unset`)"
+    )]
+    KeysDifferOnlyInCase { first: String, second: String },
+    #[error(
         "{} is not a regular file (it is a directory, device, pipe or socket); refusing to import it",
         .0.display()
     )]

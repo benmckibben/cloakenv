@@ -10,8 +10,10 @@ security tool, and most of the code exists to keep a handful of promises.
 
 ## Building and testing
 
-cloakenv supports Linux and macOS and needs Rust **1.87 or newer** (the MSRV, set
-as `rust-version` in `Cargo.toml`). Windows is unsupported.
+cloakenv supports Linux, macOS and Windows (x86_64) and needs Rust **1.87 or
+newer** (the MSRV, set as `rust-version` in `Cargo.toml`). Windows-only code is
+in `src/winsys.rs` and must be checked on the Windows CI job (a Linux machine
+can only type-check it with `cargo check --target x86_64-pc-windows-msvc`).
 
 ```bash
 cargo build --locked
