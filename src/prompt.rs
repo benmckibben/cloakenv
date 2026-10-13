@@ -69,6 +69,10 @@ pub use unix::read_hidden;
 
 #[cfg(not(unix))]
 pub fn read_hidden(prompt: &str) -> Result<Zeroizing<String>, PromptError> {
+    // rpassword switches echo off and restores it itself, but not when Ctrl-C
+    // kills the process in between; the guard covers that (see its docs).
+    #[cfg(windows)]
+    let _console = crate::winsys::ConsoleModeGuard::capture();
     rpassword::prompt_password(prompt)
         .map(Zeroizing::new)
         .map_err(PromptError::Io)
