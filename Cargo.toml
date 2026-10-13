@@ -62,9 +62,18 @@ signal-hook = { version = "0.4.5", default-features = false, features = ["iterat
 rpassword = "7.5.4"
 
 [target.'cfg(windows)'.dependencies]
-# Already in the tree through clap and rpassword; only the three feature
-# groups needed for LockFileEx and MoveFileExW are enabled.
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+# Already in the tree through clap and rpassword; only the feature groups
+# needed for file locking, the job object and the console handler are enabled.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
