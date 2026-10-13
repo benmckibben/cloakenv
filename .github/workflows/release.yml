@@ -285,6 +285,13 @@ jobs:
             runner: macos-15
             kind: macos
             arch: x86_64
+          # Windows: x86_64 MSVC only, built natively. The C runtime is linked
+          # statically so the exe needs no Visual C++ redistributable. The zip is
+          # not code-signed.
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            kind: windows
+            arch: x86_64
     env:
       VERSION: ${{ needs.guard.outputs.version }}
       TARGET: ${{ matrix.target }}
@@ -307,6 +314,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
 
       - name: Build
+        if: matrix.kind != 'windows'
         env:
           LINKER: ${{ matrix.linker }}
           # Smaller binaries, and no builder paths baked into them.
@@ -368,6 +376,7 @@ jobs:
           fi
 
       - name: Package
+        if: matrix.kind != 'windows'
         run: |
           set -euo pipefail
           name="cloakenv-$VERSION-$TARGET"
@@ -399,6 +408,91 @@ jobs:
           ls -l dist
           tar -tzvf "dist/$name.tar.gz"
 
+      - name: Build (Windows)
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        env:
+          # Smaller binary, and no PDB path baked into it.
+          CARGO_PROFILE_RELEASE_STRIP: "true"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:RUSTFLAGS = "-C target-feature=+crt-static --remap-path-prefix=$env:GITHUB_WORKSPACE=/build --remap-path-prefix=$env:USERPROFILE\.cargo=/cargo --remap-path-prefix=$env:USERPROFILE\.rustup=/rustup"
+          cargo build --release --locked --target $env:TARGET
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
+          Get-Item "target/$env:TARGET/release/cloakenv.exe" | Format-List Name, Length
+
+      - name: Check what was built (Windows)
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import os, struct, sys
+          path = os.path.join("target", os.environ["TARGET"], "release", "cloakenv.exe")
+          data = open(path, "rb").read()
+          off = struct.unpack_from("<I", data, 0x3C)[0]
+          if data[off:off + 4] != b"PE\0\0":
+              sys.exit("::error::not a PE file")
+          machine = struct.unpack_from("<H", data, off + 4)[0]
+          # Optional header starts 24 bytes after the PE signature; Subsystem is at +68.
+          subsystem = struct.unpack_from("<H", data, off + 24 + 68)[0]
+          print(f"machine: {machine:#06x} (want 0x8664, x86-64); subsystem: {subsystem} (want 3, console)")
+          if machine != 0x8664:
+              sys.exit("::error::expected an x86-64 binary")
+          if subsystem != 3:
+              sys.exit("::error::expected a console binary")
+          # No builder path (PDB path, source paths) in the binary.
+          for needle in (os.environ["GITHUB_WORKSPACE"], os.environ["USERPROFILE"]):
+              for variant in {needle, needle.replace("\\", "/")}:
+                  if variant.encode() in data or variant.encode("utf-16-le") in data:
+                      sys.exit(f"::error::the binary contains a builder path: {variant}")
+          # CRT linked statically: no Visual C++ runtime DLL in the import table.
+          lowered = data.lower()
+          for dll in (b"vcruntime140", b"msvcp140", b"api-ms-win-crt"):
+              if dll in lowered:
+                  sys.exit(f"::error::the binary imports {dll.decode()}: the C runtime is not static")
+          print("no builder path; C runtime is static")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw "binary check failed" }
+
+      - name: Package (Windows)
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $epoch = git log -1 --format=%ct
+          @'
+          import os, sys, time, zipfile
+          name = f"cloakenv-{os.environ['VERSION']}-{os.environ['TARGET']}"
+          epoch = int(sys.argv[1])
+          stamp = time.gmtime(max(epoch, 315532800))[:6]  # zip cannot go before 1980
+          files = [
+              (os.path.join("target", os.environ["TARGET"], "release", "cloakenv.exe"), "cloakenv.exe", 0o755),
+              ("LICENSE-MIT", "LICENSE-MIT", 0o644),
+              ("LICENSE-APACHE", "LICENSE-APACHE", 0o644),
+              ("README.md", "README.md", 0o644),
+              ("CHANGELOG.md", "CHANGELOG.md", 0o644),
+          ]
+          os.makedirs("dist", exist_ok=True)
+          out = os.path.join("dist", name + ".zip")
+          # Reproducible: sorted names, fixed timestamp, fixed modes.
+          with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for src, arc, mode in sorted(files, key=lambda f: f[1]):
+                  info = zipfile.ZipInfo(f"{name}/{arc}", date_time=stamp)
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.external_attr = (mode & 0xFFFF) << 16
+                  with open(src, "rb") as f:
+                      z.writestr(info, f.read(), compresslevel=9)
+          print(out, os.path.getsize(out))
+          '@ | python - $epoch
+          if ($LASTEXITCODE -ne 0) { throw "packaging failed" }
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Smoke test (Windows)
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: .github/scripts/smoke-test.ps1 -Archive "dist/cloakenv-$env:VERSION-$env:TARGET.zip" -Version $env:VERSION
+
       # Smoke-test the archive we're about to ship, not the build directory.
       # See .github/scripts/smoke-test.sh: init / set / list / run, --shield,
       # exit codes and fail-closed, with a dummy passphrase in a temp dir.
@@ -427,7 +521,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build-${{ matrix.target }}
-          path: dist/cloakenv-${{ needs.guard.outputs.version }}-${{ matrix.target }}.tar.gz
+          path: dist/cloakenv-${{ needs.guard.outputs.version }}-${{ matrix.target }}.${{ matrix.kind == 'windows' && 'zip' || 'tar.gz' }}
           if-no-files-found: error
           retention-days: 7
 
@@ -450,12 +544,13 @@ jobs:
         run: |
           set -euo pipefail
           ls -l
-          count=$(find . -maxdepth 1 -name 'cloakenv-*.tar.gz' | wc -l)
-          if [ "$count" -ne 4 ]; then
-            echo "::error::expected 4 archives, found $count"
+          tars=$(find . -maxdepth 1 -name 'cloakenv-*.tar.gz' | wc -l)
+          zips=$(find . -maxdepth 1 -name 'cloakenv-*.zip' | wc -l)
+          if [ "$tars" -ne 4 ] || [ "$zips" -ne 1 ]; then
+            echo "::error::expected 4 .tar.gz archives and 1 .zip, found $tars and $zips"
             exit 1
           fi
-          sha256sum cloakenv-*.tar.gz > SHA256SUMS
+          sha256sum cloakenv-*.tar.gz cloakenv-*.zip > SHA256SUMS
           cat SHA256SUMS
           sha256sum --check --strict SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -463,6 +558,7 @@ jobs:
           name: release-assets-${{ needs.guard.outputs.version }}
           path: |
             out/cloakenv-*.tar.gz
+            out/cloakenv-*.zip
             out/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
@@ -501,12 +597,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The artifact must still be intact, and must hold exactly the four
-          # archives and their checksums.
+          # The artifact must still be intact, and must hold exactly the five
+          # archives (four .tar.gz and the Windows .zip) and their checksums.
           (cd out && sha256sum --check --strict SHA256SUMS)
-          count=$(find out -maxdepth 1 -name 'cloakenv-*.tar.gz' | wc -l)
-          if [ "$count" -ne 4 ]; then
-            echo "::error::expected 4 archives in the artifact, found $count"
+          tars=$(find out -maxdepth 1 -name 'cloakenv-*.tar.gz' | wc -l)
+          zips=$(find out -maxdepth 1 -name 'cloakenv-*.zip' | wc -l)
+          if [ "$tars" -ne 4 ] || [ "$zips" -ne 1 ]; then
+            echo "::error::expected 4 .tar.gz archives and 1 .zip in the artifact, found $tars and $zips"
             exit 1
           fi
 
@@ -525,12 +622,14 @@ jobs:
             echo
             echo "---"
             echo
-            echo 'Verify a download with `sha256sum --check SHA256SUMS` (run it in the folder that holds the archives).'
+            echo 'Verify a download with `sha256sum --check SHA256SUMS` (run it in the folder that holds the archives); on Windows, compare `Get-FileHash -Algorithm SHA256 <file>` with the line for it in `SHA256SUMS`.'
+            echo
+            echo 'The Windows zip is not code-signed, so SmartScreen or antivirus software may warn about it.'
           } >> notes.md
 
           flags=(--draft --verify-tag --title "cloakenv $VERSION" --notes-file notes.md)
           # A pre-release tag (v1.2.3-rc.1) is marked as one.
           case "$VERSION" in *-*) flags+=(--prerelease) ;; esac
 
-          gh release create "$TAG" out/cloakenv-*.tar.gz out/SHA256SUMS "${flags[@]}"
+          gh release create "$TAG" out/cloakenv-*.tar.gz out/cloakenv-*.zip out/SHA256SUMS "${flags[@]}"
           echo "::notice::draft release created for $TAG: review it on the Releases page and publish it by hand"
