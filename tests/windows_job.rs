@@ -28,6 +28,31 @@ fn wait_until(timeout: Duration, done: impl Fn() -> bool) -> bool {
     done()
 }
 
+/// Runs `cloakenv <args>` with stdout and stderr sent to files, and returns how
+/// long it took to exit, its status and what it printed. `Command::output` is
+/// no use for these tests: on Windows a `start /b` child inherits the pipe
+/// handles, so `output()` would wait for the background process itself, which
+/// is exactly what is being measured.
+fn run_to_files(env: &Env, args: &[&str]) -> (Duration, std::process::ExitStatus, String) {
+    let out_path = env.path().join("out.txt");
+    let out = fs::File::create(&out_path).unwrap();
+    let err = out.try_clone().unwrap();
+    let start = Instant::now();
+    let status = env
+        .cmd(Some(PASS))
+        .args(args)
+        .stdout(out)
+        .stderr(err)
+        .status()
+        .unwrap();
+    let elapsed = start.elapsed();
+    (
+        elapsed,
+        status,
+        fs::read_to_string(out_path).unwrap_or_default(),
+    )
+}
+
 fn size(path: &Path) -> u64 {
     fs::metadata(path).map_or(0, |m| m.len())
 }
@@ -88,8 +113,8 @@ fn a_background_process_outlives_a_command_that_finished_normally() {
     )
     .unwrap();
 
-    let out = env.run(&["run", "--", launcher.to_str().unwrap()]);
-    assert!(out.status.success(), "launcher failed: {}", stderr(&out));
+    let (_, status, output) = run_to_files(&env, &["run", "--", launcher.to_str().unwrap()]);
+    assert!(status.success(), "launcher failed: {output}");
     assert!(
         !survivor.exists(),
         "the background process was too quick to prove anything"
@@ -119,10 +144,10 @@ fn the_exit_code_is_reported_with_shield_too() {
 #[test]
 fn shield_does_not_hang_on_a_background_process_holding_the_pipes() {
     let env = Env::init();
-    // The launcher exits at once; its child keeps stdout/stderr open for ~4 s.
+    // The launcher exits at once; its child keeps stdout/stderr open for ~8 s.
     fs::write(
         env.path().join("holder.bat"),
-        "@echo off\r\nping -n 5 127.0.0.1 >nul\r\n",
+        "@echo off\r\nping -n 9 127.0.0.1 >nul\r\n",
     )
     .unwrap();
     let launcher = env.path().join("launch_holder.bat");
@@ -131,13 +156,12 @@ fn shield_does_not_hang_on_a_background_process_holding_the_pipes() {
         "@echo off\r\necho started\r\nstart \"\" /b cmd /c \"%~dp0holder.bat\"\r\n",
     )
     .unwrap();
-    let start = Instant::now();
-    let out = env.run(&["run", "--shield", "--", launcher.to_str().unwrap()]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert!(stdout(&out).contains("started"));
+    let (elapsed, status, output) =
+        run_to_files(&env, &["run", "--shield", "--", launcher.to_str().unwrap()]);
+    assert!(status.success(), "{output}");
+    assert!(output.contains("started"), "{output}");
     assert!(
-        start.elapsed() < Duration::from_secs(4),
-        "run waited for the leftover process ({:?}); the drain is meant to be bounded to ~3 s",
-        start.elapsed()
+        elapsed < Duration::from_secs(6),
+        "run waited for the leftover process ({elapsed:?}); the drain is meant to be bounded to ~3 s"
     );
 }
