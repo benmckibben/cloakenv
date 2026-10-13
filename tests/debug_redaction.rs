@@ -78,7 +78,9 @@ const DERIVES_DEBUG: &[(&str, &[&str])] = &[
     ("envcheck.rs", &["Overrun"]), // key names and byte counts
     ("input.rs", &["InputError"]),
     ("main.rs", &["Cli"]),
-    ("perms.rs", &["Exposure"]),     // a two-variant tag
+    // Exposure is a two-variant tag; AclEntry is a SID string, an access mask and
+    // two flags read from a file's ACL (no secret can reach it).
+    ("perms.rs", &["AclEntry", "Exposure"]),
     ("prompt.rs", &["PromptError"]), // never carries what was typed
     ("runner.rs", &["RunError"]),
     ("vault.rs", &["VaultError", "VaultLock"]),
