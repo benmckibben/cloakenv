@@ -7,7 +7,9 @@
 //! Each warning is one line and names only paths and octal modes; no
 //! passphrase or vault content is ever included.
 //!
-//! The mode checks are Unix-only. The symbolic-link checks apply everywhere.
+//! The mode checks are Unix-only; on Windows the equivalent is a check of the
+//! file's ACL (see [`AclEntry`] and [`acl_exposure`]). The symbolic-link checks
+//! apply everywhere.
 
 use std::fs;
 use std::path::Path;
@@ -134,6 +136,92 @@ impl Accounts {
     }
 }
 
+/// One entry of a Windows discretionary ACL, reduced to what the exposure rule
+/// needs. Read from the file by `winsys::read_dacl` on Windows; plain data here
+/// so that the rule is testable on every platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclEntry {
+    /// The trustee, as a string SID (`S-1-5-32-545`).
+    pub sid: String,
+    /// The access mask the entry grants or denies.
+    pub mask: u32,
+    /// True for an "allow" entry, false for a "deny" entry.
+    pub allow: bool,
+    /// True for an entry that is only inherited by children (a directory's
+    /// `(IO)` entries) and does not apply to the object itself.
+    pub inherit_only: bool,
+}
+
+/// `FILE_WRITE_DATA`/`FILE_ADD_FILE`, `FILE_APPEND_DATA`/`FILE_ADD_SUBDIRECTORY`,
+/// `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`, `GENERIC_WRITE` and
+/// `GENERIC_ALL`: any of them lets the trustee replace or remove entries in a
+/// directory, or change who may.
+const WRITE_MASK: u32 = 0x0000_0002
+    | 0x0000_0004
+    | 0x0000_0040
+    | 0x0001_0000
+    | 0x0004_0000
+    | 0x0008_0000
+    | 0x4000_0000
+    | 0x1000_0000;
+
+/// The groups that mean "other people on this machine": Everyone, the local
+/// Users group and Authenticated Users. Administrators, SYSTEM and the owner
+/// are expected to have access and are never reported.
+fn broad_group(sid: &str) -> Option<&'static str> {
+    match sid {
+        "S-1-1-0" => Some("Everyone"),
+        "S-1-5-32-545" => Some("BUILTIN\\Users"),
+        "S-1-5-11" => Some("Authenticated Users"),
+        _ => None,
+    }
+}
+
+/// Which of Everyone, Users and Authenticated Users the ACL grants access to.
+///
+/// With `writes_only` (a vault *directory*) only an entry that allows writing is
+/// counted, as on Unix where only a writable directory is reported; without it
+/// (the vault file, the passphrase file) any access counts, like the Unix check
+/// for group/other read or write. Entries that only apply to children are
+/// ignored. "Deny" entries are ignored too, which can only make the answer err
+/// towards warning, as the rest of this module does. A missing DACL (which
+/// Windows treats as "everyone may do anything") is reported by the caller as an
+/// Everyone entry. The result has each group once, in the order first seen.
+pub fn acl_exposure(entries: &[AclEntry], writes_only: bool) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for e in entries {
+        if !e.allow || e.inherit_only || e.mask == 0 {
+            continue;
+        }
+        if writes_only && e.mask & WRITE_MASK == 0 {
+            continue;
+        }
+        if let Some(name) = broad_group(&e.sid) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// The ACL of `path` as seen by the exposure rule, or `None` where ACLs do not
+/// exist or the path cannot be inspected.
+#[cfg(windows)]
+fn acl_of(path: &Path) -> Option<Vec<AclEntry>> {
+    crate::winsys::read_dacl(path)
+}
+
+/// Joins group names for a warning: `A`, `A and B`, `A, B and C`.
+#[cfg(windows)]
+fn join_names(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
 fn is_symlink(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
@@ -206,6 +294,18 @@ fn vault_warnings_with(
         }
     }
 
+    #[cfg(windows)]
+    if let Some(acl) = acl_of(dir) {
+        let who = acl_exposure(&acl, true);
+        if !who.is_empty() {
+            out.push(format!(
+                "vault directory {} can be written to by {} (Windows ACL); they could replace the vault. cloakenv creates a directory it makes for you, SYSTEM and Administrators only",
+                dir.display(),
+                join_names(&who)
+            ));
+        }
+    }
+
     if check_file {
         if is_symlink(vault) {
             out.push(format!(
@@ -219,6 +319,17 @@ fn vault_warnings_with(
                 out.push(format!(
                     "vault file {} is group/world-readable or writable (mode {mode:04o}, expected 0600)",
                     vault.display()
+                ));
+            }
+        }
+        #[cfg(windows)]
+        if let Some(acl) = acl_of(vault) {
+            let who = acl_exposure(&acl, false);
+            if !who.is_empty() {
+                out.push(format!(
+                    "vault file {} can be read or changed by {} (Windows ACL); expected access for you, SYSTEM and Administrators only",
+                    vault.display(),
+                    join_names(&who)
                 ));
             }
         }
@@ -244,7 +355,18 @@ pub fn passphrase_file_warnings(file: &Path) -> Vec<String> {
             ));
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    if let Some(acl) = acl_of(file) {
+        let who = acl_exposure(&acl, false);
+        if !who.is_empty() {
+            out.push(format!(
+                "passphrase file {} can be read or changed by {} (Windows ACL); anyone who can read it can decrypt the vault",
+                file.display(),
+                join_names(&who)
+            ));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = file;
     out
 }
@@ -470,5 +592,115 @@ staff:x:50:ben
         assert!(w[0].contains("passphrase file"));
         // Missing files are reported by the read itself, not here.
         assert!(passphrase_file_warnings(&t.path().join("nope")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use super::*;
+
+    fn allow(sid: &str, mask: u32) -> AclEntry {
+        AclEntry {
+            sid: sid.into(),
+            mask,
+            allow: true,
+            inherit_only: false,
+        }
+    }
+
+    const USERS: &str = "S-1-5-32-545";
+    const AUTH: &str = "S-1-5-11";
+    const EVERYONE: &str = "S-1-1-0";
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINS: &str = "S-1-5-32-544";
+    const ME: &str = "S-1-5-21-1-2-3-1001";
+    const READ: u32 = 0x1200A9; // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+    const MODIFY: u32 = 0x1301BF;
+    const FULL: u32 = 0x1F01FF;
+
+    #[test]
+    fn an_owner_system_and_admins_acl_is_clean() {
+        let acl = [allow(ME, FULL), allow(SYSTEM, FULL), allow(ADMINS, FULL)];
+        assert!(acl_exposure(&acl, false).is_empty());
+        assert!(acl_exposure(&acl, true).is_empty());
+    }
+
+    #[test]
+    fn a_file_is_exposed_by_any_access_for_the_broad_groups() {
+        assert_eq!(
+            acl_exposure(&[allow(USERS, READ)], false),
+            ["BUILTIN\\Users"]
+        );
+        assert_eq!(
+            acl_exposure(&[allow(AUTH, MODIFY)], false),
+            ["Authenticated Users"]
+        );
+        assert_eq!(acl_exposure(&[allow(EVERYONE, 1)], false), ["Everyone"]);
+    }
+
+    #[test]
+    fn a_directory_is_exposed_only_by_write_access() {
+        // The default for a folder under C:\dev: Users read, Authenticated Users modify.
+        let acl = [allow(USERS, READ), allow(AUTH, MODIFY), allow(ADMINS, FULL)];
+        assert_eq!(acl_exposure(&acl, true), ["Authenticated Users"]);
+        assert_eq!(
+            acl_exposure(&acl, false),
+            ["BUILTIN\\Users", "Authenticated Users"]
+        );
+        assert!(acl_exposure(&[allow(USERS, READ)], true).is_empty());
+    }
+
+    #[test]
+    fn each_write_bit_counts_for_a_directory() {
+        for bit in [
+            0x2,
+            0x4,
+            0x40,
+            0x10000,
+            0x40000,
+            0x80000,
+            0x4000_0000,
+            0x1000_0000,
+        ] {
+            assert_eq!(
+                acl_exposure(&[allow(USERS, bit)], true),
+                ["BUILTIN\\Users"],
+                "{bit:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherit_only_deny_and_empty_entries_are_ignored() {
+        let mut inherit_only = allow(AUTH, MODIFY);
+        inherit_only.inherit_only = true;
+        let mut deny = allow(USERS, FULL);
+        deny.allow = false;
+        let acl = [inherit_only, deny, allow(EVERYONE, 0)];
+        assert!(acl_exposure(&acl, false).is_empty());
+        assert!(acl_exposure(&acl, true).is_empty());
+    }
+
+    #[test]
+    fn each_group_is_named_once_in_the_order_first_seen() {
+        let acl = [
+            allow(AUTH, MODIFY),
+            allow(USERS, READ),
+            allow(AUTH, FULL),
+            allow(USERS, FULL),
+        ];
+        assert_eq!(
+            acl_exposure(&acl, false),
+            ["Authenticated Users", "BUILTIN\\Users"]
+        );
+    }
+
+    #[test]
+    fn other_accounts_are_not_reported() {
+        let acl = [
+            allow("S-1-5-21-1-2-3-1002", FULL),
+            allow("S-1-5-32-546", FULL),
+        ];
+        assert!(acl_exposure(&acl, false).is_empty());
     }
 }

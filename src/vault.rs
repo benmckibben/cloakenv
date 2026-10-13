@@ -662,14 +662,7 @@ fn backup_vault_at(path: &Path, unix_secs: u64) -> Result<PathBuf, VaultError> {
             backup_name.push(format!("-{attempt}"));
         }
         let backup = path.with_file_name(backup_name);
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut dest = match opts.open(&backup) {
+        let mut dest = match open_private_file(&backup, Create::New, false) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(VaultError::io("cannot back up the vault", &backup, e)),
@@ -793,15 +786,8 @@ fn open_lock_file(vault: &Path) -> Result<fs::File, VaultError> {
     create_private_dir(&parent)
         .map_err(|e| VaultError::io("cannot create vault directory", &parent, e))?;
     let lock_path = VaultLock::path_for(vault);
-    let mut opts = fs::OpenOptions::new();
     // Rust opens files with O_CLOEXEC, so the lock never leaks into children.
-    opts.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(&lock_path)
+    open_private_file(&lock_path, Create::OpenOrCreate, true)
         .map_err(|e| VaultError::io("cannot open vault lock", &lock_path, e))
 }
 
@@ -905,14 +891,7 @@ fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
     let tmp = parent.join(tmp_name);
 
     let result = (|| -> io::Result<()> {
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
+        let mut f = open_private_file(&tmp, Create::New, false)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
@@ -943,15 +922,60 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-fn create_private_dir(dir: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
+/// Whether `open_private_file` may open a file that already exists.
+#[derive(Clone, Copy)]
+enum Create {
+    /// Fail with `AlreadyExists` if the file is there.
+    New,
+    /// Open the file, creating it if it is missing.
+    OpenOrCreate,
+}
+
+/// Opens (and if need be creates) a file for writing, plus reading if `read`,
+/// that only its creator may use: mode 0600 on Unix, and on Windows a protected
+/// ACL for the current user, SYSTEM and Administrators only, set at creation.
+/// An existing file keeps its mode or ACL.
+fn open_private_file(path: &Path, how: Create, read: bool) -> io::Result<fs::File> {
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+        crate::winsys::open_private_file(path, matches!(how, Create::New), read)
     }
-    builder.create(dir)
+    #[cfg(not(windows))]
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.read(read).write(true);
+        match how {
+            Create::New => opts.create_new(true),
+            Create::OpenOrCreate => opts.create(true).truncate(false),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(path)
+    }
+}
+
+/// Creates `dir` and missing parents that only their creator may use: mode 0700
+/// on Unix, and on Windows a protected ACL for the current user, SYSTEM and
+/// Administrators only. An existing directory is left as it is.
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::winsys::create_private_dir(dir)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(dir)
+    }
 }
 
 #[cfg(test)]

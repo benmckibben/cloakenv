@@ -13,6 +13,12 @@
 //!   kills every process in it when cloakenv goes away, however it goes (the
 //!   counterpart of `PR_SET_PDEATHSIG` on Linux, and stronger: it covers the
 //!   command's descendants too).
+//! * [`create_private_dir`], [`open_private_file`]: create a directory or file
+//!   with a *protected* DACL that grants full access to the current user,
+//!   SYSTEM and Administrators and to nobody else, set at creation so that there
+//!   is no moment when the object has the inherited ACL (the counterpart of
+//!   mode 0700 and 0600 on Unix).
+//! * [`read_dacl`]: the ACL of a path, for the permission warnings.
 //! * [`ConsoleModeGuard`]: puts the console's input mode back if cloakenv is
 //!   killed by Ctrl-C (or the window is closed) while a hidden prompt has echo
 //!   switched off.
@@ -32,11 +38,22 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, INVALID_HANDLE_VALUE,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    GetNamedSecurityInfoW, SE_FILE_OBJECT,
+};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+    DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetTokenInformation, INHERIT_ONLY_ACE,
+    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    LockFileEx, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS,
 };
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
@@ -52,7 +69,8 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    CREATE_SUSPENDED, GetCurrentProcess, OpenProcessToken, OpenThread, ResumeThread,
+    THREAD_SUSPEND_RESUME,
 };
 
 /// Takes an exclusive lock on the first byte of `file`. With `block` false, a
@@ -380,4 +398,293 @@ impl Drop for ConsoleModeGuard {
         // SAFETY: removes the routine registered by `capture`.
         unsafe { SetConsoleCtrlHandler(Some(restore_on_ctrl), 0) };
     }
+}
+
+// ---------------------------------------------------------------------------
+// Private files and directories (ACLs)
+// ---------------------------------------------------------------------------
+
+/// A block allocated by the system (`LocalAlloc`) that is freed on drop.
+struct LocalBlock(*mut c_void);
+
+impl Drop for LocalBlock {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the pointer came from an API documented to return memory
+            // that is released with `LocalFree`, and is freed only here.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+}
+
+fn wide(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain([0]).collect()
+}
+
+fn from_wide(ptr: *const u16) -> String {
+    let mut len = 0;
+    // SAFETY: the callers pass a NUL-terminated string from a system API.
+    #[allow(unsafe_code)]
+    while unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: `len` code units were just read from the same allocation.
+    #[allow(unsafe_code)]
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+/// The string SID (`S-1-5-21-...`) of the user this process runs as.
+#[allow(unsafe_code)]
+fn current_user_sid() -> io::Result<String> {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: the pseudo handle from GetCurrentProcess needs no closing; `token`
+    // is a valid out-pointer.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a new handle that we own, wrapped exactly once.
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut needed = 0u32;
+    // SAFETY: a size query: a null buffer of length 0 is how the API is asked
+    // how much room TokenUser needs; it is expected to fail.
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if needed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // u64 elements so that the buffer is aligned for TOKEN_USER's pointers.
+    let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+    // SAFETY: `buf` is at least `needed` bytes and `needed` is a valid out-pointer.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buf.as_mut_ptr().cast::<c_void>(),
+            needed,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: on success the buffer holds a TOKEN_USER whose SID points inside
+    // the same buffer, which is alive for this whole function.
+    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    sid_to_string(sid)
+}
+
+#[allow(unsafe_code)]
+fn sid_to_string(sid: *mut c_void) -> io::Result<String> {
+    let mut text: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `sid` is a valid SID and `text` a valid out-pointer.
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _free = LocalBlock(text.cast::<c_void>());
+    Ok(from_wide(text))
+}
+
+/// A security descriptor that is built from the owner's SID and freed on drop,
+/// plus the `SECURITY_ATTRIBUTES` that point at it.
+struct PrivateAttributes {
+    attributes: SECURITY_ATTRIBUTES,
+    _descriptor: LocalBlock,
+}
+
+impl PrivateAttributes {
+    /// A *protected* DACL (nothing is inherited from the parent) with a full
+    /// access entry each for the current user, SYSTEM (`SY`) and Administrators
+    /// (`BA`). `inheritable` adds the container and object inherit flags so that
+    /// the entries pass on to what is created inside a directory.
+    #[allow(unsafe_code)]
+    fn new(inheritable: bool) -> io::Result<Self> {
+        let sid = current_user_sid()?;
+        let flags = if inheritable { "OICI" } else { "" };
+        let sddl = format!("D:P(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)(A;{flags};FA;;;{sid})");
+        let sddl: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
+        let mut descriptor: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `sddl` is NUL-terminated; revision 1 is SDDL_REVISION_1;
+        // `descriptor` is a valid out-pointer and a null size is allowed.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            attributes: SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                // Never inheritable: a command started by `run` must not get
+                // the vault's handles.
+                bInheritHandle: 0,
+            },
+            _descriptor: LocalBlock(descriptor),
+        })
+    }
+}
+
+/// Creates `dir` and any missing parent directories, each with a private,
+/// protected ACL (see [`PrivateAttributes::new`]). A directory that already
+/// exists is left exactly as it is, like the Unix `create_private_dir` leaves
+/// an existing directory's mode alone.
+#[allow(unsafe_code)]
+pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    // The missing ancestors, outermost last.
+    let mut missing = Vec::new();
+    let mut at = Some(dir);
+    while let Some(p) = at {
+        if p.as_os_str().is_empty() || p.is_dir() {
+            break;
+        }
+        missing.push(p);
+        at = p.parent();
+    }
+    let attrs = PrivateAttributes::new(true)?;
+    for p in missing.into_iter().rev() {
+        let path = wide(p);
+        // SAFETY: `path` is NUL-terminated and `attrs` (and the descriptor it
+        // points at) outlives the call.
+        if unsafe { CreateDirectoryW(path.as_ptr(), &attrs.attributes) } == 0 {
+            let err = io::Error::last_os_error();
+            // Someone else (a concurrent `init`) made it first.
+            if err.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) && p.is_dir() {
+                continue;
+            }
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Opens `path` for writing (and reading too if `read`), creating it with a
+/// private, protected ACL if it does not exist. With `create_new` it fails with
+/// `AlreadyExists` instead of opening an existing file. An existing file keeps
+/// whatever ACL it has: this never changes the ACL of a file it did not create.
+#[allow(unsafe_code)]
+pub fn open_private_file(path: &Path, create_new: bool, read: bool) -> io::Result<File> {
+    let attrs = PrivateAttributes::new(false)?;
+    let wide_path = wide(path);
+    let access = GENERIC_WRITE | if read { GENERIC_READ } else { 0 };
+    // SAFETY: `wide_path` is NUL-terminated and `attrs` outlives the call; no
+    // template file.
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attrs.attributes,
+            if create_new { CREATE_NEW } else { OPEN_ALWAYS },
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a new file handle that we own, wrapped exactly once.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// The DACL of `path`, as entries for the exposure rule, or `None` if it cannot
+/// be read. A path with *no* DACL (Windows then lets everyone do everything) is
+/// returned as one Everyone entry with full access. Entries other than plain
+/// allow and deny entries (object and callback entries) are skipped.
+#[allow(unsafe_code)]
+pub fn read_dacl(path: &Path) -> Option<Vec<crate::perms::AclEntry>> {
+    let wide_path = wide(path);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `wide_path` is NUL-terminated; the out-pointers are valid, and
+    // the owner, group and SACL are not requested.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    // The DACL lives inside this block; `dacl` is only valid until it is freed.
+    let _descriptor = LocalBlock(descriptor);
+    if dacl.is_null() {
+        return Some(vec![crate::perms::AclEntry {
+            sid: "S-1-1-0".to_owned(),
+            mask: 0x001F_01FF,
+            allow: true,
+            inherit_only: false,
+        }]);
+    }
+    // SAFETY: plain data for which all-zero is valid.
+    let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `dacl` is a valid ACL and `info` is the struct the information
+    // class asks for, with its size.
+    let ok = unsafe {
+        GetAclInformation(
+            dacl,
+            std::ptr::from_mut(&mut info).cast::<c_void>(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let mut entries = Vec::new();
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `index` is below the ACE count and `ace` a valid out-pointer.
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+            continue;
+        }
+        // SAFETY: every ACE starts with an ACE_HEADER.
+        let header = unsafe { *ace.cast::<ACE_HEADER>() };
+        // 0 is ACCESS_ALLOWED_ACE_TYPE and 1 is ACCESS_DENIED_ACE_TYPE; both have
+        // the layout of ACCESS_ALLOWED_ACE (header, mask, then the SID).
+        if header.AceType > 1 {
+            continue;
+        }
+        let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+        // SAFETY: the ACE has that layout (see above); the SID starts at
+        // `SidStart` and stays valid while the descriptor is alive.
+        let (mask, sid) = unsafe {
+            (
+                (*ace).Mask,
+                std::ptr::addr_of_mut!((*ace).SidStart).cast::<c_void>(),
+            )
+        };
+        let Ok(sid) = sid_to_string(sid) else {
+            continue;
+        };
+        entries.push(crate::perms::AclEntry {
+            sid,
+            mask,
+            allow: header.AceType == 0,
+            inherit_only: u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0,
+        });
+    }
+    Some(entries)
 }
