@@ -136,10 +136,8 @@ fn a_vault_file_that_users_can_read_draws_a_warning() {
         w.contains("BUILTIN\\Users"),
         "the warning does not name the group: {w:?}"
     );
-    assert!(
-        w.contains(env.vault().to_str().unwrap()),
-        "no path in the warning: {w:?}"
-    );
+    // The default vault path is shown as given (relative), not made absolute.
+    assert!(w.contains("vault.bin"), "no path in the warning: {w:?}");
 }
 
 #[test]
