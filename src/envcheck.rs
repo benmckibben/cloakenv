@@ -214,8 +214,8 @@ mod tests {
     #[test]
     fn on_windows_run_refuses_a_vault_with_two_spellings_of_one_name() {
         let mut v = Vault::new();
-        v.set("TOKEN", "one".to_owned().into()).unwrap();
-        v.set("token", "two".to_owned().into()).unwrap();
+        v.set("TOKEN", "val-aaa-111".to_owned().into()).unwrap();
+        v.set("token", "val-bbb-222".to_owned().into()).unwrap();
         match check_run_environment(&v, &[]) {
             Err(e @ VaultError::KeysDifferOnlyInCase { .. }) => {
                 let shown = e.to_string();
@@ -223,7 +223,7 @@ mod tests {
                     shown.contains("TOKEN") && shown.contains("token"),
                     "{shown}"
                 );
-                assert!(!shown.contains("one") && !shown.contains("two"), "{shown}");
+                assert!(!shown.contains("val-aaa") && !shown.contains("val-bbb"), "{shown}");
             }
             other => panic!("unexpected {other:?}"),
         }
