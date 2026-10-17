@@ -1,7 +1,8 @@
 # Vault format v2: design
 
-**Status:** design for review. Nothing here is implemented. When it is accepted, this document replaces the
-"Proposed: vault format v2" section of ARCHITECTURE.md, which it builds on and in three places corrects.
+**Status:** accepted design, not implemented. Target release: **0.3.0**. It supersedes the "Proposed: vault format v2"
+section of ARCHITECTURE.md, which it builds on and in three places corrects. When the implementation lands,
+ARCHITECTURE.md describes the implemented format and this file is kept as the design record.
 
 ## Goals
 
@@ -24,10 +25,11 @@ it is, protection against code running as the same user (it can read the passphr
 | D3 | A random 16-byte **vault id** in the header, fixed at `init` and kept forever. The anti-rollback state is keyed by it, not by a hash of the path. | **yes** (new) |
 | D4 | Generation counter in the header; per-user state file holds, per vault id, the highest generation seen **and the tag of that version**. Same generation with a different tag = forked history, also refused. | extends it |
 | D5 | Padding with **Padmé** (at most 12% overhead, leaks O(log log n) bits) above a **4 KiB floor**, padding = zero bytes inside the AEAD. | resolves an open question |
-| D6 | **No automatic migration.** New binaries read v1 and v2 and write back the version they read; `init` creates v2; `cloakenv upgrade` converts explicitly. | **yes** |
+| D6 | **No automatic migration.** New binaries read v1 and v2 and write back the version they read; `init` creates v2; `cloakenv upgrade` converts explicitly. Every command that opens a v1 vault says that the upgrade is available and recommended. | **yes** |
 | D7 | Rollback refusal is fail-closed for every command, including `run` and `list`; the way past it is a command, `cloakenv accept-rollback`, never an environment variable. | resolves an open question |
-| D8 | `export` is **out of scope** for v2 (it needs no format change); decided separately. | narrows scope |
+| D8 | **No `export`** (and no `get`). The documented answer to "I need a value back" is to rotate it. | **yes** (decided: not built) |
 | D9 | A TLV **extension area** in the header so later additions need no version bump. | new |
+| D10 | Released as **0.3.0**, a breaking release (library API, and new vaults default to v2). | new |
 
 ## Why no wrapped data key (D1, D2)
 
@@ -174,21 +176,31 @@ hole. A one-line fix is in the message.
 - `cloakenv info` (new, small): prints the version, KDF parameters, generation, vault id, file size and what the state file
   says about it. Needs the passphrase (the header is unauthenticated until then; showing unverified numbers would invite
   trusting them).
-- `set`, `unset`, `import`: unchanged behaviour; on v2 they increase the generation and update the state file **after**
+- `set`, `unset`, `import`: unchanged behaviour (plus the upgrade notice on v1); on v2 they increase the generation and update the state file **after**
   the rename succeeds. The existing automatic raise of weak KDF parameters on save stays.
 - `run`, `list`: still never write the vault; they do write the state file (raising the mark).
 
 ## Migration and compatibility (D6)
 
-The proposal migrated automatically on the next write. I recommend against it: a vault on a shared machine, a
+The proposal migrated automatically on the next write. This design does not, because a vault on a shared machine, a
 volume mounted into containers, or a team with mixed versions, would be silently converted by whoever ran `set` first
 with 0.3, after which every 0.2 binary fails with "unsupported vault format version 2". The user then has to discover
 that the cause was an upgrade they never asked for.
 
 Instead:
-- 0.3 **reads** v1 and v2. It **writes back the version it read**; on a v1 save it prints one line:
-  "this vault uses format 1, which cannot detect rollback or hide its size; run `cloakenv upgrade` to convert it
-  (cloakenv 0.2 and older cannot open version 2)".
+- 0.3 **reads** v1 and v2 and **writes back the version it read**.
+- **Upgrade notice.** Every command that opens a v1 vault (`list`, `run`, `set`, `unset`, `import`, `passwd`,
+  `info`; `upgrade` itself excepted) prints one notice on cloakenv's own stderr, after the vault is decrypted and before
+  anything else happens:
+
+      cloakenv: this vault uses format 1. Format 2 detects a rolled-back vault and hides its exact size;
+      run 'cloakenv upgrade' to convert it (recommended; cloakenv 0.2 and older cannot open format 2).
+
+  Rules: printed only **after** a successful decryption (a wrong passphrase, or a file that is not a vault, never
+  produces it); at most once per command; never through the `--shield` streams (it is written before the child is
+  spawned, like the existing permission warnings); no effect on any exit code. There is no switch to silence it: the
+  way to make it go away is to upgrade. Cost: a team that has to stay compatible with 0.2 for a while sees it on every
+  command. If that becomes a real complaint, an opt-out can be added later without a format change.
 - `init` creates v2. A team that needs 0.2 compatibility for a new vault can create it with an 0.2 binary; I would not
   add a `--format 1` flag, which would keep the old format alive.
 - 0.2 and older refuse v2 with the error they already have. (This needs a test against the published 0.2.0 binary,
@@ -197,6 +209,22 @@ Instead:
   until `accept-rollback`, which is the correct behaviour.
 - Library API (`cloakenv::vault` is public): `Vault::seal/open/load/save` change shape (they need the
   generation, id and state). Pre-1.0, so a breaking change in 0.3.0, listed in the CHANGELOG.
+
+## No export: rotate instead (D8)
+
+There is no `export` and no `get` in 0.3.0. A vault is a one-way store: values go in with `set` and `import` and
+come out only as environment variables of a command started by `run`. The README will say so plainly, with the
+recommended practice:
+
+- **Treat the vault as a copy, not the source of truth.** The source of a secret is the service that issued it (the
+  cloud console, the database, the API provider's dashboard).
+- **If you need a value you cannot see, rotate it:** issue a new one at the source and `cloakenv set` it. A rotated
+  secret is better than a recovered one: the old value may already have been seen wherever it was copied from.
+- **If you forget the passphrase, the contents are gone.** That is the design: there is no recovery key.
+
+Why: `export` would be the one command whose purpose is to emit every secret at once, into a stream that ends up in
+terminals, scrollback, shell redirects and CI logs. Its absence is a protection. The decision can be revisited if users
+ask for it; adding a command later needs no format change.
 
 ## Cryptographic notes
 
@@ -240,17 +268,25 @@ For v2:
 2. **v2 codec in the library:** header, extensions, Padmé, the decoder rules, vectors, fuzz target. Not reachable from the CLI yet.
 3. **State file and the check:** locations, locking, the table above, `accept-rollback`, `info`.
 4. **Commands:** `init` writes v2, `upgrade`, `passwd`, the v1 hint on save.
-5. **Docs and release:** README threat model and file-format sections, ARCHITECTURE.md (replace the proposal with the
-   implemented design), CHANGELOG with a migration section, then a 0.3.0 release on Ben's go-ahead.
+5. **Docs and release:** README threat model and file-format sections (including "no export: rotate instead"),
+   ARCHITECTURE.md (replace the proposal with the implemented design), CHANGELOG with a migration section, then the
+   0.3.0 release.
 
 Rough size: 1,500 to 2,500 lines including tests; PRs 2 and 3 carry the risk and want the most review. I would also like
 an **independent review of PR 2 and 3** by someone other than their author before release.
 
-## Decisions for Ben
+## Decisions (made)
 
-1. **D1: drop key wrapping?** I recommend yes (reasons above). The alternative is wrapping now in case keychain unlock comes later.
-2. **D6: no automatic migration?** I recommend explicit `upgrade`.
-3. **D7: fail closed on rollback for `run` too,** with a warning-only fallback when the state file cannot be written. The alternative is warning only, everywhere.
-4. **Padding floor:** 4 KiB (my default) or 1 KiB (smaller files, more leakage for tiny vaults).
-5. **`export`:** decide separately, or not at all.
-6. **Release:** 0.3.0, breaking (library API and the new default format).
+1. **Key wrapping:** dropped (D1, D2).
+2. **Migration:** explicit `cloakenv upgrade`, never automatic; every command on a v1 vault prints the upgrade notice (D6).
+3. **Rollback:** fails closed for every command, `run` included; warning only when the state file cannot be read or
+   written (D7).
+4. **Padding floor:** 4 KiB (D5).
+5. **`export`:** not built; users are told to rotate instead of recover; revisited only on user feedback (D8).
+6. **Release:** 0.3.0, breaking (D10).
+
+## Still open (for the implementation PRs; not blocking this design)
+
+- The exact wording of the error messages and of the upgrade notice.
+- Whether `info` lands in PR 3 or PR 4.
+- The lock and the atomic rename on network filesystems (unchanged from v1, where they are documented as unsupported).
