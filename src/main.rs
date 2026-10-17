@@ -15,9 +15,11 @@ use cloakenv::crypto::{CryptoError, KdfParams};
 use cloakenv::input::{self, InputError};
 use cloakenv::passphrase as rules;
 use cloakenv::prompt::{self, PromptError};
+use cloakenv::vault::state::{self, Observed, Verdict};
+use cloakenv::vault::v2;
 use cloakenv::vault::{
-    Vault, VaultError, VaultLock, backup_vault, check_entry, is_valid_key, parse_dotenv_entries,
-    read_env_file, vault_dir, write_gitignore,
+    MAX_VAULT_LEN, Vault, VaultError, VaultLock, backup_vault, check_entry, is_valid_key,
+    parse_dotenv_entries, read_env_file, vault_dir, write_gitignore,
 };
 use cloakenv::{
     PASSPHRASE_ENV, PASSPHRASE_FILE_ENV, envcheck, hardening, is_reserved_key, perms, runner,
@@ -132,6 +134,29 @@ enum Cmd {
     /// List stored variable names (never values).
     #[command(after_help = SUBCOMMAND_EXIT_CODES)]
     List,
+    /// Show the vault's format, key-derivation settings and rollback status (never secrets).
+    ///
+    /// Needs the passphrase: what a file's header says about itself (its generation
+    /// and vault id) cannot be trusted until the passphrase has verified it. Changes
+    /// nothing, including the rollback-protection file, which lives in
+    /// $CLOAKENV_STATE_DIR, else the user's state directory.
+    #[command(after_help = SUBCOMMAND_EXIT_CODES)]
+    Info,
+    /// Accept an older or diverged copy of the vault as the new normal.
+    ///
+    /// A format 2 vault that is older than one this machine has already seen, a
+    /// second copy saved from the same version, or a format 1 file where a format 2
+    /// vault used to be, is refused. If that is what you intend (you restored a
+    /// backup), this makes the copy in hand the one that counts. Anything saved
+    /// only in the newer or the other copy is not in this one. Asks for
+    /// confirmation on a terminal (or --yes when there is none); does nothing if
+    /// the vault is not being refused.
+    #[command(after_help = SUBCOMMAND_EXIT_CODES)]
+    AcceptRollback {
+        /// Do not ask for confirmation (for scripts).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Run a command with the vault's secrets injected into its environment.
     ///
     /// The command comes after `--`, and everything after its name belongs to it:
@@ -195,6 +220,10 @@ impl std::fmt::Debug for Cmd {
             Cmd::Unset { key: _ } => f.debug_struct("Unset").field("key", &REDACTED).finish(),
             Cmd::Import { file: _ } => f.debug_struct("Import").field("file", &REDACTED).finish(),
             Cmd::List => f.write_str("List"),
+            Cmd::Info => f.write_str("Info"),
+            Cmd::AcceptRollback { yes } => {
+                f.debug_struct("AcceptRollback").field("yes", yes).finish()
+            }
             Cmd::Run { shield, command } => f
                 .debug_struct("Run")
                 .field("shield", shield)
@@ -427,6 +456,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             })
             .context("cannot write to stdout")?;
         }
+        Cmd::Info => cmd_info(path)?,
+        Cmd::AcceptRollback { yes } => cmd_accept_rollback(path, yes)?,
         Cmd::Run { shield, command } => {
             // Fail closed: the vault is fully authenticated and decrypted
             // before anything is spawned.
@@ -695,7 +726,14 @@ fn load_raw(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
     // Advisory only; goes to our own stderr before anything is decrypted or
     // spawned, so it can never end up inside a shielded child stream.
     perms::emit(&perms::vault_warnings(path, true));
-    Vault::load(path, pass.as_bytes()).map_err(|err| {
+    Vault::load(path, pass.as_bytes()).map_err(|err| passphrase_hint(err, pass))
+}
+
+/// Turns a vault error into the error to report, first saying (on our own
+/// stderr) that a passphrase ending in a line break is the likely cause if
+/// the vault would not open.
+fn passphrase_hint(err: VaultError, pass: &Zeroizing<String>) -> anyhow::Error {
+    {
         // A passphrase that ends in a line break and does not unlock the
         // vault is most likely one with a stray newline (a file or variable
         // written with an extra `echo`). Say so, without showing it.
@@ -707,7 +745,169 @@ fn load_raw(path: &Path, pass: &Zeroizing<String>) -> Result<Vault> {
             );
         }
         err.into()
+    }
+}
+
+/// What `info` and `accept-rollback` learn from a vault file once the passphrase has authenticated it.
+struct Inspected {
+    version: u8,
+    size: u64,
+    params: KdfParams,
+    entries: usize,
+    observed: Observed,
+    /// Format 2 only: generation, vault id, padded plaintext length, number of extension records.
+    v2: Option<(u64, [u8; 16], u64, usize)>,
+}
+
+/// Reads and authenticates a vault of format 1 or 2. Never writes anything.
+fn inspect(path: &Path, pass: &Zeroizing<String>) -> Result<Inspected> {
+    use std::io::Read as _;
+    require_vault(path)?;
+    // Advisory only, on our own stderr, before anything is decrypted.
+    perms::emit(&perms::vault_warnings(path, true));
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_VAULT_LEN + 1).read_to_end(&mut bytes))
+        .with_context(|| format!("cannot read the vault at {}", path.display()))?;
+    let size = bytes.len() as u64;
+    match v2::format_version(&bytes)? {
+        1 => {
+            let vault =
+                Vault::open(&bytes, pass.as_bytes()).map_err(|e| passphrase_hint(e, pass))?;
+            Ok(Inspected {
+                version: 1,
+                size,
+                params: vault.params(),
+                entries: vault.len(),
+                observed: Observed::V1,
+                v2: None,
+            })
+        }
+        2 => {
+            let o = v2::open(&bytes, pass.as_bytes()).map_err(|e| passphrase_hint(e, pass))?;
+            let padded = v2::padded_len(v2::unpadded_len(&o.vault));
+            Ok(Inspected {
+                version: 2,
+                size,
+                params: o.vault.params(),
+                entries: o.vault.len(),
+                observed: Observed::V2 {
+                    id: o.vault_id,
+                    generation: o.generation,
+                    tag: o.tag,
+                },
+                v2: Some((o.generation, o.vault_id, padded, o.extensions.len())),
+            })
+        }
+        other => Err(VaultError::UnsupportedVersion(other).into()),
+    }
+}
+
+/// One line of `info` about the rollback state.
+fn rollback_status(verdict: &Verdict, vault: &Path) -> String {
+    if let Some(refusal) = verdict.refusal(vault) {
+        return format!("REFUSED: {refusal}");
+    }
+    match verdict {
+        Verdict::FirstSeen => "not seen on this machine before (it is trusted and recorded the first time a command that checks opens it)".to_owned(),
+        Verdict::Advanced { from } => format!("ok: newer than generation {from}, the last this machine recorded"),
+        Verdict::Same => "ok: the version this machine saw last".to_owned(),
+        Verdict::Unprotected => "not protected: format 1 has no generation, so an old copy cannot be detected".to_owned(),
+        Verdict::Unchecked { reason } => format!("unknown: {reason}"),
+        Verdict::Rollback { .. } | Verdict::Fork { .. } | Verdict::Downgrade { .. } => String::new(),
+    }
+}
+
+/// `cloakenv info`: prints facts about the vault, never a name or a value.
+fn cmd_info(path: &Path) -> Result<()> {
+    let pass = passphrase(false)?;
+    let i = inspect(path, &pass)?;
+    let status = match state::state_dir() {
+        None => "unknown: no place for the rollback-protection file (HOME is not set; set CLOAKENV_STATE_DIR)".to_owned(),
+        Some(dir) => match state::peek(&dir, path, &i.observed) {
+            Ok((verdict, _)) => rollback_status(&verdict, path),
+            Err(e) => format!("unknown: {e}"),
+        },
+    };
+    let p = i.params;
+    let mut lines = vec![
+        ("vault", path.display().to_string()),
+        ("format", i.version.to_string()),
+        ("size", format!("{} bytes", i.size)),
+        (
+            "key derivation",
+            format!(
+                "Argon2id, memory {} KiB, iterations {}, lanes {}",
+                p.m_cost_kib, p.t_cost, p.p_cost
+            ),
+        ),
+        ("entries", i.entries.to_string()),
+    ];
+    if let Some((generation, id, padded, extensions)) = i.v2 {
+        lines.push(("generation", generation.to_string()));
+        lines.push(("vault id", state::hex(&id)));
+        lines.push(("padding", format!("Padmé, {padded} bytes of plaintext")));
+        lines.push(("extensions", extensions.to_string()));
+    }
+    lines.push(("rollback", status));
+    diag::stdout_until_closed(|out| {
+        lines
+            .iter()
+            .try_for_each(|(k, v)| writeln!(out, "{:<15} {v}", format!("{k}:")))
     })
+    .context("cannot write to stdout")?;
+    Ok(())
+}
+
+/// `cloakenv accept-rollback`: the deliberate way past a rollback, fork or downgrade refusal.
+fn cmd_accept_rollback(path: &Path, yes: bool) -> Result<()> {
+    let pass = passphrase(false)?;
+    let i = inspect(path, &pass)?;
+    let dir = state::state_dir().ok_or_else(|| {
+        anyhow!("cannot find a place for the rollback-protection file: HOME is not set. Set CLOAKENV_STATE_DIR to a directory")
+    })?;
+    let (verdict, _) = state::peek(&dir, path, &i.observed)?;
+    let summary = match (&verdict, &i.observed) {
+        (Verdict::Rollback { seen, last_path }, Observed::V2 { generation, .. }) => format!(
+            "The vault in hand is generation {generation}; this machine has seen generation {seen}{}. Accepting makes generation {generation} the new normal; anything saved in the newer generations is not in this copy.",
+            last_path.as_ref().map_or(String::new(), |p| format!(" (last at {p})"))
+        ),
+        (Verdict::Fork { generation }, _) => format!(
+            "Two different copies of generation {generation} exist. Accepting keeps the one in hand; anything saved only in the other copy is not in this one."
+        ),
+        (Verdict::Downgrade { .. }, _) => "This is a format 1 file, but this path held a format 2 vault. Accepting forgets that and uses the old file as it is; format 1 cannot detect rollback.".to_owned(),
+        _ => {
+            elog!("cloakenv: nothing to accept: {}", rollback_status(&verdict, path));
+            return Ok(());
+        }
+    };
+    confirm_accept(&summary, yes)?;
+    state::accept(&dir, path, &i.observed)?;
+    elog!(
+        "cloakenv: accepted: this machine now treats this copy as the latest (run `cloakenv info` to check)"
+    );
+    Ok(())
+}
+
+/// Asks before `accept-rollback` changes anything, as `init --force` does.
+fn confirm_accept(summary: &str, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        bail!("{summary} Add --yes to accept it without being asked");
+    }
+    elog!("cloakenv: {summary}");
+    diag::stderr_text("Type 'yes' to continue: ");
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("cannot read the answer")?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") {
+        return Ok(());
+    }
+    bail!("not confirmed; nothing was changed")
 }
 
 /// Checks a passphrase that is about to protect a *new* vault. The rules are
