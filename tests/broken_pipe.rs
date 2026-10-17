@@ -81,6 +81,7 @@ fn list_piped_into_head_is_quiet() {
         .env_remove("CLOAKENV_PASSPHRASE_FILE")
         .env_remove("CLOAKENV_VAULT")
         .env("CLOAKENV_PASSPHRASE", PASS)
+        .env("CLOAKENV_STATE_DIR", env.state_dir())
         .env("CE_BIN", env!("CARGO_BIN_EXE_cloakenv"))
         .args(["-c", r#""$CE_BIN" list 2>err.txt | head -1; cat err.txt"#]);
     let out = sh.output().unwrap();

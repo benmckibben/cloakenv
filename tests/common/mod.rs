@@ -12,12 +12,16 @@ pub const PASS: &str = "correct horse battery staple";
 /// A scratch working directory with an isolated vault path.
 pub struct Env {
     pub dir: TempDir,
+    /// Where the rollback-protection file goes for this environment's commands, so that no test ever reads or
+    /// writes the real user's state directory.
+    pub state: TempDir,
 }
 
 impl Env {
     pub fn new() -> Self {
         Self {
             dir: tempfile::tempdir().expect("tempdir"),
+            state: tempfile::tempdir().expect("tempdir"),
         }
     }
 
@@ -33,6 +37,11 @@ impl Env {
         self.dir.path()
     }
 
+    /// The state directory (`CLOAKENV_STATE_DIR`) used by every command of this environment.
+    pub fn state_dir(&self) -> PathBuf {
+        self.state.path().join("cloakenv")
+    }
+
     pub fn vault(&self) -> PathBuf {
         self.path().join(".cloak").join("vault.bin")
     }
@@ -44,6 +53,7 @@ impl Env {
             .env_remove("CLOAKENV_PASSPHRASE")
             .env_remove("CLOAKENV_PASSPHRASE_FILE")
             .env_remove("CLOAKENV_VAULT")
+            .env("CLOAKENV_STATE_DIR", self.state_dir())
             .stdin(Stdio::null());
         if let Some(p) = pass {
             cmd.env("CLOAKENV_PASSPHRASE", p);
