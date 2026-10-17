@@ -533,12 +533,19 @@ pub fn state_dir_for(
         }),
         Platform::Unix => match get("XDG_STATE_HOME")
             .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
+            .filter(|p| is_absolute_xdg(p))
         {
             Some(x) => Some(x.join(sub)),
             None => get("HOME").map(|h| PathBuf::from(h).join(".local").join("state").join(sub)),
         },
     }
+}
+
+/// What the XDG rule calls absolute: a path that starts with a slash. On a Unix host that is exactly
+/// [`Path::is_absolute`]; the second clause only matters when this Unix branch is exercised from another host
+/// (the tests do, on Windows, where `/x/state` has no drive letter and so is not "absolute" to the standard library).
+fn is_absolute_xdg(p: &Path) -> bool {
+    p.is_absolute() || p.to_str().is_some_and(|s| s.starts_with('/'))
 }
 
 /// [`state_dir_for`] for this platform and the real environment.
@@ -1204,21 +1211,31 @@ mod tests {
         let dir = |p, pairs: &[(&str, &str)]| state_dir_for(p, &env(pairs));
         assert_eq!(
             dir(Platform::Unix, &[("HOME", "/home/u")]),
-            Some(PathBuf::from("/home/u/.local/state/cloakenv"))
+            Some(
+                PathBuf::from("/home/u")
+                    .join(".local")
+                    .join("state")
+                    .join("cloakenv")
+            )
         );
         assert_eq!(
             dir(
                 Platform::Unix,
                 &[("HOME", "/home/u"), ("XDG_STATE_HOME", "/x/state")]
             ),
-            Some(PathBuf::from("/x/state/cloakenv"))
+            Some(PathBuf::from("/x/state").join("cloakenv"))
         );
         assert_eq!(
             dir(
                 Platform::Unix,
                 &[("HOME", "/home/u"), ("XDG_STATE_HOME", "rel/state")]
             ),
-            Some(PathBuf::from("/home/u/.local/state/cloakenv")),
+            Some(
+                PathBuf::from("/home/u")
+                    .join(".local")
+                    .join("state")
+                    .join("cloakenv")
+            ),
             "a relative XDG_STATE_HOME is ignored"
         );
         assert_eq!(
@@ -1226,7 +1243,12 @@ mod tests {
                 Platform::Unix,
                 &[("HOME", "/home/u"), ("XDG_STATE_HOME", "")]
             ),
-            Some(PathBuf::from("/home/u/.local/state/cloakenv")),
+            Some(
+                PathBuf::from("/home/u")
+                    .join(".local")
+                    .join("state")
+                    .join("cloakenv")
+            ),
             "empty counts as unset"
         );
         assert_eq!(dir(Platform::Unix, &[]), None, "no home");
@@ -1236,9 +1258,12 @@ mod tests {
                 Platform::MacOs,
                 &[("HOME", "/Users/u"), ("XDG_STATE_HOME", "/ignored")]
             ),
-            Some(PathBuf::from(
-                "/Users/u/Library/Application Support/cloakenv"
-            ))
+            Some(
+                PathBuf::from("/Users/u")
+                    .join("Library")
+                    .join("Application Support")
+                    .join("cloakenv")
+            )
         );
         assert_eq!(
             dir(
@@ -1277,7 +1302,7 @@ mod tests {
                 "{p:?}: an empty override counts as unset"
             );
         }
-        assert_eq!(state_file(Path::new("/d")), PathBuf::from("/d/seen"));
+        assert_eq!(state_file(Path::new("/d")), Path::new("/d").join("seen"));
     }
 
     // ---- the file-level flows, in a temporary directory ----
@@ -1305,7 +1330,7 @@ mod tests {
         let text = fs::read_to_string(&file).unwrap();
         assert!(
             text.contains(&hex(&id(1)))
-                && text.contains(vault.canonicalize().unwrap().to_str().unwrap()),
+                && text.contains(&escape(vault.canonicalize().unwrap().to_str().unwrap())),
             "{text}"
         );
         #[cfg(unix)]
