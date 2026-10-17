@@ -26,6 +26,9 @@ include = [
     "/docs/*.md",
     "/src/**/*.rs",
     "/tests/**/*.rs",
+    # Golden vaults written by released versions (the tests open them): see tests/fixtures/v1/README.md.
+    "/tests/fixtures/v1/*.bin",
+    "/tests/fixtures/v1/many.env",
 ]
 
 [lib]
