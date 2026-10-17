@@ -304,8 +304,11 @@ described here:
 
 ## Proposed: vault format v2
 
-**Status: a proposal, not implemented, and open.** Nothing in this section is
-built. It collects, in one place, everything that needs a new vault format, so
+**Status: superseded by the accepted design in
+[`design/vault-format-v2.md`](design/vault-format-v2.md)** (target 0.3.0),
+which differs from this proposal in key wrapping, migration, the rollback
+state and `export`. This section is kept until the implementation replaces
+it. Nothing in it is built. It collects, in one place, everything that needs a new vault format, so
 that the format is changed once rather than four times.
 
 ### What is true today (the limits this addresses)
