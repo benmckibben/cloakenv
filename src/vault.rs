@@ -44,6 +44,8 @@ use crate::crypto::{self, CryptoError, KdfParams, NONCE_LEN, SALT_LEN, TAG_LEN};
 
 pub use crate::dotenv::{DotenvEntry, parse_dotenv, parse_dotenv_entries};
 
+pub mod v2;
+
 /// File magic.
 pub const MAGIC: &[u8; 8] = b"CLOAKENV";
 /// Current format version.
@@ -74,6 +76,12 @@ pub enum VaultError {
     UnsupportedVersion(u8),
     #[error("unsupported vault algorithm (kdf id {kdf}, aead id {aead})")]
     UnsupportedAlgorithm { kdf: u8, aead: u8 },
+    #[error("unsupported vault padding scheme {0}")]
+    UnsupportedPadding(u8),
+    #[error(
+        "the vault uses an extension (type {0:#06x}) that this version of cloakenv does not understand"
+    )]
+    UnsupportedExtension(u16),
     #[error("vault file is truncated or malformed")]
     Malformed,
     #[error("vault file is too large (the limit is 16 MiB)")]

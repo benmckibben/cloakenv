@@ -1,0 +1,30 @@
+[package]
+name = "cloakenv-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cloakenv = { path = ".." }
+zeroize = "1"
+
+# Not part of the cloakenv package or workspace: a standalone crate, built only by cargo-fuzz.
+[workspace]
+
+[[bin]]
+name = "v2_header"
+path = "fuzz_targets/v2_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_mutated"
+path = "fuzz_targets/v2_mutated.rs"
+test = false
+doc = false
+bench = false
