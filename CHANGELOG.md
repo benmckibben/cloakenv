@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - unreleased
+## [0.3.0] - 2026-10-18
 
 Vault format 2. **Breaking: cloakenv 0.2 and older cannot open a format 2
 vault**, and new vaults are format 2. Existing vaults keep working until you
