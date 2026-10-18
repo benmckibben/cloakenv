@@ -111,7 +111,11 @@ fn passphrase_is_not_leaked_to_child() {
 #[test]
 fn cli_refuses_to_store_passphrase_vars() {
     let env = Env::init();
-    for key in ["CLOAKENV_PASSPHRASE", "CLOAKENV_PASSPHRASE_FILE"] {
+    for key in [
+        "CLOAKENV_PASSPHRASE",
+        "CLOAKENV_PASSPHRASE_FILE",
+        "CLOAKENV_NEW_PASSPHRASE_FILE",
+    ] {
         let out = env.run_stdin(&["set", key], "nope");
         assert!(!out.status.success(), "set {key} should fail");
         let err = stderr(&out);
@@ -136,23 +140,27 @@ fn vault_cannot_reintroduce_passphrase_vars() {
     // a vault written by another tool or an older cloakenv could be. `run`
     // must still strip them.
     let env = Env::init();
-    let mut vault = cloakenv::vault::Vault::load(&env.vault(), PASS.as_bytes()).unwrap();
+    let mut loaded = cloakenv::vault::file::Loaded::load(&env.vault(), PASS.as_bytes()).unwrap();
     for (k, v) in [
         ("CLOAKENV_PASSPHRASE", "from-vault"),
         ("CLOAKENV_PASSPHRASE_FILE", "from-vault-file"),
+        ("CLOAKENV_NEW_PASSPHRASE_FILE", "from-vault-new-file"),
         ("KEEP", "yes"),
     ] {
-        vault.set(k, zeroize::Zeroizing::new(v.to_owned())).unwrap();
+        loaded
+            .vault
+            .set(k, zeroize::Zeroizing::new(v.to_owned()))
+            .unwrap();
     }
-    vault.save(&env.vault(), PASS.as_bytes()).unwrap();
+    loaded.save(&env.vault(), PASS.as_bytes()).unwrap();
     let out = env.ok(&[
         "run",
         "--",
         "sh",
         "-c",
-        r#"printf '%s' "${CLOAKENV_PASSPHRASE-unset}|${CLOAKENV_PASSPHRASE_FILE-unset}|$KEEP""#,
+        r#"printf '%s' "${CLOAKENV_PASSPHRASE-unset}|${CLOAKENV_PASSPHRASE_FILE-unset}|${CLOAKENV_NEW_PASSPHRASE_FILE-unset}|$KEEP""#,
     ]);
-    assert_eq!(stdout(&out), "unset|unset|yes");
+    assert_eq!(stdout(&out), "unset|unset|unset|yes");
 }
 
 #[test]

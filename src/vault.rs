@@ -44,6 +44,7 @@ use crate::crypto::{self, CryptoError, KdfParams, NONCE_LEN, SALT_LEN, TAG_LEN};
 
 pub use crate::dotenv::{DotenvEntry, parse_dotenv, parse_dotenv_entries};
 
+pub mod file;
 pub mod state;
 pub mod v2;
 

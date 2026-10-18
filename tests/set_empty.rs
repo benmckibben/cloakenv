@@ -77,6 +77,7 @@ fn a_failing_producer_in_a_real_pipeline_keeps_the_old_value() {
     let mut cmd = Command::new("sh");
     cmd.current_dir(env.path())
         .env("CLOAKENV_PASSPHRASE", PASS)
+        .env("CLOAKENV_STATE_DIR", env.state_dir())
         .env_remove("CLOAKENV_PASSPHRASE_FILE")
         .env_remove("CLOAKENV_VAULT")
         .arg("-c")

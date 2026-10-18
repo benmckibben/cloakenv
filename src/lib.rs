@@ -57,6 +57,10 @@ pub const PASSPHRASE_ENV: &str = "CLOAKENV_PASSPHRASE";
 /// (e.g. a machine-local random key file). Also stripped from children.
 pub const PASSPHRASE_FILE_ENV: &str = "CLOAKENV_PASSPHRASE_FILE";
 
+/// Environment variable naming a file whose contents are the *new* passphrase for `cloakenv passwd` (files only: a
+/// new passphrase is never read from the environment itself). Also stripped from children.
+pub const NEW_PASSPHRASE_FILE_ENV: &str = "CLOAKENV_NEW_PASSPHRASE_FILE";
+
 /// True for the names cloakenv reads its own passphrase from. They are always
 /// stripped from child environments, so the CLI refuses to store them: a
 /// vault entry under either name would be silently dropped at `run` time.
@@ -65,10 +69,12 @@ pub fn is_reserved_key(key: &str) -> bool {
     // the same variable there.
     #[cfg(windows)]
     {
-        key.eq_ignore_ascii_case(PASSPHRASE_ENV) || key.eq_ignore_ascii_case(PASSPHRASE_FILE_ENV)
+        key.eq_ignore_ascii_case(PASSPHRASE_ENV)
+            || key.eq_ignore_ascii_case(PASSPHRASE_FILE_ENV)
+            || key.eq_ignore_ascii_case(NEW_PASSPHRASE_FILE_ENV)
     }
     #[cfg(not(windows))]
     {
-        key == PASSPHRASE_ENV || key == PASSPHRASE_FILE_ENV
+        key == PASSPHRASE_ENV || key == PASSPHRASE_FILE_ENV || key == NEW_PASSPHRASE_FILE_ENV
     }
 }

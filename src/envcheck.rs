@@ -16,7 +16,7 @@
 use std::ffi::OsString;
 
 use crate::vault::{MAX_ENV_ENTRY_LEN, Vault, VaultError};
-use crate::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV};
+use crate::{NEW_PASSPHRASE_FILE_ENV, PASSPHRASE_ENV, PASSPHRASE_FILE_ENV};
 
 /// Variables that decide which programs and libraries run, for *every*
 /// command and everything it starts: `PATH` (which `true` is found), the
@@ -120,7 +120,7 @@ pub fn check_run_environment(vault: &Vault, argv: &[OsString]) -> Result<(), Vau
     let mut other = 0usize;
     let mut other_count = 0usize;
     for (k, v) in std::env::vars_os() {
-        if k == PASSPHRASE_ENV || k == PASSPHRASE_FILE_ENV {
+        if k == PASSPHRASE_ENV || k == PASSPHRASE_FILE_ENV || k == NEW_PASSPHRASE_FILE_ENV {
             continue;
         }
         if k.to_str().is_some_and(|k| vault.get(k).is_some()) {

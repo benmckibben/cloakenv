@@ -197,6 +197,7 @@ fn cli(vault: &Path, pass: &str) -> Command {
         .arg(vault)
         .env_remove("CLOAKENV_PASSPHRASE_FILE")
         .env_remove("CLOAKENV_VAULT")
+        .env("CLOAKENV_STATE_DIR", vault.parent().unwrap().join("state"))
         .env("CLOAKENV_PASSPHRASE", pass)
         .stdin(std::process::Stdio::null());
     cmd

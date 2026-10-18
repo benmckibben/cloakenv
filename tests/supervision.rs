@@ -347,6 +347,7 @@ fn rc_of(env: &Env, mode: &[&str], args: &[&str]) -> (String, String) {
     let o = Command::new("sh")
         .current_dir(env.path())
         .env("CLOAKENV_PASSPHRASE", PASS)
+        .env("CLOAKENV_STATE_DIR", env.state_dir())
         .env_remove("CLOAKENV_VAULT")
         .arg("-c")
         .arg(r#"bin=$1; shift; "$bin" run "$@"; echo "rc=$?""#)

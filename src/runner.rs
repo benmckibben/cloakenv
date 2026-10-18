@@ -22,7 +22,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::vault::Vault;
-use crate::{PASSPHRASE_ENV, PASSPHRASE_FILE_ENV};
+use crate::{NEW_PASSPHRASE_FILE_ENV, PASSPHRASE_ENV, PASSPHRASE_FILE_ENV};
 
 /// Replacement text written in place of any secret value under `--shield`.
 pub const REDACTION: &[u8] = b"[REDACTED_BY_CLOAKENV]";
@@ -484,6 +484,7 @@ fn build_command(program: &OsStr, args: &[OsString], vault: &Vault) -> Command {
         .envs(vault.iter())
         .env_remove(PASSPHRASE_ENV)
         .env_remove(PASSPHRASE_FILE_ENV)
+        .env_remove(NEW_PASSPHRASE_FILE_ENV)
         .stdin(Stdio::inherit());
     cmd
 }
