@@ -206,9 +206,11 @@ jobs:
           cat files.txt
           echo "::endgroup::"
 
-          # Allow-list: the manifest, lockfile, docs, licences, sources and tests.
+          # Allow-list: the manifest, lockfile, docs (and the design records under
+          # docs/design/), licences, sources, tests, and the golden vault files that
+          # the tests open (tests/fixtures/v1/*.bin and many.env, nothing else).
           # Anything else (editor files, CI config, notes, keys, ...) fails.
-          allowed='^(Cargo\.toml|Cargo\.toml\.orig|Cargo\.lock|\.cargo_vcs_info\.json|README\.md|CHANGELOG\.md|SECURITY\.md|CONTRIBUTING\.md|LICENSE-MIT|LICENSE-APACHE|docs/[A-Za-z0-9_-]+\.md|src/[A-Za-z0-9_/]+\.rs|tests/[A-Za-z0-9_/]+\.rs)$'
+          allowed='^(Cargo\.toml|Cargo\.toml\.orig|Cargo\.lock|\.cargo_vcs_info\.json|README\.md|CHANGELOG\.md|SECURITY\.md|CONTRIBUTING\.md|LICENSE-MIT|LICENSE-APACHE|docs/[A-Za-z0-9_-]+\.md|docs/design/[A-Za-z0-9_-]+\.md|src/[A-Za-z0-9_/]+\.rs|tests/[A-Za-z0-9_/]+\.rs|tests/fixtures/v1/[A-Za-z0-9_.-]+\.(bin|env))$'
           unexpected=$(grep -Ev "$allowed" files.txt || true)
           if [ -n "$unexpected" ]; then
             echo "::error::unexpected files in the package:"

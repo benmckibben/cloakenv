@@ -153,8 +153,9 @@ enum Cmd {
     /// Asks for the current passphrase (CLOAKENV_PASSPHRASE or
     /// CLOAKENV_PASSPHRASE_FILE, or the prompt) and then the new one twice at
     /// the prompt, or from the file named by CLOAKENV_NEW_PASSPHRASE_FILE. A
-    /// copy of the vault as it was is kept next to it (still encrypted with the
-    /// OLD passphrase; delete it once the new one is confirmed to work).
+    /// copy of the vault as it was is kept in the state directory, in backups/
+    /// (still encrypted with the OLD passphrase; delete it once the new one is
+    /// confirmed to work).
     #[command(after_help = SUBCOMMAND_EXIT_CODES)]
     Passwd,
     /// Show the vault's format, key-derivation settings and rollback status (never secrets).
@@ -732,12 +733,12 @@ fn confirm_replace(path: &Path, yes: bool) -> Result<()> {
     let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     if !io::stdin().is_terminal() {
         bail!(
-            "{} already holds a vault and --force would replace it with an empty one. Add --yes to confirm without being asked (a backup copy of the old vault is kept next to it)",
+            "{} already holds a vault and --force would replace it with an empty one. Add --yes to confirm without being asked (a backup copy of the old vault is kept in the state directory)",
             shown.display()
         );
     }
     elog!(
-        "cloakenv: this replaces the vault at {} with an empty one, protected by a new passphrase. A copy of the old file is kept next to it.",
+        "cloakenv: this replaces the vault at {} with an empty one, protected by a new passphrase. A copy of the old file is kept in the state directory.",
         shown.display()
     );
     diag::stderr_text("Type 'yes' to continue: ");

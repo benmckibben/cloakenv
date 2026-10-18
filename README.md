@@ -49,11 +49,15 @@ What this does and does not protect against is in the [Threat model](#threat-mod
 
 | command | what it does |
 |---------|--------------|
-| `cloakenv init [--force [--yes]]` | create an empty vault; refuses to overwrite an existing one unless `--force`, which asks for confirmation (or `--yes`) and first saves a backup copy, see [Replacing a vault, changing the passphrase](#replacing-a-vault-changing-the-passphrase) |
+| `cloakenv init [--force [--yes]]` | create an empty vault; refuses to overwrite an existing one unless `--force`, which asks for confirmation (or `--yes`) and first saves a backup copy in the state directory, see [Replacing a vault, changing the passphrase](#replacing-a-vault-changing-the-passphrase) |
 | `cloakenv set [--allow-empty] KEY` | store or replace one value, from a hidden prompt or stdin (never from the command line); empty input is refused unless `--allow-empty` |
 | `cloakenv unset KEY` | remove one entry (an error if there is no such key) |
 | `cloakenv import FILE` | add or replace the entries of a `.env` file, see [Importing a `.env` file](#importing-a-env-file) |
 | `cloakenv list` | print the names, one per line, never the values |
+| `cloakenv upgrade` | convert a format 1 vault to format 2, keeping a copy of the old file, see [Vault format 2](#vault-format-2-rollback-detection-upgrading-and-the-state-directory) |
+| `cloakenv passwd` | change the vault's passphrase, keeping its contents |
+| `cloakenv info` | show the vault's format, key-derivation settings, generation and rollback status; never names or values |
+| `cloakenv accept-rollback [--yes]` | accept an older, diverged or downgraded copy of a format 2 vault as the new normal, see [Rollback, fork and downgrade detection](#rollback-fork-and-downgrade-detection) |
 | `cloakenv run [--shield] -- COMMAND [ARGS...]` | run a command with the vault in its environment |
 
 The `--` before the command is required, so that everything after the command's
@@ -63,8 +67,8 @@ called `--shield`, and `cloakenv run cmd --shield` (no `--`) is a usage error
 
 Every command takes `--vault <path>` (or `CLOAKENV_VAULT`), see
 [Vault location](#vault-location); `--help` and `--version` work everywhere.
-Variable names must match `[A-Za-z_][A-Za-z0-9_]*`; `CLOAKENV_PASSPHRASE` and
-`CLOAKENV_PASSPHRASE_FILE` are reserved. Exit codes are in [Exit codes](#exit-codes).
+Variable names must match `[A-Za-z_][A-Za-z0-9_]*`; `CLOAKENV_PASSPHRASE`,
+`CLOAKENV_PASSPHRASE_FILE` and `CLOAKENV_NEW_PASSPHRASE_FILE` are reserved. Exit codes are in [Exit codes](#exit-codes).
 
 ## Values you store
 
@@ -98,7 +102,7 @@ key or the limit and never repeat a value:
 | limit | value | what happens beyond it |
 |-------|-------|------------------------|
 | one variable, `KEY=VALUE` together | 131,071 bytes (128 KiB minus one) | `set` and `import` refuse it, naming the key: `cloakenv: error: BIG: the variable would be 131072 bytes as KEY=VALUE, over the limit of 131071 bytes for one environment variable`. Linux refuses to start a command with a single environment string over 128 KiB (`E2BIG`); the same limit applies on every platform so a vault stays usable wherever it is copied. This also bounds the length of a key. |
-| the vault file | 16 MiB (16,777,216 bytes) | any write that would produce a larger file is refused with `the vault would be N bytes, over the 16 MiB limit ...; nothing was written`. `import` is all or nothing: the merged result is checked first, and if one entry is too large or the total is, nothing is imported and the vault is untouched. |
+| the vault file (for format 2, the whole padded file) | 16 MiB (16,777,216 bytes) | any write that would produce a larger file is refused with `the vault would be N bytes, over the 16 MiB limit ...; nothing was written`. `import` is all or nothing: the merged result is checked first, and if one entry is too large or the total is, nothing is imported and the vault is untouched. |
 | the `.env` file for `import` | 16 MiB | refused up front, see [Importing a `.env` file](#importing-a-env-file) |
 | a value on stdin to `set` | 1 MiB (plus one line ending) | refused while reading; this is only the read limit, the per-variable limit above is stricter |
 | the environment of the command (Linux) | a quarter of the stack limit (`ulimit -s`; 2 MiB by default), at most 6 MiB, at least 128 KiB | `run` fails with exit 125 before starting anything and names the largest vault entries: `the environment for the command would be N bytes, over the M bytes this system lets a program start with ... Largest vault entries: A (n bytes), B (n bytes)`. The total counts the inherited environment, the command's arguments and the pointers the kernel adds. |
@@ -188,13 +192,24 @@ source, draws this warning on stderr; nothing is refused, no exit code changes,
 and the passphrase is never echoed:
 
 ```
-cloakenv: warning: the passphrase is shorter than 12 characters; anyone who obtains the vault file can guess it offline, so a short passphrase is easy to crack. Use a longer one (4 or more random words, or 20 or more random characters). There is no command to change the passphrase later: `cloakenv init --force` starts over (and erases the vault's contents)
+cloakenv: warning: the passphrase is shorter than 12 characters; anyone who obtains the vault file can guess it offline, so a short passphrase is easy to crack. Use a longer one (4 or more random words, or 20 or more random characters). To change the passphrase later, run `cloakenv passwd`
 ```
 
 A machine-local key file from `/dev/urandom` (above) never triggers it.
 
-Both variables are always stripped from the child's environment, and
-`cloakenv set` / `cloakenv import` refuse to store secrets under either name.
+**The new passphrase for `passwd`.** `cloakenv passwd` takes the current
+passphrase from the sources above and the new one from a hidden prompt (typed
+twice, only on a terminal) or from the file named by
+`CLOAKENV_NEW_PASSPHRASE_FILE` (at most 64 KiB, one trailing newline removed,
+the same rules as above). There is no environment variable that holds the new
+passphrase itself. The new passphrase gets the same checks as at `init` (not
+empty, not ending in a line break, the short-passphrase warning), and must differ
+from the current one.
+
+All three variables (`CLOAKENV_PASSPHRASE`, `CLOAKENV_PASSPHRASE_FILE` and
+`CLOAKENV_NEW_PASSPHRASE_FILE`) are always stripped from the child's
+environment, and `cloakenv set` / `cloakenv import` refuse to store secrets under
+any of those names (a format 2 vault cannot even hold them).
 On Linux, cloakenv also marks itself non-dumpable at startup
 (`prctl(PR_SET_DUMPABLE, 0)`), so neither the commands it runs nor other
 processes of your user can read the passphrase out of `/proc/<pid>/environ`,
@@ -246,8 +261,9 @@ concurrent `cloakenv set` calls never lose updates (`flock` on Unix,
 `LockFileEx` on Windows; see [Platform support](#platform-support)). A writer holds the lock for its whole
 load-modify-save cycle, which includes two key derivations (a fraction of a
 second each at the default settings), so simultaneous writers queue up (the
-ones that have to wait say so on stderr); reads (`list`, `run`) never take it
-and always see a complete vault. The lock dies with its process, so a killed
+ones that have to wait say so on stderr); reads (`list`, `run`, `info`) never take
+it and always see a complete vault (they may update the rollback record, see
+[Vault format 2](#vault-format-2-rollback-detection-upgrading-and-the-state-directory)). The lock dies with its process, so a killed
 writer cannot leave it stuck. On a filesystem where `flock` does not work (an
 NFS mount without lock support, say) writers refuse to run with `cannot lock
 vault <path>: <OS error>` rather than go ahead unprotected.
@@ -268,21 +284,26 @@ read the repository, forever.
 
 ### Replacing a vault, changing the passphrase
 
-There is no `passwd` command yet: the passphrase of a vault cannot be changed
-in place (see the proposal in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#proposed-vault-format-v2)). The only
-way is `cloakenv init --force`, which starts a new, **empty** vault under a new
-passphrase. Because that destroys the old contents, it is guarded:
+To change the passphrase **and keep the contents**, use `cloakenv passwd` (see
+[Changing the passphrase](#changing-the-passphrase)). To start over with a new,
+**empty** vault under a new passphrase, use `cloakenv init --force`. Because that
+destroys the old contents, it is guarded:
 
 * On a terminal it asks `Type 'yes' to continue:` and does nothing for any other
   answer. With no terminal (scripts, CI) it refuses unless you add `--yes`
   (`init --force --yes`).
-* Before replacing anything, it saves the old file next to it as
-  `vault.bin.bak-YYYYMMDDTHHMMSSZ` (UTC; mode 0600; byte for byte the old
-  ciphertext, so it needs the **old** passphrase) and tells you where. To keep
-  your secrets, `set` them again or `import` them, then delete the backup.
-  cloakenv never overwrites or removes a backup (and `.cloak/.gitignore` keeps it
-  out of git); delete them when you no longer need the old passphrase, because
-  a backup is a vault encrypted with a passphrase you chose to retire.
+* Before replacing anything, it saves the old file in the **state directory**
+  (see [The state directory](#the-state-directory)), as
+  `backups/vault.bin.bak-YYYYMMDDTHHMMSSZ` (UTC; mode 0600; byte for byte the old
+  ciphertext, so it needs the **old** passphrase) and tells you where. It needs a
+  state directory (`HOME` or `CLOAKENV_STATE_DIR`); with none it stops before
+  replacing anything. To keep your secrets, `set` them again or `import` them,
+  then delete the backup. cloakenv never overwrites or removes a backup; delete
+  them when you no longer need the old passphrase, because a backup is a vault
+  encrypted with a passphrase you chose to retire. The backups are not in the
+  vault's directory, so there is no old copy lying next to the vault for anyone
+  who can write that directory.
+* The new vault is format 2 and is recorded as the latest for that path.
 
 ### Permission warnings
 
@@ -290,7 +311,9 @@ On Unix, cloakenv checks permissions each time it opens the vault and prints
 one line per problem on its own stderr, before it decrypts or spawns anything
 (so it never appears inside the redacted stream of a `--shield` child). These
 are warnings only: exit codes do not change and cloakenv never chmods files it
-did not create.
+did not create. The four state-directory rows are printed once the vault has
+been opened and compared with the rollback record, not before (they use the same
+group rule as the vault directory).
 
 | condition | warning |
 |-----------|---------|
@@ -300,6 +323,10 @@ did not create.
 | passphrase file group/world-readable or writable | `cloakenv: warning: passphrase file <file> is group/world-readable or writable (mode 0666, expected 0600); anyone who can read it can decrypt the vault` |
 | vault directory is a symlink | `cloakenv: warning: vault directory <dir> is a symbolic link; cloakenv follows it, so make sure its target is private` |
 | vault file is a symlink | `cloakenv: warning: vault file <file> is a symbolic link; reads follow it, but saving replaces the link with a regular file` |
+| state directory is a symlink | `cloakenv: warning: rollback-protection directory <dir> is a symbolic link; cloakenv follows it, so make sure its target is private (whoever controls it controls rollback detection)` |
+| state directory world-writable | `cloakenv: warning: rollback-protection directory <dir> is world-writable (mode 0777, expected 0700); anyone on this machine could edit the record of which vaults this machine has seen and defeat rollback detection` |
+| state directory group-writable, group not private to you | `cloakenv: warning: rollback-protection directory <dir> is writable by a group that is not private to you (mode 0770, expected 0700); its members could edit the record of which vaults this machine has seen` |
+| state directory owned by another user | `cloakenv: warning: rollback-protection directory <dir> belongs to another user (uid 1001); that user can edit the record of which vaults this machine has seen` |
 
 **The exact rule for the vault directory.** A directory that others can write
 to lets them replace the vault with one of their own, but an ordinary project
@@ -342,6 +369,22 @@ New vaults use 64 MiB / 3 passes / 1 lane, well inside the limit. There is no
 flag or variable to raise it. It only matters if you created a vault through
 the library API with stronger-than-default settings above the cap.
 
+### Format 2 files
+
+A format 2 file is refused up front, before any key derivation, for the same
+kind of reasons as above: an unknown version, algorithm, padding scheme or
+reserved flag, an extension record it cannot read (or a *critical* one it does
+not know), a generation of 0, or too short a ciphertext. The format 2 reader is
+as strict as its writer, so after authentication it also refuses
+key-derivation settings below 19 MiB / 2 passes / 1 lane (the writer never goes
+below them: `upgrade` raises a weaker format 1 vault's settings first and says
+so), entries that are not in key order, a name that is not a valid variable name,
+the three reserved names, and any padding that is not exactly the canonical
+length of zero bytes. All of these look the same to you: the file is refused as
+an unusable vault. The size limit above counts the **padded** file, so a vault
+can hold slightly less than 16 MiB of entries (padding adds at most 12% above the
+4 KiB floor, and about 6% at most in practice).
+
 ### Leftover temporary files
 
 Every save writes the new vault to a temporary file next to it
@@ -349,7 +392,7 @@ Every save writes the new vault to a temporary file next to it
 place, so the vault is never half-written. If cloakenv is killed (`kill -9`,
 power loss, the out-of-memory killer) between those two steps, the temporary
 file stays behind, as large as the vault. The next command that **writes** (`set`,
-`unset`, `import`, `init`) removes such leftovers once it holds the vault lock, but
+`unset`, `import`, `init`, `passwd`, `upgrade`) removes such leftovers once it holds the vault lock, but
 only files that are: regular files (not links or directories), named exactly as
 a save names them for this vault, owned by you, and not modified for 5 minutes
 (a running save finishes in seconds). Read-only commands do not clean up.
@@ -734,13 +777,147 @@ What it does **not** catch:
 These are known limitations, documented here rather than fixed in this
 version; see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#--shield-streaming-redaction).
 
+## Vault format 2: rollback detection, upgrading and the state directory
+
+`cloakenv init` now creates a **format 2** vault.
+Compared with format 1 it has an authenticated header with a **generation** that
+goes up on every save and a random **vault id**; it is **padded** so its size
+does not reveal the exact total length of the contents (a small vault is 4,208
+bytes); and it can be checked against a record kept outside the vault's
+directory so that an older copy being put back is noticed. The passphrase, the
+key derivation (Argon2id) and the cipher (XChaCha20-Poly1305) are the same.
+A format 1 vault keeps working exactly as before until you run
+`cloakenv upgrade`.
+
+### Rollback, fork and downgrade detection
+
+The first time a command opens a
+format 2 vault it records the vault's id and generation. Every later open
+compares, after the passphrase has verified the file and before anything runs:
+
+| what is in hand | result |
+|-----------------|--------|
+| a vault this machine has not seen | trusted, recorded, with one note on stderr |
+| a newer generation | accepted and recorded (a save, here or elsewhere) |
+| the generation and contents last seen | accepted |
+| an **older** generation | **refused** (rollback) |
+| the **same generation, different contents** | **refused** (fork: two copies were saved from the same version) |
+| a **format 1 file** where a format 2 vault used to be | **refused** (downgrade) |
+
+A refusal prints the reason and what to do, changes nothing, starts nothing
+(`run` exits 125, every other command exits 1), and is never overridden by an
+environment variable. If you really did restore an older copy on purpose, run
+`cloakenv accept-rollback`: it asks for the passphrase, says what it will
+replace, asks for confirmation on a terminal (`--yes` when there is none) and
+then treats the copy in hand as the latest. Anything saved only in the newer or
+the other copy is not in it.
+
+Commands that only read (`list`, `run`, `info`) do not take the vault's write
+lock, so a save by another command can land between their read and their
+comparison. A read that looks like a rollback is therefore repeated, up to three
+reads in all, before it is believed; a copy that is still behind is refused.
+`cloakenv info` shows the format, size, key-derivation settings, the number of
+entries (never names or values), the generation and vault id of a format 2
+vault, and what the record says (`REFUSED: ...` with the reason, if the vault would be
+refused), without changing anything; it exits 0 either way, since reporting is its
+job. It needs the passphrase, because a header means nothing until it has been
+authenticated.
+
+### The state directory
+
+The record is a small text file, `seen`, in the user's
+state directory (with an empty lock file, `.seen.lock`, and the kept copies of old
+vaults in `backups/` beside it):
+
+| platform | state directory |
+|----------|-----------------|
+| Linux and other Unix | `$XDG_STATE_HOME/cloakenv` if that is an absolute path, else `~/.local/state/cloakenv` |
+| macOS | `~/Library/Application Support/cloakenv` |
+| Windows | `%LOCALAPPDATA%\cloakenv` |
+
+`CLOAKENV_STATE_DIR` names another directory (used as given). cloakenv creates
+it private (0700, the file 0600; a protected ACL on Windows) and warns, on
+every command, if it is a symbolic link, writable by others or owned by someone
+else. If no state directory can be found (no `HOME`) or it cannot be written,
+a command on a format 2 vault says so once and carries on without the check,
+except that a rollback it can still see is still refused. A damaged file is an
+error that names it; if you did not edit it, delete it to start over (the next
+vault found is then trusted once). The record holds the **paths** of your vaults
+in plain text, ids, generations and AEAD tags; no secret. It is kept for the
+1,024 most recently used vaults, and opening a vault counts as use.
+
+### Upgrading a format 1 vault
+
+Every command that opens a format 1 vault prints
+this on stderr, after the passphrase has been accepted, never through
+`--shield`'s streams and without changing any exit code:
+
+```text
+cloakenv: this vault uses format 1. Format 2 detects a rolled-back vault and hides its exact size;
+cloakenv: run 'cloakenv upgrade' to convert it (recommended; cloakenv 0.2 and older cannot open format 2).
+```
+
+`cloakenv upgrade` asks for the passphrase, keeps a byte-identical copy of the
+format 1 file in the state directory (`backups/vault.bin.bak-YYYYMMDDTHHMMSSZ`,
+mode 0600), writes the format 2 vault (generation 1, a new vault id, the same
+passphrase) and remembers the old file's identity. **It is never done
+automatically and cannot be undone by cloakenv 0.2 or older, which refuse a
+format 2 vault** ("unsupported vault format version 2") without touching it.
+The kept copy is for recovery only: cloakenv refuses to open it as a downgrade,
+and the copy that `passwd` keeps of a format 2 vault is an older generation of the
+same vault, so it is refused as a rollback; to use one on purpose, restore it
+and run `accept-rollback`.
+Delete it when you no longer need it; it is encrypted with the passphrase the
+vault had then.
+
+### Changing the passphrase
+
+`cloakenv passwd` asks for the current passphrase
+(the usual sources) and takes the new one from a prompt (twice) or from the file
+named by `CLOAKENV_NEW_PASSPHRASE_FILE`, never from the environment itself. It
+re-encrypts the contents with a fresh salt and nonce, keeps a copy of the vault
+as it was in the state directory (still encrypted with the **old** passphrase:
+delete it once the new one works), and refuses a new passphrase equal to the
+current one, an empty one, or a wrong current one, before changing anything. It
+works on format 1 vaults too and leaves them format 1.
+
+### Shared vaults and forks
+
+Each machine keeps its own record. If a vault file
+is shared between machines or people (a synced folder, a repository), two of
+them saving from the same generation produce two different files of that
+generation; the first machine to meet both reports a fork, and one that last
+saw a newer generation reports a rollback. That is the check working, not a bug,
+and cloakenv cannot merge: `accept-rollback` picks the copy in hand. Prefer one
+machine that writes the vault, or keep a vault per machine, rather than a folder
+that creates conflicted copies.
+
+### Downgrade detection is best effort
+
+A format 1 file has no vault id, so
+cloakenv recognises one by (a) the paths a format 2 vault has been opened under
+(both the absolute path as typed and the path with symbolic links resolved, so a
+link put in place of the vault is still caught) and (b) the identity of the
+format 1 file that **this machine upgraded**, wherever it turns up (a renamed
+directory, another name). An older format 1 snapshot that was never upgraded
+here, under a path never seen, has nothing to be recognised by.
+
+### What the record does not defend against
+
+It is a file in your account's
+state directory, so anyone or anything that can write it (you, root, code running
+as you) can lower or delete it. The design assumes an attacker who can write the
+vault's directory, or the place it is shipped through, but not the state
+directory. It is not signed or encrypted, because any key for that would have to
+be readable by the same code that could edit the file.
+
 ## Platform support
 
 | platform | status |
 |----------|--------|
 | Linux | supported; tested in CI (Ubuntu 24.04, stable Rust and the 1.87 MSRV) |
 | macOS | supported; tested in CI (macOS 15, stable Rust) |
-| Windows | supported on **x86_64 (MSVC)** only; built, linted and tested in CI (Windows Server 2025) and tried by hand on one Windows machine. See the limitations below. 32-bit and Arm Windows are not supported |
+| Windows | supported on **x86_64 (MSVC)** only; built, linted and tested in CI (Windows Server 2025) and tried by hand on one Windows machine (0.2.0's Windows support, and again for 0.3.0's vault format 2). See the limitations below. 32-bit and Arm Windows are not supported |
 
 The release workflow ([CONTRIBUTING.md](CONTRIBUTING.md#releasing-maintainer))
 builds static musl binaries for Linux (x86_64 and aarch64) and binaries for
@@ -786,6 +963,19 @@ Several protections described above are implemented with Unix-only APIs
   Dropbox folder, on a network share or on an exFAT drive, a second Windows
   account, domain accounts, and a program that is itself running in another job
   object.
+- **Vault format 2 on Windows (0.3.0), tried by hand** in Windows PowerShell 5.1
+  in the classic console (not Windows Terminal), on one 64-bit machine, not
+  elevated, with the vault and the state directory on local NTFS: `init`, `info`,
+  `set`, `list`, `run`; a rolled-back copy refused and then accepted with
+  `accept-rollback`; upgrading a vault made by the published 0.2.0 build, the old
+  file refused as a downgrade, and 0.2.0 refusing the upgraded vault; `passwd` with a
+  new passphrase from a file with Windows line endings and from the prompt; a
+  second window reading while the first saves, with no spurious refusal; and the
+  downgrade check with a **directory junction** in place of the vault's
+  directory (both for the file that was upgraded and for a different, never
+  upgraded format 1 file). **Not tried:** a symbolic link to a *file* (creating
+  one needs Developer Mode or an elevated shell), Windows Terminal, the state
+  directory in a synced or network folder, and macOS by hand.
 - **Release binaries are not signed**; SmartScreen or antivirus software may
   warn about them.
 
@@ -795,7 +985,7 @@ included); no `PR_SET_PDEATHSIG`, so `SIGKILL` on cloakenv under `--shield` leav
 command running; the total-environment-size check before `run` and the
 per-process hardening are Linux only; the pseudo-terminal tests of the
 prompt's terminal restoration are the least portable part of the test suite;
-the Ctrl-Z/`fg` behaviour of the prompt is tested on Linux only. The details
+the Ctrl-Z/`fg` behaviour of the prompt is tested on Linux only. The rollback record keys a vault by its absolute path and its canonical path; how a case-insensitive file system affects the second has not been verified. The details
 follow.
 
 **`PR_SET_DUMPABLE` and `PR_SET_PDEATHSIG` are Linux only.** `exec` without
@@ -827,8 +1017,9 @@ the sections it links to and in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 | threat | outcome |
 |--------|---------|
-| Someone gets a copy of the vault file (stolen laptop, backup, a mistaken `git add -f`) | They can only guess the passphrase offline, one Argon2id run (64 MiB, 3 passes) per guess; names and values are both encrypted, only the approximate total size shows. **The passphrase is the whole defence**, hence the warning at `init` for one under 12 characters ([Short passphrases](#exactly-what-counts-as-the-passphrase)). `init` also keeps `.cloak/` out of `git add .`. |
+| Someone gets a copy of the vault file (stolen laptop, backup, a mistaken `git add -f`) | They can only guess the passphrase offline, one Argon2id run (64 MiB, 3 passes) per guess; names and values are both encrypted; a format 2 vault's size shows only its rough magnitude (padded, 4 KiB at least), a format 1 vault's size gives the exact total length ([Vault format 2](#vault-format-2-rollback-detection-upgrading-and-the-state-directory)). **The passphrase is the whole defence**, hence the warning at `init` for one under 12 characters ([Short passphrases](#exactly-what-counts-as-the-passphrase)). `init` also keeps `.cloak/` out of `git add .`. |
 | Tampering with the vault file | Any change, truncation or foreign file fails authentication; `run` exits 125 and starts nothing ([Vault file limits](#vault-file-limits)). |
+| Someone who can write the vault's directory puts an **older valid copy** back (a backup, an old commit), or a second copy saved from the same version, or the old format 1 file | A format 2 vault is compared with a record kept outside the directory and **refused**, before anything is decrypted into a command: `run` exits 125 and starts nothing, the other commands exit 1, and the vault is not touched ([Vault format 2](#vault-format-2-rollback-detection-upgrading-and-the-state-directory)). Not for a format 1 vault, which cannot be told from a restored backup; downgrade detection is best effort, and the record itself is not protected from code running as you. |
 | Plaintext `.env` files, secrets in argv and shell history | `set` never takes a value on the command line (it refuses one and says so); nothing is decrypted to disk ([Values you store](#values-you-store)). Importing does not undo the past: the `.env` you import from stays on disk (and in any backup or git history) until you remove it, and deleting a file does not securely erase it. |
 | Secrets showing up in agent transcripts, CI logs, terminal scrollback | `run --shield` replaces exact occurrences of values in the command's stdout and stderr, for accidents only ([What `--shield` does and doesn't do](#what---shield-does-and-doesnt-do)). |
 | Other local users | The vault is written `0600` in a `0700` directory; loose permissions and symlinks are warned about ([Permission warnings](#permission-warnings)). |
@@ -857,17 +1048,26 @@ the sections it links to and in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
   are redacted so broadly that the marker confirms a guess (a warning names the
   keys). Output after the command exits, and a partial secret at the very end of
   a stream, are also not covered.
-- **Rollback.** Everything in the vault is authenticated, but a valid file is
-  not tied to a point in time. **Anyone who can write the vault's directory can
-  put an older valid vault back** (a backup, an old commit, a copy they took
-  earlier): rotated secrets revert to their old values and deleted ones return,
-  and nothing notices, because `run` has no record of what it saw before. They
-  still cannot read or forge one; they can also just delete it. Keep the
-  directory private (cloakenv warns when it is not) and do not keep the vault
-  where others can write. A generation counter with a high-water mark kept
-  outside the directory could catch this for attackers confined to the
-  directory; it needs a new file format and is written up as a proposal, not
-  built ([Proposed: vault format v2](docs/ARCHITECTURE.md#proposed-vault-format-v2)).
+- **Rollback, with limits.** A format 2 vault is protected against an older
+  copy being put back, against two diverged copies and against the old format 1
+  file coming back, by a record that lives **outside the vault's directory**
+  (the state directory). That protection has edges: it is **best effort for
+  downgrades** (a format 1 file has no id, so only a file that was upgraded on
+  this machine, or a path a format 2 vault was opened under, is recognised; an
+  older format 1 snapshot under a new path is not); **the record is not itself
+  protected** (anyone who can write the state directory, which includes you,
+  root and any code running as you, can edit or delete it, and the next open
+  trusts what it finds, with a one-line note); a machine that has **never**
+  opened the vault has nothing to compare with; and a **format 1 vault has no
+  protection at all** (`cloakenv upgrade` converts it). A vault in a synced
+  folder or a repository shared between machines will report forks and
+  rollbacks that are real, because each machine keeps its own record
+  ([Shared vaults](#shared-vaults-and-forks)).
+- **Getting a value back.** There is deliberately no `export` and no `get`: a
+  value goes in with `set` or `import` and comes out only as an environment
+  variable of a command that `run` starts. If you need a value you cannot see,
+  rotate it at the service that issued it and `set` the new one. If you forget
+  the passphrase the contents are gone; there is no recovery key.
 - **Memory and swap.** Decrypted values are held in buffers that are wiped when
   dropped, and `exec` without `--shield` leaves nothing behind, but this is best
   effort: cloakenv does not lock memory (`mlock`), so the OS may write pages
@@ -877,15 +1077,18 @@ the sections it links to and in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
   is and is not covered, with measurements). Use an encrypted swap if that is in
   your threat model.
 - **Weak passphrases.** See above: cloakenv warns, it does not refuse.
-- **Metadata: the file size is the exact total length of your secrets.**
-  Names and values are encrypted, but the file is not padded: its size is 84
-  bytes plus, for each entry, 8 bytes and the length of the name and of the
-  value. A vault holding `K=a` is 94 bytes and one holding `K=aaaaaaaaaa` is 103,
-  so anyone who can see the size (and changes to it) learns the exact total
-  length, and that a rotated secret changed length. The modification time and
-  the existence of a vault are visible to anyone who can list the directory.
-  Padding is part of the [vault format v2 proposal](docs/ARCHITECTURE.md#proposed-vault-format-v2),
-  not built.
+- **Metadata.** Names and values are encrypted, and a format 2 vault is
+  padded (Padmé, with a 4 KiB floor), so its size shows only its rough
+  magnitude, and a value rotated to a slightly different length usually leaves
+  the size unchanged. Crossing a size step is still visible, and so are the
+  modification time and the existence of a vault to anyone who can list the
+  directory. **A format 1 vault is not padded**: its size is 84 bytes plus, for
+  each entry, 8 bytes and the length of the name and of the value, so the exact
+  total length of your secrets is visible to anyone who can see the file.
+- **The state directory holds paths.** The record of which vaults this machine
+  has seen includes the path each was last opened at, in plain text, in a
+  directory only you should be able to read (mode 0700, file 0600). It holds no
+  secret, no key and no name or value, but it does say where your vaults are.
 
 ## More detail
 

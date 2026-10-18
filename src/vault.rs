@@ -648,8 +648,8 @@ impl VaultLock {
     }
 }
 
-/// Copies the vault file at `path` to a new file next to it before it is
-/// replaced (`init --force`), and returns the copy's path. The copy is named
+/// Copies the vault file at `path` to a new file in `dir` before it is
+/// replaced (`init --force`, `upgrade`, `passwd`), and returns the copy's path. The copy is named
 /// `<vault file name>.bak-YYYYMMDDTHHMMSSZ` in `dir` (UTC; a counter is added if that
 /// name is taken), created with mode 0600, and is only ever the ciphertext. It
 /// is never overwritten or removed by cloakenv, and it does not match the

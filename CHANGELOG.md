@@ -7,6 +7,129 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-18
+
+Vault format 2. **Breaking: cloakenv 0.2 and older cannot open a format 2
+vault**, and new vaults are format 2. Existing vaults keep working until you
+convert them.
+
+### Upgrading (read this first)
+
+- A format 1 vault is **not** changed behind your back. Every command that
+  opens one prints a notice that `cloakenv upgrade` is available and
+  recommended. Run it when everything that reads the vault (your machines, CI,
+  teammates) runs 0.3 or newer: afterwards 0.2 and older refuse the vault with
+  "unsupported vault format version 2" and leave it untouched.
+- `upgrade` keeps a byte-identical copy of the format 1 file in the **state
+  directory** (see below), under `backups/`, and the same passphrase keeps working.
+  `init --force` and `passwd` keep their copies there too, no longer next to
+  the vault. All three therefore need a state directory (`HOME` or
+  `CLOAKENV_STATE_DIR`) and stop with a message if there is none.
+- cloakenv refuses to open those kept copies as a downgrade, or (the copy
+  `passwd` keeps of a format 2 vault) as a rollback, until you run
+  `cloakenv accept-rollback`: they are for recovery.
+- A vault shared between machines (a synced folder, a repository) will report
+  **forks and rollbacks** when two machines save from the same generation. See
+  [Vault format 2](README.md#vault-format-2-rollback-detection-upgrading-and-the-state-directory) in the README.
+- `CLOAKENV_NEW_PASSPHRASE_FILE` is a reserved name, like the other two
+  passphrase variables: it is removed from the environment of the command `run`
+  starts, and `set` and `import` refuse it. A format 1 vault that already holds
+  an entry with that name keeps it but `run` no longer injects it.
+
+### Added
+
+- **Vault format 2**: an authenticated header with a **generation** (up by one
+  on every save) and a random **vault id**; the plaintext is **padded** (Padmé,
+  4 KiB floor, so a small vault is 4,208 bytes) so the file size no longer gives
+  the exact total length of your secrets; an extension area for later additions.
+  Same passphrase, Argon2id and XChaCha20-Poly1305. No key wrapping.
+- **Rollback, fork and downgrade detection.** A per-user record in a **state
+  directory** (`CLOAKENV_STATE_DIR`, else `$XDG_STATE_HOME/cloakenv` or
+  `~/.local/state/cloakenv`, `~/Library/Application Support/cloakenv`,
+  `%LOCALAPPDATA%\cloakenv`) remembers the highest generation of each vault.
+  Every command refuses, before anything runs, an **older** copy, a second copy
+  of the **same generation** with different contents, and a **format 1 file where
+  a format 2 vault was** (`run` exits 125, the others 1; the vault is not
+  touched). The first time a machine sees a format 2 vault it says so once.
+  Commands that only read repeat a read that looks like a rollback (three reads
+  at most) so that a save landing at the same moment is not mistaken for one.
+- `cloakenv upgrade`: convert a format 1 vault to format 2, explicitly.
+- `cloakenv passwd`: change the passphrase and keep the contents. The new
+  passphrase comes from a prompt (twice) or from `CLOAKENV_NEW_PASSPHRASE_FILE`;
+  it must differ from the current one. Works on format 1 vaults too.
+- `cloakenv info`: format, size, key-derivation settings, number of entries,
+  generation and vault id, and the rollback status; never names or values; changes
+  nothing.
+- `cloakenv accept-rollback [--yes]`: the deliberate way past a refusal
+  (never an environment variable). Asks for the passphrase and for confirmation.
+- Warnings, on every command, when the state directory is a symlink, writable by
+  others or owned by someone else.
+- Library: `vault::file::Loaded` (either format), `vault::v2` (the codec),
+  `vault::state` (the record), `NEW_PASSPHRASE_FILE_ENV`, and new `VaultError`
+  variants (`UnsupportedPadding`, `UnsupportedExtension`, `GenerationOverflow`).
+  The format 1 `Vault::seal/open/load/save` are unchanged.
+- `fuzz/`: a standalone cargo-fuzz crate (not part of the published package).
+
+### Changed
+
+- `cloakenv init` creates a **format 2** vault. `init --force` keeps its backup
+  copy in the state directory instead of next to the vault.
+- **Library, breaking:** `vault::backup_vault` now takes the directory to put the
+  copy in; `VaultError` has new variants (match it non-exhaustively).
+- The short-passphrase warning now points at `cloakenv passwd` instead of saying
+  there is no command to change the passphrase.
+- The format 2 reader refuses what its writer would not write: key-derivation
+  settings below 19 MiB / 2 passes / 1 lane, entries out of key order, the
+  reserved passphrase names, and any padding that is not exactly canonical.
+- `README.md` and `docs/ARCHITECTURE.md` describe format 2 and the state
+  directory; `docs/design/vault-format-v2.md` records why.
+
+### Security
+
+- Closes two limits of 0.2: the exact total length of the secrets being visible
+  in the file size (format 2), and a restored older vault being accepted silently
+  (format 2 vaults on a machine that has opened them before).
+- **Limits that remain, on purpose or by nature:**
+  - A **format 1 vault has neither protection**; `upgrade` is the way.
+  - Downgrade detection is **best effort**: a format 1 file has no id, so only
+    one that this machine upgraded, or one at a path (as typed, or with symbolic
+    links resolved) that held a format 2 vault, is recognised. An older format 1
+    snapshot that was never upgraded here, under a new path, is not.
+  - The record is **not authenticated**: anyone who can write the state directory
+    (you, root, code running as you) can edit or delete it, and the next open
+    trusts what it finds. A machine that has never opened a vault has nothing to
+    compare with. The record holds the **paths** of your vaults in plain text.
+  - There is no `export` or `get`, on purpose: rotate a value at its source
+    instead of recovering it.
+
+### Known limitations
+
+- **No external security review.** The format 2 code was reviewed once by a
+  reviewer other than its author. The two serious findings (a race between
+  readers and a writer, and a downgrade bypass) were fixed before this release,
+  and most of the rest were fixed or are listed here; that is not the same as an
+  outside audit.
+- Format 2 was run on Linux, macOS and Windows in CI. It was also tried by hand
+  on Windows (Windows PowerShell 5.1 in the classic console, one 64-bit machine,
+  local NTFS): the commands, rollback refusal and `accept-rollback`, upgrading a
+  0.2.0 vault, `passwd`, a reader racing a writer, and the downgrade check with a
+  directory junction. **Not tried by hand:** a symbolic link to a file on Windows
+  (needs Developer Mode or an elevated shell), Windows Terminal, a state
+  directory in a synced or network folder, and anything on macOS. How a
+  case-insensitive file system affects the path matching of the record on macOS
+  has not been verified.
+- The fuzz target that mutates whole files runs few inputs (each one that gets
+  past the header costs a key derivation); the targets for the header, the
+  decoder and the record file run millions.
+- The interoperability check with the published 0.2.0 binary was done by hand
+  and is not an automated test.
+- `passwd` accepts a new-passphrase file containing a NUL byte or an interior newline,
+  which a prompt could not retype.
+- The directory entry of a kept backup copy is not synced to disk before the
+  command returns (the copy's contents are).
+- `set` on a vault path that is a symbolic link replaces the link with a regular file
+  (it has always warned about this).
+
 ## [0.2.0] - 2026-10-13
 
 Windows support. Nothing else changed.
@@ -300,6 +423,7 @@ has the detail; this is the short version.
 - **No external security review.** The code had an internal review and fixes
   before this release, which is not the same thing.
 
-[Unreleased]: https://github.com/benmckibben/cloakenv/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/benmckibben/cloakenv/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/benmckibben/cloakenv/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/benmckibben/cloakenv/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/benmckibben/cloakenv/releases/tag/v0.1.0

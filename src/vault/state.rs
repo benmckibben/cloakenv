@@ -1017,8 +1017,8 @@ mod tests {
     #[test]
     fn paths_with_spaces_survive_a_round_trip_on_both_line_kinds() {
         // regression: path lines used to be split on every space, which made any vault under a directory such as
-        // "/Users/Jane Doe/..." turn the whole state file into a "damaged" one
-        let p = "/Users/Jane Doe/my  projects/a b c/vault.bin";
+        // "/srv/Jane Doe/..." turn the whole state file into a "damaged" one
+        let p = "/srv/Jane Doe/my  projects/a b c/vault.bin";
         let s = state_with(&[(1, 5, 1, Some(p))]);
         let text = s.serialize();
         assert!(
@@ -1427,9 +1427,9 @@ mod tests {
     fn state_dir_for_every_platform() {
         let dir = |p, pairs: &[(&str, &str)]| state_dir_for(p, &env(pairs));
         assert_eq!(
-            dir(Platform::Unix, &[("HOME", "/home/u")]),
+            dir(Platform::Unix, &[("HOME", "/srv/u")]),
             Some(
-                PathBuf::from("/home/u")
+                PathBuf::from("/srv/u")
                     .join(".local")
                     .join("state")
                     .join("cloakenv")
@@ -1438,17 +1438,17 @@ mod tests {
         assert_eq!(
             dir(
                 Platform::Unix,
-                &[("HOME", "/home/u"), ("XDG_STATE_HOME", "/x/state")]
+                &[("HOME", "/srv/u"), ("XDG_STATE_HOME", "/x/state")]
             ),
             Some(PathBuf::from("/x/state").join("cloakenv"))
         );
         assert_eq!(
             dir(
                 Platform::Unix,
-                &[("HOME", "/home/u"), ("XDG_STATE_HOME", "rel/state")]
+                &[("HOME", "/srv/u"), ("XDG_STATE_HOME", "rel/state")]
             ),
             Some(
-                PathBuf::from("/home/u")
+                PathBuf::from("/srv/u")
                     .join(".local")
                     .join("state")
                     .join("cloakenv")
@@ -1458,10 +1458,10 @@ mod tests {
         assert_eq!(
             dir(
                 Platform::Unix,
-                &[("HOME", "/home/u"), ("XDG_STATE_HOME", "")]
+                &[("HOME", "/srv/u"), ("XDG_STATE_HOME", "")]
             ),
             Some(
-                PathBuf::from("/home/u")
+                PathBuf::from("/srv/u")
                     .join(".local")
                     .join("state")
                     .join("cloakenv")
@@ -1473,10 +1473,10 @@ mod tests {
         assert_eq!(
             dir(
                 Platform::MacOs,
-                &[("HOME", "/Users/u"), ("XDG_STATE_HOME", "/ignored")]
+                &[("HOME", "/srv/mac"), ("XDG_STATE_HOME", "/ignored")]
             ),
             Some(
-                PathBuf::from("/Users/u")
+                PathBuf::from("/srv/mac")
                     .join("Library")
                     .join("Application Support")
                     .join("cloakenv")
