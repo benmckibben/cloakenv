@@ -28,3 +28,17 @@ path = "fuzz_targets/v2_mutated.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "v2_plaintext"
+path = "fuzz_targets/v2_plaintext.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_parse"
+path = "fuzz_targets/state_parse.rs"
+test = false
+doc = false
+bench = false

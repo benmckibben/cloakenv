@@ -146,7 +146,14 @@ fn init_force_yes_keeps_a_private_copy_that_the_old_passphrase_still_opens() {
     let err = stderr(&out);
     assert!(err.contains("kept a copy of the old vault at"), "{err}");
 
-    let dir = env.path().join(".cloak");
+    // the copy is kept in the state directory, not next to the vault
+    let beside: Vec<_> = fs::read_dir(env.path().join(".cloak"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".bak"))
+        .collect();
+    assert!(beside.is_empty(), "a copy next to the vault: {beside:?}");
+    let dir = env.state_dir().join("backups");
     let backups: Vec<_> = fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().path())

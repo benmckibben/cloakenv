@@ -1,8 +1,8 @@
 //! Vault file format, version 2: the codec.
 //!
 //! Design and reasons: `docs/design/vault-format-v2.md`. This module only turns a [`Vault`] and its metadata into
-//! bytes and back. Nothing in the CLI uses it yet; the commands, the rollback state file and the migration come in
-//! later changes. Version 1 (the parent module) is untouched.
+//! bytes and back; the commands, the rollback state file and the format-aware load and save that use it are in
+//! [`super::state`], [`super::file`] and the CLI. Version 1 (the parent module) is untouched.
 //!
 //! # Layout (all integers little-endian)
 //!
