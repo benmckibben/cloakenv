@@ -337,6 +337,78 @@ fn vault_warnings_with(
     out
 }
 
+/// Warnings about the directory that holds the rollback-protection file and the copies of old vaults. Whoever can
+/// change what is in it can edit the record of what this machine has seen, which is the whole of rollback detection,
+/// so a directory other people can write to, that belongs to someone else, or that is a symbolic link (to somewhere
+/// that may be) is worth saying out loud. Only the directory itself is looked at, not its parents: a home directory
+/// that is a link is common and not the point.
+pub fn state_dir_warnings(dir: &Path) -> Vec<String> {
+    #[cfg(unix)]
+    {
+        let lazy = std::cell::OnceCell::new();
+        state_dir_warnings_with(dir, &|gid| {
+            lazy.get_or_init(Accounts::system).is_private_group(gid)
+        })
+    }
+    #[cfg(not(unix))]
+    state_dir_warnings_with(dir, &|_| false)
+}
+
+fn state_dir_warnings_with(
+    dir: &Path,
+    #[allow(unused_variables)] is_private_group: &dyn Fn(u32) -> bool,
+) -> Vec<String> {
+    #[allow(unused_mut)]
+    let mut out = Vec::new();
+    if is_symlink(dir) {
+        out.push(format!(
+            "rollback-protection directory {} is a symbolic link; cloakenv follows it, so make sure its target is private (whoever controls it controls rollback detection)",
+            dir.display()
+        ));
+    }
+    #[cfg(unix)]
+    if let (Some(mode), Some(gid)) = (mode_of(dir), gid_of(dir)) {
+        match dir_exposure(mode, gid, is_private_group) {
+            Some(Exposure::World) => out.push(format!(
+                "rollback-protection directory {} is world-writable (mode {mode:04o}, expected 0700); anyone on this machine could edit the record of which vaults this machine has seen and defeat rollback detection",
+                dir.display()
+            )),
+            Some(Exposure::SharedGroup) => out.push(format!(
+                "rollback-protection directory {} is writable by a group that is not private to you (mode {mode:04o}, expected 0700); its members could edit the record of which vaults this machine has seen",
+                dir.display()
+            )),
+            None => {}
+        }
+        if let Some(owner) = owner_of(dir) {
+            if owner != rustix::process::geteuid().as_raw() {
+                out.push(format!(
+                    "rollback-protection directory {} belongs to another user (uid {owner}); that user can edit the record of which vaults this machine has seen",
+                    dir.display()
+                ));
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Some(acl) = acl_of(dir) {
+        let who = acl_exposure(&acl, true);
+        if !who.is_empty() {
+            out.push(format!(
+                "rollback-protection directory {} can be written to by {} (Windows ACL); they could edit the record of which vaults this machine has seen. A directory cloakenv creates is open only to you, SYSTEM and Administrators",
+                dir.display(),
+                join_names(&who)
+            ));
+        }
+    }
+    out
+}
+
+/// Owning user of {`path`} (following symlinks), if it can be inspected.
+#[cfg(unix)]
+fn owner_of(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|m| m.uid())
+}
+
 /// Warnings about the passphrase file named by `CLOAKENV_PASSPHRASE_FILE`.
 ///
 /// This is a warning rather than an error on purpose: container and
@@ -558,6 +630,42 @@ staff:x:50:ben
         let (_t, v) = setup();
         chmod(&v, 0o666);
         assert!(vault_warnings(&v, false).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_state_directory_is_checked_like_the_vault_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("state");
+        std::fs::create_dir(&dir).unwrap();
+        chmod(&dir, 0o700);
+        assert!(
+            state_dir_warnings(&dir).is_empty(),
+            "{:?}",
+            state_dir_warnings(&dir)
+        );
+        assert!(
+            state_dir_warnings(&t.path().join("missing")).is_empty(),
+            "a directory that does not exist has nothing to say"
+        );
+        chmod(&dir, 0o777);
+        let w = state_dir_warnings(&dir);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("world-writable") && w[0].contains("rollback detection"),
+            "{w:?}"
+        );
+        chmod(&dir, 0o755);
+        assert!(
+            state_dir_warnings(&dir).is_empty(),
+            "readable by others is not writable by others"
+        );
+        chmod(&dir, 0o700);
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let w = state_dir_warnings(&link);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("symbolic link"), "{w:?}");
     }
 
     #[test]

@@ -78,6 +78,10 @@ pub enum VaultError {
     UnsupportedVersion(u8),
     #[error("unsupported vault algorithm (kdf id {kdf}, aead id {aead})")]
     UnsupportedAlgorithm { kdf: u8, aead: u8 },
+    #[error(
+        "this vault has been saved as many times as the format can count and cannot be saved again"
+    )]
+    GenerationOverflow,
     #[error("unsupported vault padding scheme {0}")]
     UnsupportedPadding(u8),
     #[error(
@@ -646,19 +650,19 @@ impl VaultLock {
 
 /// Copies the vault file at `path` to a new file next to it before it is
 /// replaced (`init --force`), and returns the copy's path. The copy is named
-/// `<vault file name>.bak-YYYYMMDDTHHMMSSZ` (UTC; a counter is added if that
+/// `<vault file name>.bak-YYYYMMDDTHHMMSSZ` in `dir` (UTC; a counter is added if that
 /// name is taken), created with mode 0600, and is only ever the ciphertext. It
 /// is never overwritten or removed by cloakenv, and it does not match the
 /// pattern of the temporary files that are cleaned up. Fails, leaving
 /// everything as it was, if the copy cannot be made.
-pub fn backup_vault(path: &Path) -> Result<PathBuf, VaultError> {
+pub fn backup_vault(path: &Path, dir: &Path) -> Result<PathBuf, VaultError> {
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    backup_vault_at(path, secs)
+    backup_vault_at(path, dir, secs)
 }
 
-fn backup_vault_at(path: &Path, unix_secs: u64) -> Result<PathBuf, VaultError> {
+fn backup_vault_at(path: &Path, dir: &Path, unix_secs: u64) -> Result<PathBuf, VaultError> {
     let mut source =
         fs::File::open(path).map_err(|e| VaultError::io("cannot back up the vault", path, e))?;
     let name = path.file_name().ok_or_else(|| {
@@ -668,6 +672,10 @@ fn backup_vault_at(path: &Path, unix_secs: u64) -> Result<PathBuf, VaultError> {
             io::ErrorKind::InvalidInput.into(),
         )
     })?;
+    // The copy goes into `dir` (a private directory made if need be), not next to the vault: a copy beside the vault
+    // is the ready-made old file for anyone who can write that directory.
+    create_private_dir(dir)
+        .map_err(|e| VaultError::io("cannot create the backup directory", dir, e))?;
     let stamp = utc_stamp(unix_secs);
     for attempt in 0..1000u32 {
         let mut backup_name = name.to_os_string();
@@ -675,7 +683,7 @@ fn backup_vault_at(path: &Path, unix_secs: u64) -> Result<PathBuf, VaultError> {
         if attempt > 0 {
             backup_name.push(format!("-{attempt}"));
         }
-        let backup = path.with_file_name(backup_name);
+        let backup = dir.join(backup_name);
         let mut dest = match open_private_file(&backup, Create::New, false) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -1478,8 +1486,8 @@ mod tests {
         v.save(&vault, b"old passphrase").unwrap();
         let original = fs::read(&vault).unwrap();
 
-        let first = backup_vault_at(&vault, 1_700_000_000).unwrap();
-        let second = backup_vault_at(&vault, 1_700_000_000).unwrap();
+        let first = backup_vault_at(&vault, dir.path(), 1_700_000_000).unwrap();
+        let second = backup_vault_at(&vault, dir.path(), 1_700_000_000).unwrap();
         assert_eq!(first.file_name().unwrap(), "vault.bin.bak-20231114T221320Z");
         assert_eq!(
             second.file_name().unwrap(),
@@ -1497,7 +1505,7 @@ mod tests {
         assert_eq!(Vault::load(&first, b"old passphrase").unwrap().len(), 1);
         // The original is untouched, and a missing vault is an error.
         assert_eq!(fs::read(&vault).unwrap(), original);
-        assert!(backup_vault_at(&dir.path().join("nope.bin"), 0).is_err());
+        assert!(backup_vault_at(&dir.path().join("nope.bin"), dir.path(), 0).is_err());
         // A backup never looks like a temporary file to the cleanup.
         let name = first.file_name().unwrap();
         assert!(!is_temp_file_name(name, std::ffi::OsStr::new("vault.bin")));
