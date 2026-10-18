@@ -2244,8 +2244,10 @@ v1 "
             check(&state, &old, &v1_with(5)).unwrap().verdict,
             Verdict::Unprotected
         );
-        // an ordinary path has one spelling
-        assert_eq!(path_keys(&old).len(), 1);
+        // a path with nothing to resolve has one spelling (the temporary directory is canonicalised first: on some
+        // systems it is itself under a link, and then even a plain file has two)
+        let plain = fs::canonicalize(t.path()).unwrap().join("old-v1.bin");
+        assert_eq!(path_keys(&plain).len(), 1);
     }
 
     #[test]
