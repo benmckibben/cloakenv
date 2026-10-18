@@ -136,23 +136,19 @@ fn cli_refuses_to_store_passphrase_vars() {
 
 #[test]
 fn vault_cannot_reintroduce_passphrase_vars() {
-    // The CLI refuses these names, so build the vault through the library, as
-    // a vault written by another tool or an older cloakenv could be. `run`
-    // must still strip them.
-    let env = Env::init();
-    let mut loaded = cloakenv::vault::file::Loaded::load(&env.vault(), PASS.as_bytes()).unwrap();
+    // The CLI refuses these names, so build a format 1 vault through the library, as a vault written by another
+    // tool or an older cloakenv could be. `run` must still strip them.
+    let env = Env::new();
+    let mut vault = cloakenv::vault::Vault::with_params(cloakenv::crypto::KdfParams::MIN).unwrap();
     for (k, v) in [
         ("CLOAKENV_PASSPHRASE", "from-vault"),
         ("CLOAKENV_PASSPHRASE_FILE", "from-vault-file"),
         ("CLOAKENV_NEW_PASSPHRASE_FILE", "from-vault-new-file"),
         ("KEEP", "yes"),
     ] {
-        loaded
-            .vault
-            .set(k, zeroize::Zeroizing::new(v.to_owned()))
-            .unwrap();
+        vault.set(k, zeroize::Zeroizing::new(v.to_owned())).unwrap();
     }
-    loaded.save(&env.vault(), PASS.as_bytes()).unwrap();
+    vault.save(&env.vault(), PASS.as_bytes()).unwrap();
     let out = env.ok(&[
         "run",
         "--",
@@ -161,6 +157,32 @@ fn vault_cannot_reintroduce_passphrase_vars() {
         r#"printf '%s' "${CLOAKENV_PASSPHRASE-unset}|${CLOAKENV_PASSPHRASE_FILE-unset}|${CLOAKENV_NEW_PASSPHRASE_FILE-unset}|$KEEP""#,
     ]);
     assert_eq!(stdout(&out), "unset|unset|unset|yes");
+}
+
+#[test]
+fn a_format_2_vault_cannot_hold_those_names_at_all() {
+    // The format 2 writer refuses them and the reader would refuse a file that had them (see src/vault/v2.rs), so
+    // unlike a format 1 vault there is nothing for `run` to strip.
+    let env = Env::init();
+    let mut loaded = cloakenv::vault::file::Loaded::load(&env.vault(), PASS.as_bytes()).unwrap();
+    for k in [
+        "CLOAKENV_PASSPHRASE",
+        "CLOAKENV_PASSPHRASE_FILE",
+        "CLOAKENV_NEW_PASSPHRASE_FILE",
+    ] {
+        loaded
+            .vault
+            .set(k, zeroize::Zeroizing::new("x".to_owned()))
+            .unwrap();
+        assert!(
+            matches!(
+                loaded.save(&env.vault(), PASS.as_bytes()),
+                Err(cloakenv::vault::VaultError::InvalidKey)
+            ),
+            "{k}"
+        );
+        loaded.vault.remove(k);
+    }
 }
 
 #[test]

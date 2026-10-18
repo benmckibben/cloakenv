@@ -686,9 +686,11 @@ fn the_upgrade_notice_appears_for_every_command_on_a_format_1_vault_and_creates_
         assert_f1_notice(&String::from_utf8_lossy(&out.stderr), "passwd");
         let bytes = fs::read(env.vault()).unwrap();
         assert_eq!(bytes[8], 1, "byte 8 must stay 1 after passwd");
+        // the kept copy of the old vault is in the state directory, but no rollback record is made for a vault that
+        // stays format 1
         assert!(
-            !env.state_dir().exists(),
-            "state dir must not exist after passwd on v1"
+            !env.state_dir().join("seen").exists(),
+            "no rollback record may be created after passwd on v1"
         );
         // verify it still opens with the new passphrase
         let list = env
@@ -809,7 +811,14 @@ fn upgrade_converts_a_format_1_vault_and_keeps_a_copy() {
     );
 
     // Backup copy exists with .bak-<timestamp> name
-    let vault_dir = env.path().join(".cloak");
+    // the copy is kept in the state directory, and nothing is left next to the vault
+    let beside: Vec<_> = fs::read_dir(env.path().join(".cloak"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".bak"))
+        .collect();
+    assert!(beside.is_empty(), "a copy next to the vault: {beside:?}");
+    let vault_dir = env.state_dir().join("backups");
     let backups: Vec<_> = fs::read_dir(&vault_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -994,7 +1003,14 @@ fn passwd_changes_the_passphrase_and_keeps_the_contents() {
     }
 
     // A backup copy exists that still opens with the old passphrase (via library)
-    let vault_dir = env.path().join(".cloak");
+    // the copy is kept in the state directory, and nothing is left next to the vault
+    let beside: Vec<_> = fs::read_dir(env.path().join(".cloak"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".bak"))
+        .collect();
+    assert!(beside.is_empty(), "a copy next to the vault: {beside:?}");
+    let vault_dir = env.state_dir().join("backups");
     let backups: Vec<_> = fs::read_dir(&vault_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -1177,4 +1193,93 @@ fn the_new_commands_are_listed_in_help() {
     let h = String::from_utf8_lossy(&out.stdout);
     assert!(h.contains("upgrade"), "help must mention upgrade");
     assert!(h.contains("passwd"), "help must mention passwd");
+}
+
+#[test]
+fn passwd_refuses_the_current_passphrase_as_the_new_one() {
+    let env = Env::init();
+    env.set("K", "v");
+    let before = fs::read(env.vault()).unwrap();
+    let same = env.path().join("same");
+    fs::write(&same, format!("{PASS}\n")).unwrap();
+    let out = env
+        .cmd(Some(PASS))
+        .env("CLOAKENV_NEW_PASSPHRASE_FILE", &same)
+        .arg("passwd")
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("same as the current"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(fs::read(env.vault()).unwrap(), before, "nothing changed");
+    let kept = env.state_dir().join("backups");
+    assert!(
+        !kept.exists() || fs::read_dir(&kept).unwrap().next().is_none(),
+        "no backup was made for a change that did not happen"
+    );
+}
+
+#[test]
+fn a_vault_this_machine_has_not_seen_is_trusted_once_and_says_so() {
+    let env = Env::new();
+    let seal = |generation: u64| {
+        let mut v = cloakenv::vault::Vault::with_params(cloakenv::crypto::KdfParams::MIN).unwrap();
+        v.set("K", zeroize::Zeroizing::new("v".to_owned())).unwrap();
+        let bytes =
+            cloakenv::vault::v2::seal(&v, &[9; 16], generation, &[], PASS.as_bytes()).unwrap();
+        fs::create_dir_all(env.vault().parent().unwrap()).unwrap();
+        fs::write(env.vault(), bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(env.vault(), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    };
+    const NOTE: &str = "has not seen this vault before";
+    seal(4);
+    let first = env.run(&["list"]);
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(stderr(&first).contains(NOTE), "{}", stderr(&first));
+    let second = env.run(&["list"]);
+    assert!(
+        second.status.success() && !stderr(&second).contains(NOTE),
+        "{}",
+        stderr(&second)
+    );
+    // from here on an older copy is refused
+    seal(3);
+    assert!(env.run(&["list"]).status.code() == Some(1));
+    // a vault this machine created itself never says it
+    let own = Env::init();
+    assert!(!stderr(&own.ok(&["list"])).contains(NOTE));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_world_writable_state_directory_is_warned_about() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::init();
+    fs::set_permissions(env.state_dir(), fs::Permissions::from_mode(0o777)).unwrap();
+    let out = env.run(&["list"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("rollback-protection directory")
+            && stderr(&out).contains("world-writable"),
+        "{}",
+        stderr(&out)
+    );
+    fs::set_permissions(env.state_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!stderr(&env.run(&["list"])).contains("rollback-protection directory"));
+}
+
+#[test]
+fn the_weak_passphrase_warning_points_at_passwd() {
+    let env = Env::new();
+    let out = env.cmd(Some("short")).arg("init").output().expect("spawn");
+    let err = stderr(&out);
+    assert!(err.contains("cloakenv passwd"), "{err}");
+    assert!(!err.contains("no command to change"), "{err}");
 }

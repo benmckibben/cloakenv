@@ -1,8 +1,8 @@
 //! Vault file format, version 2: the codec.
 //!
 //! Design and reasons: `docs/design/vault-format-v2.md`. This module only turns a [`Vault`] and its metadata into
-//! bytes and back. Nothing in the CLI uses it yet; the commands, the rollback state file and the migration come in
-//! later changes. Version 1 (the parent module) is untouched.
+//! bytes and back; the commands, the rollback state file and the format-aware load and save that use it are in
+//! [`super::state`], [`super::file`] and the CLI. Version 1 (the parent module) is untouched.
 //!
 //! # Layout (all integers little-endian)
 //!
@@ -54,6 +54,12 @@ pub const FIXED_HEADER_LEN: usize = 96;
 pub const MAX_EXTENSIONS_LEN: usize = 4096;
 /// Smallest padded plaintext, in bytes.
 pub const PAD_FLOOR: u64 = 4096;
+/// The weakest key-derivation settings a version 2 file may carry: what the writer has always written as its minimum.
+const V2_MIN_PARAMS: KdfParams = KdfParams {
+    m_cost_kib: 19 * 1024,
+    t_cost: 2,
+    p_cost: 1,
+};
 /// Length of the vault id.
 pub const VAULT_ID_LEN: usize = 16;
 /// An extension type with this bit set is *critical*: a reader that does not know it must refuse the file.
@@ -231,6 +237,14 @@ impl Header {
             p_cost: u32_at(20),
         }
         .validate_for_open()?;
+        // The reader accepts only what the writer writes. The writer never goes below these settings, and this is a
+        // constant of the format, not the current default, so raising the default later does not lock out old files.
+        if params.m_cost_kib < V2_MIN_PARAMS.m_cost_kib
+            || params.t_cost < V2_MIN_PARAMS.t_cost
+            || params.p_cost < V2_MIN_PARAMS.p_cost
+        {
+            return Err(VaultError::Malformed);
+        }
         let generation = u64::from_le_bytes(bytes[80..88].try_into().expect("8 bytes"));
         if generation == 0 || u32_at(88) != 0 {
             return Err(VaultError::Malformed);
@@ -307,6 +321,9 @@ fn decode_plaintext(buf: &[u8], params: KdfParams) -> Result<Vault, VaultError> 
         entries: BTreeMap::new(),
         params,
     };
+    // the writer emits the entries in key order, so a file that does not is not one of ours (and a repeated key
+    // cannot be in order either)
+    let mut previous: Option<&str> = None;
     for _ in 0..count {
         let klen = take_u32(buf, &mut pos)?;
         let key =
@@ -315,9 +332,13 @@ fn decode_plaintext(buf: &[u8], params: KdfParams) -> Result<Vault, VaultError> 
         let value =
             std::str::from_utf8(take(buf, &mut pos, vlen)?).map_err(|_| VaultError::Malformed)?;
         // valid name, no NUL, entry size cap: the same rules as `set`; the error is deliberately not echoed
-        if check_entry(key, value).is_err() || vault.entries.contains_key(key) {
+        if check_entry(key, value).is_err()
+            || crate::is_reserved_key(key)
+            || previous.is_some_and(|p| key <= p)
+        {
             return Err(VaultError::Malformed);
         }
+        previous = Some(key);
         vault
             .entries
             .insert(key.to_owned(), Zeroizing::new(value.to_owned()));
@@ -343,6 +364,10 @@ pub fn seal_with(
     let size = sealed_len(vault, ext_len);
     if size > MAX_VAULT_LEN {
         return Err(VaultError::VaultFull { size });
+    }
+    // the reader refuses these names, so the writer must not produce a file it could not read back
+    if vault.entries.keys().any(|k| crate::is_reserved_key(k)) {
+        return Err(VaultError::InvalidKey);
     }
     // never write settings weaker than the current minimum, as in version 1
     let params = vault.params.at_least(KdfParams::MIN).validate()?;
@@ -401,6 +426,19 @@ pub fn open(bytes: &[u8], passphrase: &[u8]) -> Result<Opened, VaultError> {
         extensions: header.extensions,
         tag,
     })
+}
+
+/// Entry point for the fuzzer, without the KDF and the AEAD in the way: whatever plaintext the decoder accepts must be
+/// exactly what the encoder produces for the vault it decoded (one plaintext, one valid form).
+#[doc(hidden)]
+pub fn fuzz_plaintext(buf: &[u8]) {
+    if let Ok(vault) = decode_plaintext(buf, KdfParams::MIN) {
+        assert_eq!(
+            &encode_plaintext(&vault)[..],
+            buf,
+            "an accepted plaintext must be canonical"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1185,5 +1223,62 @@ mod tests {
             accepted > 1000 && rejected > 1000,
             "{accepted} accepted, {rejected} rejected: the mutation is not exercising both"
         );
+    }
+
+    #[test]
+    fn the_reader_is_as_strict_as_the_writer() {
+        let good = sealed(&[("K", "v")]);
+        // settings between what any file may carry and what the writer ever writes
+        for (name, m, t, p) in [
+            ("memory below the writer's minimum", 8192u32, 2u32, 1u32),
+            ("one pass", 19456, 1, 1),
+        ] {
+            let mut b = patched(&good, 12, &m.to_le_bytes());
+            b = patched(&b, 16, &t.to_le_bytes());
+            b = patched(&b, 20, &p.to_le_bytes());
+            assert!(
+                matches!(open(&b, PASS), Err(VaultError::Malformed)),
+                "{name}"
+            );
+        }
+        // keys must be in order, once each
+        let unsorted = plaintext(2, &[entry(b"B", b"1"), entry(b"A", b"2")]);
+        assert!(
+            matches!(open(&forge(&unsorted), PASS), Err(VaultError::Malformed)),
+            "out of order"
+        );
+        let sorted = plaintext(2, &[entry(b"A", b"1"), entry(b"B", b"2")]);
+        assert!(
+            open(&forge(&sorted), PASS).is_ok(),
+            "the same two keys in order are fine"
+        );
+        // names the CLI refuses to store
+        for k in [
+            "CLOAKENV_PASSPHRASE",
+            "CLOAKENV_PASSPHRASE_FILE",
+            "CLOAKENV_NEW_PASSPHRASE_FILE",
+        ] {
+            let file = forge(&plaintext(1, &[entry(k.as_bytes(), b"x")]));
+            assert!(
+                matches!(open(&file, PASS), Err(VaultError::Malformed)),
+                "{k} in a file"
+            );
+            let mut v = vault_with(&[]);
+            v.entries
+                .insert(k.to_owned(), Zeroizing::new("x".to_owned()));
+            assert!(
+                matches!(seal(&v, &ID, 1, &[], PASS), Err(VaultError::InvalidKey)),
+                "the writer refuses {k} too"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plaintext_fuzz_entry_point_takes_garbage_and_valid_input() {
+        fuzz_plaintext(&[]);
+        fuzz_plaintext(&[0; 4096]);
+        fuzz_plaintext(&[0xff; 5000]);
+        fuzz_plaintext(&plaintext(1, &[entry(b"K", b"v")]));
+        fuzz_plaintext(&plaintext(2, &[entry(b"B", b"1"), entry(b"A", b"2")]));
     }
 }

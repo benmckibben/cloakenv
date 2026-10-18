@@ -18,8 +18,9 @@ use crate::crypto::{self, TAG_LEN};
 /// What a vault file carries besides its entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Meta {
-    /// Format version 1: no id, no generation, no extensions.
-    V1,
+    /// Format version 1: no id, no generation, no extensions. `tag` is the Poly1305 tag of the file as read or last
+    /// written: the only thing that identifies one version of a version 1 file.
+    V1 { tag: [u8; TAG_LEN] },
     /// Format version 2. A generation of 0 means "never saved": the first save writes generation 1.
     V2 {
         id: [u8; VAULT_ID_LEN],
@@ -61,7 +62,7 @@ impl Loaded {
     /// The format version: 1 or 2.
     pub fn format(&self) -> u8 {
         match self.meta {
-            Meta::V1 => 1,
+            Meta::V1 { .. } => 1,
             Meta::V2 { .. } => 2,
         }
     }
@@ -69,7 +70,7 @@ impl Loaded {
     /// What the rollback check compares: nothing for a vault that has never been saved.
     pub fn observed(&self) -> Option<Observed> {
         match &self.meta {
-            Meta::V1 => Some(Observed::V1),
+            Meta::V1 { tag } => Some(Observed::V1 { tag: *tag }),
             Meta::V2 { generation: 0, .. } => None,
             Meta::V2 {
                 id,
@@ -87,10 +88,15 @@ impl Loaded {
     /// Authenticates and decrypts the complete contents of a vault file of either format.
     pub fn open(bytes: &[u8], passphrase: &[u8]) -> Result<Self, VaultError> {
         match v2::format_version(bytes)? {
-            1 => Ok(Loaded {
-                vault: Vault::open(bytes, passphrase)?,
-                meta: Meta::V1,
-            }),
+            1 => {
+                let vault = Vault::open(bytes, passphrase)?;
+                let mut tag = [0u8; TAG_LEN];
+                tag.copy_from_slice(&bytes[bytes.len() - TAG_LEN..]);
+                Ok(Loaded {
+                    vault,
+                    meta: Meta::V1 { tag },
+                })
+            }
             2 => {
                 let o = v2::open(bytes, passphrase)?;
                 Ok(Loaded {
@@ -120,14 +126,20 @@ impl Loaded {
     /// read). On error nothing changed on disk and `self` is unchanged.
     pub fn save(&mut self, path: &Path, passphrase: &[u8]) -> Result<(), VaultError> {
         match &mut self.meta {
-            Meta::V1 => self.vault.save(path, passphrase),
+            Meta::V1 { tag } => {
+                self.vault.save(path, passphrase)?;
+                *tag = file_tag(path)?;
+                Ok(())
+            }
             Meta::V2 {
                 id,
                 generation,
                 tag,
                 extensions,
             } => {
-                let next = generation.checked_add(1).ok_or(VaultError::Malformed)?;
+                let next = generation
+                    .checked_add(1)
+                    .ok_or(VaultError::GenerationOverflow)?;
                 let bytes = v2::seal(&self.vault, id, next, extensions, passphrase)?;
                 write_atomic_private(path, &bytes)?;
                 *generation = next;
@@ -136,6 +148,19 @@ impl Loaded {
             }
         }
     }
+}
+
+/// The last `TAG_LEN` bytes of the file at `path`: the Poly1305 tag of a vault file of either format.
+fn file_tag(path: &Path) -> Result<[u8; TAG_LEN], VaultError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let read = || -> std::io::Result<[u8; TAG_LEN]> {
+        let mut f = std::fs::File::open(path)?;
+        f.seek(SeekFrom::End(-(TAG_LEN as i64)))?;
+        let mut tag = [0u8; TAG_LEN];
+        f.read_exact(&mut tag)?;
+        Ok(tag)
+    };
+    read().map_err(|e| VaultError::io("cannot read the vault just written", path, e))
 }
 
 #[cfg(test)]
@@ -165,7 +190,7 @@ mod tests {
     fn generation_of(l: &Loaded) -> u64 {
         match l.meta {
             Meta::V2 { generation, .. } => generation,
-            Meta::V1 => panic!("not format 2"),
+            Meta::V1 { .. } => panic!("not format 2"),
         }
     }
 
@@ -254,11 +279,20 @@ mod tests {
         v.set("K", Zeroizing::new("old".to_owned())).unwrap();
         v.save(&path, PASS).unwrap();
         let mut l = Loaded::load(&path, PASS).unwrap();
-        assert_eq!((l.format(), l.observed()), (1, Some(Observed::V1)));
+        let disk = fs::read(&path).unwrap();
+        let first_tag = disk[disk.len() - TAG_LEN..].to_vec();
+        assert_eq!(l.format(), 1);
+        assert!(matches!(l.observed(), Some(Observed::V1 { tag }) if tag[..] == first_tag[..]));
         l.vault.set("K2", Zeroizing::new("new".to_owned())).unwrap();
         l.save(&path, PASS).unwrap();
         assert_eq!(fs::read(&path).unwrap()[8], 1, "still format 1");
-        assert_eq!(l.meta, Meta::V1);
+        let after = fs::read(&path).unwrap();
+        let after_tag = &after[after.len() - TAG_LEN..];
+        assert!(
+            matches!(&l.meta, Meta::V1 { tag } if tag[..] == *after_tag),
+            "the tag follows the file"
+        );
+        assert_ne!(after_tag, &first_tag[..], "a save changes the tag");
         let plain = Vault::load(&path, PASS).unwrap();
         assert_eq!(plain.len(), 2, "the version 1 reader still opens it");
     }
@@ -270,7 +304,7 @@ mod tests {
             "/tests/fixtures/v1/one.bin"
         ));
         let l = Loaded::open(bytes, b"golden-v1-fixture-passphrase").unwrap();
-        assert_eq!(l.meta, Meta::V1);
+        assert!(matches!(&l.meta, Meta::V1 { tag } if tag[..] == bytes[bytes.len() - TAG_LEN..]));
         assert_eq!(
             entries(&l),
             vec![("GREETING".to_owned(), "hello".to_owned())]
@@ -326,7 +360,10 @@ mod tests {
         if let Meta::V2 { generation, .. } = &mut l.meta {
             *generation = u64::MAX;
         }
-        assert!(matches!(l.save(&path, PASS), Err(VaultError::Malformed)));
+        assert!(matches!(
+            l.save(&path, PASS),
+            Err(VaultError::GenerationOverflow)
+        ));
         assert_eq!(
             fs::read(&path).unwrap(),
             before.1,

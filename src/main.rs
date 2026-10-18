@@ -15,7 +15,7 @@ use cloakenv::crypto::{CryptoError, KdfParams};
 use cloakenv::input::{self, InputError};
 use cloakenv::passphrase as rules;
 use cloakenv::prompt::{self, PromptError};
-use cloakenv::vault::file::Loaded;
+use cloakenv::vault::file::{Loaded, Meta};
 use cloakenv::vault::state::{self, Observed, Verdict};
 use cloakenv::vault::v2;
 use cloakenv::vault::{
@@ -82,7 +82,8 @@ enum Cmd {
     /// Replacing an existing vault needs --force, which empties it (to change
     /// the passphrase and keep the contents, use 'passwd'). --force asks for
     /// confirmation on a terminal (or --yes when there is none) and first
-    /// saves a copy of the old vault next to it, as
+    /// saves a copy of the old vault in the state directory (CLOAKENV_STATE_DIR,
+    /// else the user's state directory), in backups/, as
     /// vault.bin.bak-YYYYMMDDTHHMMSSZ (mode 0600, still encrypted with the old
     /// passphrase; delete it when you no longer need it).
     #[command(after_help = SUBCOMMAND_EXIT_CODES)]
@@ -140,10 +141,11 @@ enum Cmd {
     ///
     /// Format 2 detects a rolled-back or diverged vault and hides the exact
     /// size of the contents. Converting is never done automatically: it
-    /// asks for the passphrase, keeps a copy of the format 1 file next to the
-    /// vault (vault.bin.bak-YYYYMMDDTHHMMSSZ, mode 0600, still readable by
-    /// older cloakenv) and writes the new file. cloakenv 0.2 and older
-    /// cannot open a format 2 vault.
+    /// asks for the passphrase, keeps a copy of the format 1 file in the state
+    /// directory, in backups/ (vault.bin.bak-YYYYMMDDTHHMMSSZ, mode 0600, still
+    /// readable by older cloakenv), remembers it so that cloakenv refuses it as
+    /// a downgrade, and writes the new file. cloakenv 0.2 and older cannot open
+    /// a format 2 vault.
     #[command(after_help = SUBCOMMAND_EXIT_CODES)]
     Upgrade,
     /// Change the vault's passphrase, keeping its contents.
@@ -342,7 +344,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             if path.exists() {
                 // Only now that the new passphrase is in hand and the lock
                 // is held: keep the old file before it is replaced.
-                let backup = backup_vault(path)?;
+                let backup = backup_vault(path, &backup_dir()?)?;
                 elog!(
                     "cloakenv: kept a copy of the old vault at {} (still encrypted with its old passphrase; delete it when you no longer need it)",
                     backup.display()
@@ -763,15 +765,27 @@ fn load_raw(path: &Path, pass: &Zeroizing<String>) -> Result<Loaded> {
     Ok(loaded)
 }
 
+/// How many times a read that looks like a rollback is repeated before it is believed. A command that only reads
+/// (`list`, `run`, `info`) does not hold the vault's write lock, so a writer can save the next generation and record it
+/// between that read and the comparison; the copy that was read is then simply one generation behind. The writer
+/// renames the new file into place before it records the generation, so one more read is guaranteed to see the new
+/// file. The repeat never skips the check: a copy that is still behind after it is refused as before.
+const SETTLE_ATTEMPTS: usize = 3;
+
 /// [`load_raw`] without the upgrade notice (for `upgrade` itself).
 fn load_checked(path: &Path, pass: &Zeroizing<String>) -> Result<Loaded> {
     require_vault(path)?;
     // Advisory only; goes to our own stderr before anything is decrypted or
     // spawned, so it can never end up inside a shielded child stream.
     perms::emit(&perms::vault_warnings(path, true));
-    let loaded = Loaded::load(path, pass.as_bytes()).map_err(|err| passphrase_hint(err, pass))?;
-    check_rollback(path, &loaded)?;
-    Ok(loaded)
+    for attempt in 1..=SETTLE_ATTEMPTS {
+        let loaded =
+            Loaded::load(path, pass.as_bytes()).map_err(|err| passphrase_hint(err, pass))?;
+        if check_rollback(path, &loaded, attempt == SETTLE_ATTEMPTS)? {
+            return Ok(loaded);
+        }
+    }
+    unreachable!("the last attempt either accepts the vault or fails")
 }
 
 /// Set once a rollback-protection warning has been printed, so that the save
@@ -788,14 +802,17 @@ fn state_warning(text: &str) {
 /// for what this machine has seen. A format 1 vault only needs a look at the
 /// file (nothing to record), so a user who never upgrades never gets a state
 /// directory created for them.
-fn check_rollback(path: &Path, loaded: &Loaded) -> Result<()> {
+///
+/// Returns `Ok(true)` if the vault may be used and `Ok(false)` if it looks refusable but `last` is false (the
+/// caller reads it again, see [`SETTLE_ATTEMPTS`]); on the last attempt a refusal is an error.
+fn check_rollback(path: &Path, loaded: &Loaded, last: bool) -> Result<bool> {
     let Some(obs) = loaded.observed() else {
-        return Ok(());
+        return Ok(true);
     };
     let dir = state::state_dir();
     let checked = match (&obs, &dir) {
-        (Observed::V1, None) => return Ok(()),
-        (Observed::V1, Some(dir)) => {
+        (Observed::V1 { .. }, None) => return Ok(true),
+        (Observed::V1 { .. }, Some(dir)) => {
             let (verdict, _) = state::peek(dir, path, &obs)?;
             state::Checked {
                 verdict,
@@ -806,17 +823,31 @@ fn check_rollback(path: &Path, loaded: &Loaded) -> Result<()> {
             state_warning(
                 "cannot check this vault for rollback: there is no place for the rollback-protection file (HOME is not set; set CLOAKENV_STATE_DIR)",
             );
-            return Ok(());
+            return Ok(true);
         }
         (_, Some(dir)) => state::check(dir, path, &obs)?,
     };
+    let refusal = checked.verdict.refusal(path);
+    if refusal.is_some() && !last {
+        return Ok(false);
+    }
+    if let Some(dir) = &dir {
+        for w in perms::state_dir_warnings(dir) {
+            state_warning(&w);
+        }
+    }
     for w in &checked.warnings {
         state_warning(w);
     }
-    match checked.verdict.refusal(path) {
-        Some(msg) => bail!("{msg}"),
-        None => Ok(()),
+    if let Some(msg) = refusal {
+        bail!("{msg}");
     }
+    if let Verdict::FirstSeen = checked.verdict {
+        elog!(
+            "cloakenv: note: this machine has not seen this vault before; it is trusted now, and from here on an older copy of it is refused"
+        );
+    }
+    Ok(true)
 }
 
 /// Records a vault this command has just saved (not yet seen by anyone else),
@@ -902,11 +933,13 @@ struct Inspected {
 }
 
 /// Reads and authenticates a vault of format 1 or 2. Never writes anything.
-fn inspect(path: &Path, pass: &Zeroizing<String>) -> Result<Inspected> {
+fn inspect(path: &Path, pass: &Zeroizing<String>, warn: bool) -> Result<Inspected> {
     use std::io::Read as _;
     require_vault(path)?;
     // Advisory only, on our own stderr, before anything is decrypted.
-    perms::emit(&perms::vault_warnings(path, true));
+    if warn {
+        perms::emit(&perms::vault_warnings(path, true));
+    }
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .and_then(|f| f.take(MAX_VAULT_LEN + 1).read_to_end(&mut bytes))
@@ -921,7 +954,11 @@ fn inspect(path: &Path, pass: &Zeroizing<String>) -> Result<Inspected> {
                 size,
                 params: vault.params(),
                 entries: vault.len(),
-                observed: Observed::V1,
+                observed: Observed::V1 {
+                    tag: bytes[bytes.len() - cloakenv::crypto::TAG_LEN..]
+                        .try_into()
+                        .expect("a vault file is longer than its tag"),
+                },
                 v2: None,
             })
         }
@@ -945,6 +982,64 @@ fn inspect(path: &Path, pass: &Zeroizing<String>) -> Result<Inspected> {
     }
 }
 
+/// [`inspect`], then what the rollback state says about it, read again (up to [`SETTLE_ATTEMPTS`] times) while the
+/// answer is a refusal, for the reason given at [`SETTLE_ATTEMPTS`]. The second part is `None` if there is no state
+/// directory.
+#[allow(clippy::type_complexity)]
+fn inspect_settled(
+    path: &Path,
+    pass: &Zeroizing<String>,
+) -> Result<(
+    Inspected,
+    Option<(PathBuf, Result<Verdict, state::StateError>)>,
+)> {
+    let dir = state::state_dir();
+    for attempt in 1..=SETTLE_ATTEMPTS {
+        let i = inspect(path, pass, attempt == 1)?;
+        let peeked = dir.as_ref().map(|d| {
+            (
+                d.clone(),
+                state::peek(d, path, &i.observed).map(|(verdict, _)| verdict),
+            )
+        });
+        let refused = matches!(&peeked, Some((_, Ok(v))) if v.refused());
+        if !refused || attempt == SETTLE_ATTEMPTS {
+            return Ok((i, peeked));
+        }
+    }
+    unreachable!("the last attempt returns")
+}
+
+/// Where the copy of the old vault goes (see [`state::backup_dir`]).
+fn backup_dir() -> Result<PathBuf> {
+    state::state_dir()
+        .map(|d| state::backup_dir(&d))
+        .ok_or_else(|| {
+            anyhow!(
+                "cannot keep a copy of the old vault: there is no place for it (HOME is not set). Set CLOAKENV_STATE_DIR to a directory"
+            )
+        })
+}
+
+/// Records a vault that was just upgraded from format 1 (see [`state::accept_upgraded`]).
+fn record_upgraded(path: &Path, old_v1_tag: &[u8; 16], loaded: &Loaded) {
+    let Some(obs) = loaded.observed() else {
+        return;
+    };
+    match state::state_dir() {
+        None => state_warning(
+            "cannot record this vault for rollback protection: HOME is not set (set CLOAKENV_STATE_DIR)",
+        ),
+        Some(dir) => {
+            if let Err(e) = state::accept_upgraded(&dir, path, old_v1_tag, &obs) {
+                state_warning(&format!(
+                    "could not record this vault for rollback protection: {e}"
+                ));
+            }
+        }
+    }
+}
+
 /// One line of `info` about the rollback state.
 fn rollback_status(verdict: &Verdict, vault: &Path) -> String {
     if let Some(refusal) = verdict.refusal(vault) {
@@ -963,16 +1058,14 @@ fn rollback_status(verdict: &Verdict, vault: &Path) -> String {
 /// `cloakenv info`: prints facts about the vault, never a name or a value.
 fn cmd_info(path: &Path) -> Result<()> {
     let pass = passphrase(false)?;
-    let i = inspect(path, &pass)?;
+    let (i, peeked) = inspect_settled(path, &pass)?;
     if i.version == 1 {
         upgrade_notice();
     }
-    let status = match state::state_dir() {
+    let status = match peeked {
         None => "unknown: no place for the rollback-protection file (HOME is not set; set CLOAKENV_STATE_DIR)".to_owned(),
-        Some(dir) => match state::peek(&dir, path, &i.observed) {
-            Ok((verdict, _)) => rollback_status(&verdict, path),
-            Err(e) => format!("unknown: {e}"),
-        },
+        Some((_, Ok(verdict))) => rollback_status(&verdict, path),
+        Some((_, Err(e))) => format!("unknown: {e}"),
     };
     let p = i.params;
     let mut lines = vec![
@@ -1007,11 +1100,13 @@ fn cmd_info(path: &Path) -> Result<()> {
 /// `cloakenv accept-rollback`: the deliberate way past a rollback, fork or downgrade refusal.
 fn cmd_accept_rollback(path: &Path, yes: bool) -> Result<()> {
     let pass = passphrase(false)?;
-    let i = inspect(path, &pass)?;
-    let dir = state::state_dir().ok_or_else(|| {
-        anyhow!("cannot find a place for the rollback-protection file: HOME is not set. Set CLOAKENV_STATE_DIR to a directory")
-    })?;
-    let (verdict, _) = state::peek(&dir, path, &i.observed)?;
+    let (i, peeked) = inspect_settled(path, &pass)?;
+    let (dir, verdict) = match peeked {
+        Some((dir, verdict)) => (dir, verdict?),
+        None => bail!(
+            "cannot find a place for the rollback-protection file: HOME is not set. Set CLOAKENV_STATE_DIR to a directory"
+        ),
+    };
     let summary = match (&verdict, &i.observed) {
         (Verdict::Rollback { seen, last_path }, Observed::V2 { generation, .. }) => format!(
             "The vault in hand is generation {generation}; this machine has seen generation {seen}{}. Accepting makes generation {generation} the new normal; anything saved in the newer generations is not in this copy.",
@@ -1046,19 +1141,22 @@ fn cmd_upgrade(path: &Path) -> Result<()> {
             path.display()
         );
     }
-    let backup = backup_vault(path)?;
+    let Meta::V1 { tag: old_v1_tag } = loaded.meta else {
+        bail!("internal error: a vault that is not format 1 reached the upgrade");
+    };
+    let backup = backup_vault(path, &backup_dir()?)?;
     let mut vault = loaded.vault;
     let before = vault.params();
     let raised = vault.upgrade_kdf_params();
     let mut upgraded = Loaded::from_vault_v2(vault)?;
     upgraded.save(path, pass.as_bytes())?;
-    record_accepted(path, &upgraded);
+    record_upgraded(path, &old_v1_tag, &upgraded);
     elog!(
         "cloakenv: upgraded the vault at {} to format 2 (generation 1)",
         path.display()
     );
     elog!(
-        "cloakenv: kept a copy of the format 1 file at {} (same passphrase; delete it once you have checked the upgraded vault)",
+        "cloakenv: kept a copy of the format 1 file at {} (same passphrase; delete it once you have checked the upgraded vault). cloakenv refuses to open that copy as a downgrade, so it is for recovery only",
         backup.display()
     );
     elog!("cloakenv: cloakenv 0.2 and older cannot open a format 2 vault");
@@ -1082,12 +1180,15 @@ fn cmd_passwd(path: &Path) -> Result<()> {
     require_vault(path)?;
     let old = passphrase(false)?;
     let new = new_passphrase()?;
+    if *new == *old {
+        bail!("the new passphrase is the same as the current one; nothing was changed");
+    }
     check_new_passphrase(&new)?;
     let _lock = lock(path)?;
     // A wrong current passphrase fails here, before anything is written.
     let mut loaded = load_raw(path, &old)?;
     loaded.vault.upgrade_kdf_params();
-    let backup = backup_vault(path)?;
+    let backup = backup_vault(path, &backup_dir()?)?;
     loaded.save(path, new.as_bytes())?;
     record_save(path, &loaded);
     elog!(
@@ -1095,7 +1196,7 @@ fn cmd_passwd(path: &Path) -> Result<()> {
         path.display()
     );
     elog!(
-        "cloakenv: kept the vault as it was at {}: it is still encrypted with the OLD passphrase; delete it once you have confirmed that the new one works",
+        "cloakenv: kept the vault as it was at {}: it is still encrypted with the OLD passphrase, and cloakenv refuses to open it as a rollback (it is an older version), so it is for recovery only; delete it once you have confirmed that the new one works",
         backup.display()
     );
     Ok(())
@@ -1162,7 +1263,7 @@ fn check_new_passphrase(pass: &str) -> Result<()> {
     }
     if rules::is_weak(pass) {
         elog!(
-            "cloakenv: warning: the passphrase is shorter than {} characters; anyone who obtains the vault file can guess it offline, so a short passphrase is easy to crack. Use a longer one (4 or more random words, or 20 or more random characters). There is no command to change the passphrase later: `cloakenv init --force` starts over (and erases the vault's contents)",
+            "cloakenv: warning: the passphrase is shorter than {} characters; anyone who obtains the vault file can guess it offline, so a short passphrase is easy to crack. Use a longer one (4 or more random words, or 20 or more random characters). To change the passphrase later, run `cloakenv passwd`",
             rules::WEAK_BELOW_CHARS
         );
     }

@@ -9,9 +9,11 @@
 //! # File format
 //!
 //! ```text
-//! cloakenv-seen 1
+//! cloakenv-seen 2
 //! vault <vault id, 32 hex> <generation> <tag, 32 hex> <last path, escaped, or "-">
 //! path <vault id, 32 hex> <path, escaped>
+//! v1 <tag, 32 hex> <vault id, 32 hex>
+//! end
 //! ```
 //!
 //! Strictly parsed: an unknown line kind, a duplicate vault id or path, a bad number, a bad escape, a line over
@@ -41,7 +43,10 @@ pub const FILE_NAME: &str = "seen";
 pub const MAX_VAULTS: usize = 1024;
 const MAX_FILE_LEN: u64 = 4 * 1024 * 1024;
 const MAX_LINE_LEN: usize = 8192;
-const HEADER: &str = "cloakenv-seen 1";
+const HEADER: &str = "cloakenv-seen 2";
+/// The header that the first development builds wrote: still read (without an end marker), never written.
+const LEGACY_HEADER: &str = "cloakenv-seen 1";
+const END_LINE: &str = "end";
 const HEADER_PREFIX: &str = "cloakenv-seen ";
 
 /// A vault's random id (see the format design).
@@ -65,13 +70,16 @@ pub struct State {
     vaults: Vec<Seen>,
     /// Every path that has held a version 2 vault, with the vault id it held (the downgrade guard).
     paths: Vec<(String, VaultId)>,
+    /// Tags of version 1 files that were upgraded to the given vault: such a file, at any path, is a downgrade.
+    retired: Vec<(Tag, VaultId)>,
 }
 
 /// The vault file in hand, as far as the state check is concerned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observed {
-    /// A version 1 file: it carries no generation and no id.
-    V1,
+    /// A version 1 file: it carries no generation and no id, only the Poly1305 tag of this exact version of the file,
+    /// which is what lets a version 1 file that was upgraded away be recognised wherever it turns up.
+    V1 { tag: Tag },
     /// A version 2 file, after its tag verified.
     V2 {
         id: VaultId,
@@ -248,6 +256,11 @@ impl State {
         for (p, id) in &self.paths {
             out.push_str(&format!("path {} {}\n", hex(id), escape(p)));
         }
+        for (tag, id) in &self.retired {
+            out.push_str(&format!("v1 {} {}\n", hex(tag), hex(id)));
+        }
+        out.push_str(END_LINE);
+        out.push('\n');
         out
     }
 
@@ -263,11 +276,12 @@ impl State {
             .into_iter()
             .enumerate()
             .map(|(i, l)| (i + 1, l.strip_suffix('\r').unwrap_or(l)));
-        match it.next() {
-            Some((_, h)) if h == HEADER => {}
+        let needs_end = match it.next() {
+            Some((_, h)) if h == HEADER => true,
+            Some((_, h)) if h == LEGACY_HEADER => false,
             Some((_, h)) if h.starts_with(HEADER_PREFIX) => {
                 match h[HEADER_PREFIX.len()..].parse::<u32>() {
-                    Ok(v) if v > 1 => return Err(ParseError::Newer(v)),
+                    Ok(v) if v > 2 => return Err(ParseError::Newer(v)),
                     _ => return Err(bad(1, "unrecognised header")),
                 }
             }
@@ -277,9 +291,18 @@ impl State {
                     "this is not a cloakenv state file (the header line is missing)",
                 ));
             }
-        }
+        };
         let mut st = State::default();
+        let (mut ended, mut last) = (false, 1usize);
         for (n, line) in it {
+            last = n;
+            if ended {
+                return Err(bad(n, "there is data after the end marker"));
+            }
+            if needs_end && line == END_LINE {
+                ended = true;
+                continue;
+            }
             if line.len() > MAX_LINE_LEN {
                 return Err(bad(n, "the line is longer than 8 KiB"));
             }
@@ -344,8 +367,25 @@ impl State {
                     }
                     st.paths.push((path, id));
                 }
+                "v1" => {
+                    let mut f = rest.split(' ');
+                    let (Some(tag), Some(id), None) = (f.next(), f.next(), f.next()) else {
+                        return Err(bad(n, "a v1 line needs a tag and a vault id"));
+                    };
+                    let tag =
+                        parse_hex16(tag).ok_or_else(|| bad(n, "the tag is not 32 hex digits"))?;
+                    let id = parse_hex16(id)
+                        .ok_or_else(|| bad(n, "the vault id is not 32 hex digits"))?;
+                    if st.retired.iter().any(|(t, _)| *t == tag) {
+                        return Err(bad(n, "this tag appears twice"));
+                    }
+                    st.retired.push((tag, id));
+                }
                 _ => return Err(bad(n, "unknown line kind")),
             }
+        }
+        if needs_end && !ended {
+            return Err(bad(last, "the file is cut short (there is no end marker)"));
         }
         Ok(st)
     }
@@ -372,10 +412,113 @@ impl State {
             .map(|(_, id)| *id)
     }
 
+    /// The vault that a version 1 file with this tag was upgraded to, if it was.
+    pub fn retired_owner(&self, tag: &Tag) -> Option<VaultId> {
+        self.retired
+            .iter()
+            .find(|(t, _)| t == tag)
+            .map(|(_, id)| *id)
+    }
+
+    /// Remembers that the version 1 file with `tag` was upgraded to the vault `id`. Returns whether that is new.
+    pub fn retire_v1(&mut self, tag: &Tag, id: &VaultId) -> bool {
+        match self.retired.iter().position(|(t, _)| t == tag) {
+            Some(i) if self.retired[i].1 == *id => return false,
+            Some(i) => self.retired[i].1 = *id,
+            None => self.retired.push((*tag, *id)),
+        }
+        while self.retired.len() > MAX_VAULTS {
+            self.retired.remove(0);
+        }
+        true
+    }
+
+    /// Remembers that `path` has held the vault `id`. Returns whether that is new.
+    pub fn link_path(&mut self, path: &str, id: &VaultId) -> bool {
+        match self.paths.iter().position(|(q, _)| q == path) {
+            Some(j) if self.paths[j].1 == *id => false,
+            Some(j) => {
+                self.paths[j].1 = *id;
+                true
+            }
+            None => {
+                self.paths.push((path.to_owned(), *id));
+                true
+            }
+        }
+    }
+
+    /// Counts opening a vault as use: an entry in the older half moves to the end, so that a vault that is opened
+    /// is not the one that is forgotten when the cap is reached. Entries in the newer half stay where they are, so
+    /// that opening does not rewrite the file every time. Returns whether anything moved.
+    pub fn touch(&mut self, obs: &Observed) -> bool {
+        let Observed::V2 { id, .. } = obs else {
+            return false;
+        };
+        match self.find(id) {
+            Some(i) if i < self.vaults.len() / 2 => {
+                let entry = self.vaults.remove(i);
+                self.vaults.push(entry);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// [`State::evaluate`] against several spellings of the vault's path (see [`path_keys`]): any of them having held a
+    /// version 2 vault makes a version 1 file a downgrade.
+    pub fn evaluate_keys(&self, keys: &[String], obs: &Observed) -> Verdict {
+        let first = self.evaluate(keys.first().map(String::as_str), obs);
+        if first.refused() {
+            return first;
+        }
+        for k in keys.iter().skip(1) {
+            let v = self.evaluate(Some(k), obs);
+            if v.refused() {
+                return v;
+            }
+        }
+        first
+    }
+
+    /// [`State::record`] for every spelling of the path.
+    pub fn record_keys(&mut self, keys: &[String], obs: &Observed) -> bool {
+        let mut changed = self.record(keys.first().map(String::as_str), obs);
+        if let Observed::V2 { id, .. } = obs {
+            for k in keys.iter().skip(1) {
+                changed |= self.link_path(k, id);
+            }
+        }
+        changed
+    }
+
+    /// [`State::accept`] for every spelling of the path.
+    pub fn accept_keys(&mut self, keys: &[String], obs: &Observed) -> bool {
+        match obs {
+            Observed::V1 { .. } => {
+                let mut changed = self.accept(None, obs);
+                for k in keys {
+                    changed |= self.accept(Some(k), obs);
+                }
+                changed
+            }
+            Observed::V2 { id, .. } => {
+                let mut changed = self.accept(keys.first().map(String::as_str), obs);
+                for k in keys.iter().skip(1) {
+                    changed |= self.link_path(k, id);
+                }
+                changed
+            }
+        }
+    }
+
     /// Compares what is in hand with what is remembered. Pure: changes nothing.
     pub fn evaluate(&self, path: Option<&str>, obs: &Observed) -> Verdict {
         match obs {
-            Observed::V1 => match path.and_then(|p| self.path_owner(p)) {
+            Observed::V1 { tag } => match self
+                .retired_owner(tag)
+                .or_else(|| path.and_then(|p| self.path_owner(p)))
+            {
                 Some(id) => Verdict::Downgrade { id },
                 None => Verdict::Unprotected,
             },
@@ -403,7 +546,7 @@ impl State {
     /// Records a vault that was not refused: raises the mark and remembers the path. Returns whether anything changed.
     pub fn record(&mut self, path: Option<&str>, obs: &Observed) -> bool {
         match obs {
-            Observed::V1 => false,
+            Observed::V1 { .. } => false,
             Observed::V2 {
                 id,
                 generation,
@@ -416,12 +559,13 @@ impl State {
     /// version 1 file, forgets that the path ever held a version 2 vault. Returns whether anything changed.
     pub fn accept(&mut self, path: Option<&str>, obs: &Observed) -> bool {
         match obs {
-            Observed::V1 => {
-                let before = self.paths.len();
+            Observed::V1 { tag } => {
+                let before = (self.paths.len(), self.retired.len());
                 if let Some(p) = path {
                     self.paths.retain(|(q, _)| q != p);
                 }
-                self.paths.len() != before
+                self.retired.retain(|(t, _)| t != tag);
+                (self.paths.len(), self.retired.len()) != before
             }
             Observed::V2 {
                 id,
@@ -467,21 +611,12 @@ impl State {
             }
         }
         if let Some(p) = path {
-            match self.paths.iter().position(|(q, _)| q == p) {
-                Some(j) if self.paths[j].1 == *id => {}
-                Some(j) => {
-                    self.paths[j].1 = *id;
-                    changed = true;
-                }
-                None => {
-                    self.paths.push((p.to_owned(), *id));
-                    changed = true;
-                }
-            }
+            changed |= self.link_path(p, id);
         }
         while self.vaults.len() > MAX_VAULTS {
             let gone = self.vaults.remove(0);
             self.paths.retain(|(_, i)| *i != gone.id);
+            self.retired.retain(|(_, i)| *i != gone.id);
             changed = true;
         }
         changed
@@ -553,9 +688,36 @@ pub fn state_dir() -> Option<PathBuf> {
     state_dir_for(Platform::current(), &|k| std::env::var_os(k))
 }
 
+/// Where the copies that `init --force`, `upgrade` and `passwd` keep of the old vault go: inside the state directory
+/// (private, and not a place an attacker who can write only the vault's directory can reach), not next to the vault.
+pub fn backup_dir(dir: &Path) -> PathBuf {
+    dir.join("backups")
+}
+
 /// The state file inside `dir`.
 pub fn state_file(dir: &Path) -> PathBuf {
     dir.join(FILE_NAME)
+}
+
+/// Every spelling of the vault's path that is remembered: the canonical path (symlinks resolved) and the absolute
+/// path as it was given (symlinks not resolved), when they differ and can be written as text. Remembering both
+/// means a vault that is replaced by a symbolic link to another file is still recognised by the name it was opened
+/// under. A directory that is renamed is not recognised by path at all; that is what the identity of an upgraded
+/// version 1 file is for.
+pub fn path_keys(vault: &Path) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(canon) = path_key(vault) {
+        keys.push(canon);
+    }
+    if let Some(lit) = std::path::absolute(vault)
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned))
+    {
+        if !keys.contains(&lit) {
+            keys.push(lit);
+        }
+    }
+    keys
 }
 
 /// The key a vault is remembered under: its canonical path, if it has one that can be written as text.
@@ -632,8 +794,8 @@ fn unchecked(reason: String) -> Checked {
 /// updated. A missing state file that cannot be created gives [`Verdict::Unchecked`]. A damaged file is an error.
 pub fn check(dir: &Path, vault: &Path, obs: &Observed) -> Result<Checked, StateError> {
     let file = state_file(dir);
-    let key = path_key(vault);
-    let key = key.as_deref();
+    let keys = path_keys(vault);
+    let key = keys.first().map(String::as_str);
     let lock = VaultLock::acquire(&file);
     let (state, cannot_update) = match &lock {
         Ok(_) => (load(&file), None),
@@ -654,13 +816,17 @@ pub fn check(dir: &Path, vault: &Path, obs: &Observed) -> Result<Checked, StateE
         Load::Missing => State::default(),
         Load::Ok(s) => s,
     };
-    let verdict = state.evaluate(key, obs);
+    let verdict = state.evaluate_keys(&keys, obs);
     let mut warnings: Vec<String> = path_reused_warning(&state, key, obs).into_iter().collect();
     if verdict.refused() {
         return Ok(Checked { verdict, warnings });
     }
     let mut next = state.clone();
-    if next.record(key, obs) {
+    let mut changed = next.record_keys(&keys, obs);
+    if matches!(verdict, Verdict::Same) {
+        changed |= next.touch(obs);
+    }
+    if changed {
         let wrote = match &cannot_update {
             None => {
                 write_atomic_private(&file, next.serialize().as_bytes()).map_err(|e| e.to_string())
@@ -681,18 +847,18 @@ pub fn peek(
     obs: &Observed,
 ) -> Result<(Verdict, Option<Seen>), StateError> {
     let file = state_file(dir);
-    let key = path_key(vault);
+    let keys = path_keys(vault);
     match load(&file) {
         Load::Ok(s) => {
             let seen = match obs {
                 Observed::V2 { id, .. } => s.get(id).cloned(),
-                Observed::V1 => None,
+                Observed::V1 { .. } => None,
             };
-            Ok((s.evaluate(key.as_deref(), obs), seen))
+            Ok((s.evaluate_keys(&keys, obs), seen))
         }
         // no file yet is an empty state, exactly as in [`check`]: a version 2 vault has never been seen and a
         // version 1 file is unprotected
-        Load::Missing => Ok((State::default().evaluate(key.as_deref(), obs), None)),
+        Load::Missing => Ok((State::default().evaluate_keys(&keys, obs), None)),
         Load::Unreadable(e) => Ok((
             Verdict::Unchecked {
                 reason: format!("{} cannot be read: {e}", file.display()),
@@ -708,7 +874,7 @@ pub fn peek(
 /// remembered before, for the confirmation message.
 pub fn accept(dir: &Path, vault: &Path, obs: &Observed) -> Result<Option<Seen>, StateError> {
     let file = state_file(dir);
-    let key = path_key(vault);
+    let keys = path_keys(vault);
     let _lock = VaultLock::acquire(&file)?;
     let mut state = match load(&file) {
         Load::Ok(s) => s,
@@ -722,12 +888,60 @@ pub fn accept(dir: &Path, vault: &Path, obs: &Observed) -> Result<Option<Seen>, 
     };
     let before = match obs {
         Observed::V2 { id, .. } => state.get(id).cloned(),
-        Observed::V1 => None,
+        Observed::V1 { .. } => None,
     };
-    if state.accept(key.as_deref(), obs) {
+    if state.accept_keys(&keys, obs) {
         write_atomic_private(&file, state.serialize().as_bytes())?;
     }
     Ok(before)
+}
+
+/// Records a vault that was just upgraded from format 1 (`cloakenv upgrade`): the new vault becomes the latest
+/// known version of this path, and the tag of the version 1 file it came from is remembered, so that this file (the
+/// copy that is kept as a backup is exactly that) is refused as a downgrade at whatever path it turns up. Older
+/// version 1 snapshots are not recognised: a version 1 file has no id, and nothing else identifies it.
+pub fn accept_upgraded(
+    dir: &Path,
+    vault: &Path,
+    old_v1_tag: &Tag,
+    obs: &Observed,
+) -> Result<(), StateError> {
+    let Observed::V2 { id, .. } = obs else {
+        return Ok(());
+    };
+    let file = state_file(dir);
+    let keys = path_keys(vault);
+    let _lock = VaultLock::acquire(&file)?;
+    let mut state = match load(&file) {
+        Load::Ok(s) => s,
+        Load::Missing => State::default(),
+        Load::Bad(e) => return Err(e),
+        Load::Unreadable(e) => {
+            return Err(
+                VaultError::io("cannot read the rollback-protection file", &file, e).into(),
+            );
+        }
+    };
+    let mut changed = state.accept_keys(&keys, obs);
+    changed |= state.retire_v1(old_v1_tag, id);
+    if changed {
+        write_atomic_private(&file, state.serialize().as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Entry point for the fuzzer: whatever the parser accepts must serialise to something that parses back to the same
+/// state, and serialising that again must give the same text.
+#[doc(hidden)]
+pub fn fuzz_parse(text: &str) {
+    if let Ok(state) = State::parse(text) {
+        let again = state.serialize();
+        let back = State::parse(&again)
+            .ok()
+            .expect("a serialised state parses");
+        assert_eq!(back, state);
+        assert_eq!(back.serialize(), again);
+    }
 }
 
 #[cfg(test)]
@@ -739,6 +953,12 @@ mod tests {
     }
     fn tag(n: u8) -> Tag {
         [n.wrapping_add(100); 16]
+    }
+    fn v1_obs() -> Observed {
+        Observed::V1 { tag: [0x11; 16] }
+    }
+    fn v1_with(t: u8) -> Observed {
+        Observed::V1 { tag: [t; 16] }
     }
     fn v2(n: u8, generation: u64, t: u8) -> Observed {
         Observed::V2 {
@@ -788,7 +1008,7 @@ mod tests {
         ]);
         s.record(Some("/second/path"), &v2(1, 5, 1));
         let text = s.serialize();
-        assert!(text.starts_with("cloakenv-seen 1\n") && text.ends_with('\n'));
+        assert!(text.starts_with("cloakenv-seen 2\n") && text.ends_with('\n'));
         let again = State::parse(&text).ok().expect("parses");
         assert_eq!(again, s);
         assert_eq!(again.serialize(), text);
@@ -966,7 +1186,7 @@ mod tests {
                 "{name}: got {e:?}, wanted it to mention {want:?}"
             );
         }
-        assert_eq!(parse_err("cloakenv-seen 2\n"), "newer 2");
+        assert_eq!(parse_err("cloakenv-seen 3\n"), "newer 3");
         assert_eq!(parse_err("cloakenv-seen 99\nanything at all"), "newer 99");
         let huge = format!("cloakenv-seen 1\n{}", "#".repeat(MAX_FILE_LEN as usize));
         assert!(parse_err(&huge).contains("4 MiB"));
@@ -1015,17 +1235,17 @@ mod tests {
             "much older"
         );
         assert_eq!(
-            st.evaluate(p, &Observed::V1),
+            st.evaluate(p, &v1_obs()),
             Verdict::Downgrade { id: id(1) },
             "v1 at a path that held a v2 vault"
         );
         assert_eq!(
-            st.evaluate(Some("/elsewhere"), &Observed::V1),
+            st.evaluate(Some("/elsewhere"), &v1_obs()),
             Verdict::Unprotected,
             "v1 at a path that never did"
         );
         assert_eq!(
-            st.evaluate(None, &Observed::V1),
+            st.evaluate(None, &v1_obs()),
             Verdict::Unprotected,
             "v1 at an unrecordable path"
         );
@@ -1106,7 +1326,7 @@ mod tests {
         assert_eq!(s.get(&id(1)).unwrap().last_path.as_deref(), Some("/moved"));
         assert_eq!(s.path_owner("/a"), Some(id(1)));
         assert_eq!(s.path_owner("/moved"), Some(id(1)));
-        assert!(!s.record(None, &Observed::V1), "a v1 file records nothing");
+        assert!(!s.record(None, &v1_obs()), "a v1 file records nothing");
         // a path reused by another vault changes owner
         assert!(s.record(Some("/a"), &v2(2, 1, 1)));
         assert_eq!(s.path_owner("/a"), Some(id(2)));
@@ -1134,15 +1354,12 @@ mod tests {
         assert_eq!(s.evaluate(Some("/a"), &v2(1, 4, 8)), Verdict::Same);
         // downgrade: forget the path
         assert_eq!(
-            s.evaluate(Some("/a"), &Observed::V1),
+            s.evaluate(Some("/a"), &v1_obs()),
             Verdict::Downgrade { id: id(1) }
         );
-        assert!(s.accept(Some("/a"), &Observed::V1));
-        assert_eq!(s.evaluate(Some("/a"), &Observed::V1), Verdict::Unprotected);
-        assert!(
-            !s.accept(Some("/a"), &Observed::V1),
-            "nothing left to forget"
-        );
+        assert!(s.accept(Some("/a"), &v1_obs()));
+        assert_eq!(s.evaluate(Some("/a"), &v1_obs()), Verdict::Unprotected);
+        assert!(!s.accept(Some("/a"), &v1_obs()), "nothing left to forget");
     }
 
     #[test]
@@ -1388,10 +1605,7 @@ mod tests {
             "fork"
         );
         assert!(
-            check(&state, &vault, &Observed::V1)
-                .unwrap()
-                .verdict
-                .refused(),
+            check(&state, &vault, &v1_obs()).unwrap().verdict.refused(),
             "the downgrade guard finds the path"
         );
     }
@@ -1405,7 +1619,7 @@ mod tests {
         for (what, obs) in [
             ("rollback", v2(1, 4, 1)),
             ("fork", v2(1, 5, 2)),
-            ("downgrade", Observed::V1),
+            ("downgrade", v1_obs()),
         ] {
             let c = check(&state, &vault, &obs).unwrap();
             assert!(c.verdict.refused(), "{what}: {:?}", c.verdict);
@@ -1445,15 +1659,10 @@ mod tests {
             Verdict::Advanced { from: 2 }
         );
         // downgrade then accept
-        assert!(
-            check(&state, &vault, &Observed::V1)
-                .unwrap()
-                .verdict
-                .refused()
-        );
-        accept(&state, &vault, &Observed::V1).unwrap();
+        assert!(check(&state, &vault, &v1_obs()).unwrap().verdict.refused());
+        accept(&state, &vault, &v1_obs()).unwrap();
         assert_eq!(
-            check(&state, &vault, &Observed::V1).unwrap().verdict,
+            check(&state, &vault, &v1_obs()).unwrap().verdict,
             Verdict::Unprotected
         );
     }
@@ -1469,7 +1678,7 @@ mod tests {
         );
         assert!(seen.is_none());
         assert_eq!(
-            peek(&state, &vault, &Observed::V1).unwrap().0,
+            peek(&state, &vault, &v1_obs()).unwrap().0,
             Verdict::Unprotected
         );
         assert!(!state.exists(), "peek must not create the directory");
@@ -1551,10 +1760,7 @@ mod tests {
         assert_eq!(path_key(&link), path_key(&vault));
         check(&state, &vault, &v2(1, 5, 1)).unwrap();
         assert!(
-            check(&state, &link, &Observed::V1)
-                .unwrap()
-                .verdict
-                .refused(),
+            check(&state, &link, &v1_obs()).unwrap().verdict.refused(),
             "the downgrade guard sees through the link"
         );
     }
@@ -1571,7 +1777,7 @@ mod tests {
             }
         );
         assert_eq!(
-            s.evaluate(None, &Observed::V1),
+            s.evaluate(None, &v1_obs()),
             Verdict::Unprotected,
             "but no downgrade guard without a path"
         );
@@ -1689,5 +1895,413 @@ mod tests {
             "the highest generation written won, whatever the interleaving"
         );
         assert_eq!(s.get(&id(1)).unwrap().tag, [120u8; 16]);
+    }
+
+    // ---- end marker, identity of upgraded version 1 files, path spellings, refresh on use ----
+
+    fn rich_state() -> State {
+        let mut s = state_with(&[
+            (1, 5, 1, Some("/a")),
+            (2, 3, 2, Some("/b c")),
+            (3, 1, 3, None),
+        ]);
+        s.retire_v1(&[9; 16], &id(1));
+        s
+    }
+
+    #[test]
+    fn every_truncation_of_the_state_file_is_seen() {
+        let text = rich_state().serialize();
+        assert!(
+            text.starts_with(
+                "cloakenv-seen 2
+"
+            ) && text.ends_with(
+                "
+end
+"
+            ),
+            "{text}"
+        );
+        for cut in 0..text.len() - 1 {
+            assert!(
+                State::parse(&text[..cut]).is_err(),
+                "a file cut at byte {cut} was accepted: {:?}",
+                &text[..cut]
+            );
+        }
+        // only the final line break may be missing
+        assert_eq!(
+            State::parse(&text[..text.len() - 1]).ok().unwrap(),
+            rich_state()
+        );
+        assert_eq!(State::parse(&text).ok().unwrap(), rich_state());
+    }
+
+    #[test]
+    fn data_after_the_end_marker_is_refused() {
+        let text = rich_state().serialize();
+        for extra in [
+            "end
+",
+            "vault zz
+",
+            "
+
+",
+            "path x y
+",
+        ] {
+            assert!(
+                parse_err(&format!("{text}{extra}")).contains("after the end"),
+                "{extra:?}"
+            );
+        }
+        // a blank line after the marker is data too: refused, not skipped
+        assert!(State::parse(&format!("{text}{}", String::from(char::from(10)))).is_err());
+    }
+
+    #[test]
+    fn a_file_from_the_first_builds_is_still_read_and_is_rewritten_with_the_marker() {
+        let new = rich_state().serialize();
+        let legacy = new
+            .replacen("cloakenv-seen 2", "cloakenv-seen 1", 1)
+            .replace(
+                "end
+", "",
+            );
+        let read = State::parse(&legacy)
+            .ok()
+            .expect("legacy header parses without a marker");
+        assert_eq!(read, rich_state());
+        assert_eq!(read.serialize(), new, "written back in the current format");
+        // the legacy form is not a loophole: it still has to be well formed
+        assert!(
+            State::parse(
+                "cloakenv-seen 1
+vault zz
+"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn retired_version_1_lines_are_checked_like_the_others() {
+        let good_id = "01".repeat(16);
+        let good_tag = "02".repeat(16);
+        let doc = |body: &str| {
+            format!(
+                "cloakenv-seen 2
+{body}end
+"
+            )
+        };
+        assert!(
+            State::parse(&doc(&format!(
+                "v1 {good_tag} {good_id}
+"
+            )))
+            .is_ok()
+        );
+        for (name, body, want) in [
+            (
+                "no id",
+                format!(
+                    "v1 {good_tag}
+"
+                ),
+                "needs",
+            ),
+            (
+                "extra field",
+                format!(
+                    "v1 {good_tag} {good_id} x
+"
+                ),
+                "needs",
+            ),
+            (
+                "bad tag",
+                format!(
+                    "v1 zz {good_id}
+"
+                ),
+                "32 hex",
+            ),
+            (
+                "bad id",
+                format!(
+                    "v1 {good_tag} zz
+"
+                ),
+                "32 hex",
+            ),
+            (
+                "same tag twice",
+                format!(
+                    "v1 {good_tag} {good_id}
+v1 {good_tag} {good_id}
+"
+                ),
+                "twice",
+            ),
+        ] {
+            assert!(parse_err(&doc(&body)).contains(want), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_retired_version_1_file_is_a_downgrade_at_any_path_and_other_snapshots_are_not() {
+        let mut s = State::default();
+        s.retire_v1(&[0x11; 16], &id(4));
+        let at = |p: &str| s.evaluate(Some(p), &v1_with(0x11));
+        assert_eq!(at("/anywhere/at/all"), Verdict::Downgrade { id: id(4) });
+        assert_eq!(
+            s.evaluate(None, &v1_with(0x11)),
+            Verdict::Downgrade { id: id(4) },
+            "even without a path"
+        );
+        // the limit: another version 1 file of the same vault was never recorded, so nothing identifies it
+        assert_eq!(
+            s.evaluate(Some("/anywhere"), &v1_with(0x12)),
+            Verdict::Unprotected
+        );
+        // accepting the file forgets it
+        assert!(s.accept(Some("/anywhere"), &v1_with(0x11)));
+        assert_eq!(
+            s.evaluate(Some("/anywhere"), &v1_with(0x11)),
+            Verdict::Unprotected
+        );
+        assert!(s.retire_v1(&[0x13; 16], &id(4)), "a new tag is news");
+        assert!(
+            !s.retire_v1(&[0x13; 16], &id(4)),
+            "the same tag for the same vault is not"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_vault_forgets_its_retired_files_and_the_list_has_a_cap() {
+        let mut s = State::default();
+        s.record(Some("/old"), &v2(1, 1, 1));
+        s.retire_v1(&[0x21; 16], &id(1));
+        for n in 0..MAX_VAULTS {
+            let mut i = [7u8; 16];
+            i[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            s.record(
+                None,
+                &Observed::V2 {
+                    id: i,
+                    generation: 1,
+                    tag: [1; 16],
+                },
+            );
+        }
+        assert!(s.get(&id(1)).is_none(), "the oldest vault was forgotten");
+        assert_eq!(
+            s.retired_owner(&[0x21; 16]),
+            None,
+            "and so was the file that was upgraded into it"
+        );
+        for n in 0..(MAX_VAULTS + 5) {
+            s.retire_v1(&[(n % 251) as u8; 16], &id(9));
+            let mut tag = [0u8; 16];
+            tag[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            s.retire_v1(&tag, &id(9));
+        }
+        assert!(
+            s.serialize()
+                .matches(
+                    "
+v1 "
+                )
+                .count()
+                <= MAX_VAULTS
+        );
+    }
+
+    #[test]
+    fn opening_a_vault_in_the_older_half_moves_it_to_the_end_and_nothing_else_does() {
+        let mut s = state_with(&[
+            (1, 1, 1, None),
+            (2, 1, 2, None),
+            (3, 1, 3, None),
+            (4, 1, 4, None),
+        ]);
+        assert!(!s.touch(&v2(4, 1, 4)), "the newest stays");
+        assert!(
+            !s.touch(&v2(3, 1, 3)),
+            "so does the one just inside the newer half"
+        );
+        assert!(s.touch(&v2(1, 1, 1)));
+        let order: Vec<u8> = s.vaults().iter().map(|v| v.id[0]).collect();
+        assert_eq!(order, vec![2, 3, 4, 1]);
+        assert!(
+            !s.touch(&v1_obs()) && !s.touch(&v2(9, 1, 1)),
+            "format 1 and unknown vaults have nothing to move"
+        );
+        assert!(!State::default().touch(&v2(1, 1, 1)));
+    }
+
+    #[test]
+    fn a_vault_that_keeps_being_opened_survives_many_others_and_one_that_is_not_does_not() {
+        let mine = v2(200, 5, 5);
+        let others = |n: usize| {
+            let mut i = [0u8; 16];
+            i[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            i[15] = 1;
+            Observed::V2 {
+                id: i,
+                generation: 1,
+                tag: [1; 16],
+            }
+        };
+        let (mut used, mut idle) = (State::default(), State::default());
+        used.record(Some("/mine"), &mine);
+        idle.record(Some("/mine"), &mine);
+        for n in 0..(MAX_VAULTS * 2) {
+            used.record(None, &others(n));
+            idle.record(None, &others(n));
+            if n % 100 == 0 {
+                used.touch(&mine);
+            }
+        }
+        assert!(
+            used.get(&id(200)).is_some(),
+            "a vault that is opened now and then is kept"
+        );
+        assert!(
+            idle.get(&id(200)).is_none(),
+            "control: without opening it, the same sequence forgets it"
+        );
+    }
+
+    #[test]
+    fn an_opened_vault_is_refreshed_on_disk_only_when_it_is_in_the_older_half() {
+        let (t, state, a) = dirs();
+        let b = vault_file(t.path(), "b.bin");
+        let c = vault_file(t.path(), "c.bin");
+        check(&state, &a, &v2(1, 1, 1)).unwrap();
+        check(&state, &b, &v2(2, 1, 2)).unwrap();
+        check(&state, &c, &v2(3, 1, 3)).unwrap();
+        let file = state_file(&state);
+        let before = fs::read(&file).unwrap();
+        assert_eq!(
+            check(&state, &c, &v2(3, 1, 3)).unwrap().verdict,
+            Verdict::Same
+        );
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            before,
+            "the newest is opened without a write"
+        );
+        assert_eq!(
+            check(&state, &a, &v2(1, 1, 1)).unwrap().verdict,
+            Verdict::Same
+        );
+        let after = State::parse(&fs::read_to_string(&file).unwrap())
+            .ok()
+            .unwrap();
+        assert_eq!(
+            after.vaults().last().unwrap().id,
+            id(1),
+            "the oldest moved to the end"
+        );
+        let again = fs::read(&file).unwrap();
+        assert_eq!(
+            check(&state, &a, &v2(1, 1, 1)).unwrap().verdict,
+            Verdict::Same
+        );
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            again,
+            "and now it is in the newer half, so no more writes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_place_of_the_vault_is_recognised_by_the_name_it_is_opened_under() {
+        let (t, state, vault) = dirs();
+        check(&state, &vault, &v2(1, 3, 1)).unwrap();
+        let old = vault_file(t.path(), "old-v1.bin");
+        fs::remove_file(&vault).unwrap();
+        std::os::unix::fs::symlink(&old, &vault).unwrap();
+        let keys = path_keys(&vault);
+        assert_eq!(
+            keys.len(),
+            2,
+            "canonical and literal differ for a symlink: {keys:?}"
+        );
+        let c = check(&state, &vault, &v1_with(5)).unwrap();
+        assert!(
+            matches!(c.verdict, Verdict::Downgrade { .. }),
+            "{:?}",
+            c.verdict
+        );
+        // control: the same file opened under its own name was never a vault of this machine's
+        assert_eq!(
+            check(&state, &old, &v1_with(5)).unwrap().verdict,
+            Verdict::Unprotected
+        );
+        // a path with nothing to resolve has one spelling (the temporary directory is canonicalised first: on some
+        // systems it is itself under a link, and then even a plain file has two)
+        let plain = fs::canonicalize(t.path()).unwrap().join("old-v1.bin");
+        assert_eq!(path_keys(&plain).len(), 1);
+    }
+
+    #[test]
+    fn upgrading_remembers_the_version_1_file_at_whatever_path_it_turns_up() {
+        let (t, state, vault) = dirs();
+        let old_tag = [0x77u8; 16];
+        accept_upgraded(&state, &vault, &old_tag, &v2(1, 1, 1)).unwrap();
+        let text = fs::read_to_string(state_file(&state)).unwrap();
+        assert!(
+            text.contains(&format!("v1 {} {}", hex(&old_tag), hex(&id(1)))),
+            "{text}"
+        );
+        let elsewhere = vault_file(t.path(), "elsewhere.bin");
+        let c = check(&state, &elsewhere, &Observed::V1 { tag: old_tag }).unwrap();
+        assert_eq!(c.verdict, Verdict::Downgrade { id: id(1) });
+        assert_eq!(
+            check(&state, &elsewhere, &v1_with(0x78)).unwrap().verdict,
+            Verdict::Unprotected,
+            "known limit: an older snapshot is not recognised"
+        );
+        assert_eq!(
+            check(&state, &vault, &v2(1, 1, 1)).unwrap().verdict,
+            Verdict::Same
+        );
+        accept(&state, &elsewhere, &Observed::V1 { tag: old_tag }).unwrap();
+        assert_eq!(
+            check(&state, &elsewhere, &Observed::V1 { tag: old_tag })
+                .unwrap()
+                .verdict,
+            Verdict::Unprotected
+        );
+    }
+
+    #[test]
+    fn the_state_fuzz_entry_point_takes_garbage_and_valid_files() {
+        for text in [
+            "",
+            "x",
+            "cloakenv-seen 2
+",
+            "cloakenv-seen 2
+end
+",
+            "cloakenv-seen 1
+",
+            &rich_state().serialize(),
+        ] {
+            fuzz_parse(text);
+        }
+        fuzz_parse(
+            "cloakenv-seen 2
+vault 00000000000000000000000000000000 1 00000000000000000000000000000000 
+end
+",
+        );
     }
 }
