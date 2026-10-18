@@ -1,6 +1,6 @@
 [package]
 name = "cloakenv"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.87"
 license = "MIT OR Apache-2.0"
@@ -24,6 +24,7 @@ include = [
     "/LICENSE-MIT",
     "/LICENSE-APACHE",
     "/docs/*.md",
+    "/docs/design/*.md",
     "/src/**/*.rs",
     "/tests/**/*.rs",
     # Golden vaults written by released versions (the tests open them): see tests/fixtures/v1/README.md.

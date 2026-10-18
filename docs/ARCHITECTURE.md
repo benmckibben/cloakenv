@@ -11,8 +11,11 @@
 | `src/envcheck.rs` | pre-flight checks of the environment `run` will build (per-variable and total size, with the offending keys named) |
 | `src/dotenv.rs` | the `.env` grammar for `import` (multi-line quotes, BOM, line endings, duplicates; no interpolation) |
 | `src/prompt.rs` | the hidden terminal prompt: echo off through a guard that restores the terminal on every exit (return, error, EOF, SIGINT/TERM/HUP/QUIT, SIGTSTP), reading into a wiped buffer |
-| `src/vault.rs`  | vault file format, in-memory map, size limits, atomic writes (0600 on Unix) |
-| `src/perms.rs`  | advisory permission/symlink warnings for the vault and passphrase file (Unix) |
+| `src/vault.rs`  | vault file format 1, the in-memory map, size limits, atomic writes (0600 on Unix), the writer lock, the backup copy |
+| `src/vault/v2.rs` | format 2 codec: header, extensions, Padmé padding, the decoder rules |
+| `src/vault/file.rs` | `Loaded`: reads and writes either format (the generation, id and tag of a format 2 vault) |
+| `src/vault/state.rs` | the per-user rollback record: file format, verdicts, locked check/accept, state directory location |
+| `src/perms.rs`  | advisory permission/symlink warnings for the vault, the passphrase file and the state directory (Unix; ACLs on Windows) |
 | `src/hardening.rs` | process hardening (`PR_SET_DUMPABLE` on Linux, zero soft core limit on Unix) |
 | `src/runner.rs` | env injection: `exec` into the command, or spawn it; `--shield` streaming redactor |
 | `src/supervise.rs` | (Unix) `--shield` supervision: signal forwarding, race-free reaping, output pumps |
@@ -24,10 +27,11 @@
 * **KDF:** Argon2id v1.3. New vaults use 64 MiB / 3 passes / 1 lane. A
   vault is only ever *written* with at least 19 MiB / 2 / 1 (OWASP's minimum
   Argon2id setting; `KdfParams::MIN`; `Vault::with_params` refuses less, and
-  `seal` clamps up to it). On *read* the lower bound is the more lenient
-  8 MiB / 1 / 1 (`KdfParams::FLOOR`, the old minimum), so a weak vault created
+  `seal` clamps up to it). On *read* the lower bound for a format 1 file is the more lenient
+  8 MiB / 1 / 1 (`KdfParams::FLOOR`, the old minimum; a format 2 file may not go below
+  the writer's minimum), so a weak vault created
   by an earlier version still opens instead of locking its owner out; the CLI
-  warns about it and `set`/`unset`/`import` upgrade every parameter to at
+  warns about it and `set`/`unset`/`import`/`passwd`/`upgrade` upgrade every parameter to at
   least the default (`Vault::upgrade_kdf_params`, a per-parameter maximum, so
   a stronger vault is never weakened) when they re-save. The
   parameters live in the header, which is read *before* the file is
@@ -42,15 +46,17 @@
   parameters above the cap is affected.
 * **AEAD:** XChaCha20-Poly1305 with a random 192-bit nonce. A fresh salt *and*
   nonce are generated on every write, so nonce reuse is not a practical concern.
-* **Associated data:** the entire 64-byte header (magic, version, algorithm
-  ids, KDF parameters, salt, nonce). Flipping any header bit fails decryption.
+* **Associated data:** the entire header. Format 1: 64 bytes (magic, version, algorithm
+  ids, KDF parameters, salt, nonce). Format 2: 96 bytes plus the extension area
+  (see [Vault format 2](#vault-format-2)). Flipping any header bit fails decryption.
 * Key material, passphrases and decrypted values are held in
   `zeroize::Zeroizing` buffers and wiped on drop. `Debug` impls never print them.
 
 ## Passphrase rules
 
 One passphrase, three sources (`CLOAKENV_PASSPHRASE`, `CLOAKENV_PASSPHRASE_FILE`,
-the prompt), defined in `src/passphrase.rs` and README "Exactly what counts as
+the prompt; `passwd`'s *new* passphrase comes from the prompt or from
+`CLOAKENV_NEW_PASSPHRASE_FILE`, with the same rules), defined in `src/passphrase.rs` and README "Exactly what counts as
 the passphrase". Each source yields exactly the text supplied, except that a
 file loses **one** trailing `\n` or `\r\n` and the prompt loses the Enter key;
 nothing is trimmed. A source that is set but unusable is an error, never a
@@ -82,7 +88,7 @@ Little-endian integers.
 
 Plaintext payload: `u32 count`, then per entry `u32 key_len, key, u32 value_len,
 value` (UTF-8). Variable names are encrypted too — the file reveals only
-the total length of all keys and values (see [Proposed: vault format v2](#proposed-vault-format-v2) for the exact figures and a padding proposal). The decoder rejects duplicate keys, invalid names, NUL
+the total length of all keys and values (84 bytes plus 8 and the lengths of the name and the value for each entry; format 2 pads this away, see [Vault format 2](#vault-format-2)). The decoder rejects duplicate keys, invalid names, NUL
 bytes and trailing data.
 
 Writes go to a sibling `.vault.bin.tmp-<random>` created `O_EXCL` (with mode
@@ -106,12 +112,12 @@ level as the vault itself).
 discipline as the vault: regular files only, at most 16 MiB, into one buffer
 sized up front (never reallocated, so no stray copy) that is wiped on drop.
 
-Writers (`init`, `set`, `unset`, `import`) hold an exclusive `flock(2)` on a
+Writers (`init`, `set`, `unset`, `import`, `passwd`, `upgrade`) hold an exclusive `flock(2)` on a
 sibling `.vault.bin.lock` (empty, mode 0600, never deleted) for the whole
 load → modify → save cycle, so concurrent updates are serialised instead of
 silently overwriting each other. The lock lives on a separate file because the
-vault inode is replaced on every save. Readers (`list`, `run`) take no lock;
-the atomic rename already guarantees they see a complete vault. Passphrase and
+vault inode is replaced on every save. Readers (`list`, `run`, `info`) take no lock;
+the atomic rename already guarantees they see a complete vault (their comparison with the rollback record can still race a save: see [Vault format 2](#vault-format-2)). Passphrase and
 value prompts happen *before* the lock is taken, so an idle prompt never
 blocks other writers. The lock is `flock` on Unix and `LockFileEx` on Windows (byte 0 of the same file, tied to the handle, so it is released if the process dies); on any other platform it is a no-op.
 
@@ -302,157 +308,205 @@ described here:
   and, for `set`, a refused VALUE (which is already in the kernel's
   `/proc/<pid>/cmdline` by then): no secret is ever read from argv by design.
 
-## Proposed: vault format v2
+## Vault format 2
 
-**Status: superseded by the accepted design in
-[`design/vault-format-v2.md`](design/vault-format-v2.md)** (target 0.3.0),
-which differs from this proposal in key wrapping, migration, the rollback
-state and `export`. This section is kept until the implementation replaces
-it. Nothing in it is built. It collects, in one place, everything that needs a new vault format, so
-that the format is changed once rather than four times.
+Implemented in 0.3.0. The reasons behind each choice, and the alternatives that
+were weighed, are in [design/vault-format-v2.md](design/vault-format-v2.md); this
+section describes what the code does. Format 1 files are still read and written
+(a vault stays in the format it was read in until `cloakenv upgrade`); `init`
+creates format 2.
 
-### What is true today (the limits this addresses)
+### Layout
 
-* **Rollback.** Every v1 file is authenticated (header as AAD plus the AEAD tag),
-  so nobody can *forge* or edit one without the passphrase. But a valid file is
-  not tied to a point in time. Anyone who can write the vault's directory can
-  put an **older valid vault** back (a copy they took earlier, a backup, an old
-  git commit): rotated values come back as their old (possibly leaked)
-  versions, removed keys reappear, and nothing complains. `run` has no record of
-  what it has seen before, and cloakenv keeps no state outside the vault. The
-  mitigations that work today are filesystem permissions (cloakenv warns about a
-  directory others can write) and not keeping the vault where an attacker can
-  write.
-* **Length.** The file size is a function of the secrets: 84 bytes of
-  header, tag and entry count, plus 8 bytes and the key and value lengths per
-  entry. Anyone who can see the file size knows the **exact total length of all
-  keys and values together** (a vault holding `K=a` is 94 bytes, `K=aaaaaaaaaa` is
-  103). Variable names and values stay encrypted, but a size that changes by
-  exactly the length of a rotated secret is information.
-* **Passphrase change.** The passphrase derives the encryption key directly, and
-  there is no command to change it: the only way is `init --force`, which starts
-  an empty vault (it now asks for confirmation and keeps a backup copy).
-* **No way out.** There is no `export` or `get`: the secrets can be listed by name,
-  injected into a command, or deleted, but not read back out. That is
-  deliberate (see the README threat model), but a user who forgets what is in
-  the vault has no supported way to find out other than running a command.
-
-### Design
-
-**1. Header (version 2).** Same magic, `version = 2`, and the header grows from
-64 to a fixed 96 bytes, all of it AAD:
+All integers little-endian. The header is 96 bytes plus an extension area, and the
+whole of it (extensions included) is the AEAD's associated data.
 
 | offset | size | field |
 |-------:|-----:|-------|
 |      0 |    8 | magic `CLOAKENV` |
 |      8 |    1 | format version = 2 |
-|      9 |    1 | KDF id (Argon2id v1.3) |
-|     10 |    1 | AEAD id (XChaCha20-Poly1305) |
-|     11 |    1 | padding bucket id (see 3) |
-|     12 |   12 | Argon2 memory, time, parallelism (as v1) |
-|     24 |   16 | salt |
-|     40 |    8 | generation counter (see 4), little-endian |
-|     48 |   24 | nonce of the wrapped key |
-|     72 |   48 | the data key, encrypted under the key derived from the passphrase (32 bytes + 16-byte tag) |
-|     120 |  24 | nonce of the payload |
-|     144 |    n | payload ciphertext ‖ tag |
+|      9 |    1 | KDF id = 1 (Argon2id v1.3) |
+|     10 |    1 | AEAD id = 1 (XChaCha20-Poly1305) |
+|     11 |    1 | padding scheme = 1 (Padmé, 4 KiB floor) |
+|     12 |    4 | Argon2 memory cost (KiB) |
+|     16 |    4 | Argon2 time cost |
+|     20 |    4 | Argon2 parallelism |
+|     24 |   16 | salt (fresh on every save) |
+|     40 |   24 | nonce (fresh on every save) |
+|     64 |   16 | vault id (random at creation, never changes) |
+|     80 |    8 | generation (1 at creation, +1 on every save; 0 is invalid) |
+|     88 |    4 | flags, reserved, must be 0 |
+|     92 |    4 | extension area length (at most 4096) |
+|     96 |  ext | extension records: `u16 type, u16 length, value` |
+| 96+ext |    n | ciphertext ‖ 16-byte Poly1305 tag |
 
-(The exact offsets are for the implementation to fix; the point is that the
-passphrase unlocks a random 32-byte **data key**, and the data key encrypts the
-payload.)
+The plaintext is `u32 count`, the entries in key order (`u32 key_len, key, u32
+value_len, value`, as in format 1), then zero bytes up to the padded length:
+Padmé (round the length up to a multiple of `2^(E-S)` with `E = floor(log2 len)`
+and `S = floor(log2 E) + 1`), never below 4096. The overhead above the floor is
+below 12% (the tests check at most 6.25% for lengths from 4 KiB to 16 MiB), so the
+size shows the length only to within one of a few steps, and a value rotated to a
+slightly different length usually leaves the size unchanged; crossing a step is
+visible. An empty or small vault is 96 + 4096 + 16 = 4,208 bytes. There is no key
+wrapping: the passphrase-derived key encrypts the payload directly, so
+`passwd` is two key derivations and one re-encryption, with a fresh salt and nonce.
+An unknown extension type with the top bit set (*critical*) is refused; any
+other is kept and written back by the next save.
 
-**2. Key wrapping: this is what makes `passwd` cheap.** With v1 the passphrase
-derives the payload key, so changing it means re-encrypting the payload under a
-new key, which is possible (`load` then `save` with a new passphrase) but needs a
-command. With a wrapped data key:
+### Decoder rules
 
-* `cloakenv passwd` asks for the old and the new passphrase (new one twice),
-  derives both keys, re-wraps the data key under a fresh salt, increments the
-  generation counter and saves atomically. A backup copy is made first, as for
-  `init --force`. The payload is untouched except for the new nonce.
-* `cloakenv rekey` does the same and also generates a **new data key** and
-  re-encrypts the payload, for the case where the old data key may have been
-  seen (for example a copy of the vault was taken while the old passphrase was
-  weak). Both commands print what changed and exit non-zero on a wrong old
-  passphrase without touching the file.
-* Several wrapped keys (multiple passphrases) are **not** proposed: more than
-  one way in is a different threat model.
+Checked from the still-unauthenticated header, before the KDF runs: the magic,
+version, algorithm and padding ids, the reserved flags, the extension area (at
+most 4096 bytes, every record complete, no type twice, no unknown critical
+type), generation not 0, the key-derivation parameters (within the same range as
+format 1, and not below 19 MiB / 2 passes / 1 lane, the lowest the writer ever
+writes), and a ciphertext of at least the floor plus the tag. The generation, the
+vault id and the extensions are **never acted on before the tag verifies**.
 
-**3. Padding buckets: hide the exact length.** The plaintext payload is padded,
-inside the AEAD, to the next bucket: 4 KiB, then doubling (8 KiB, 16 KiB ...)
-up to the 16 MiB limit. Padding is a length-prefixed block of zero bytes after
-the entries (authenticated, so it cannot be altered) and is stripped on read.
-The file size then reveals only which bucket the vault is in: about a factor of
-two of the total length, and nothing at all about changes inside a bucket (a
-rotated secret of a different length no longer changes the size). Costs: a
-small vault is 4 KiB + 144 bytes instead of about 100 bytes, and the bucket
-step is itself visible when a vault grows past a boundary. Padding cannot hide
-that a vault exists, nor its approximate order of magnitude. The bucket id in
-the header records the choice so that a later release can change the scheme.
+After authentication: the format 1 entry rules (valid unique names, no NUL, the
+entry size cap), the entries strictly in key order, none of the three reserved
+passphrase names, and zero padding of exactly the canonical length. One
+plaintext therefore has exactly one valid file, and a file the writer would not
+have produced is refused. All header and decode failures are reported alike (the
+same "not a usable vault" error), and the 16 MiB limit counts the whole file,
+padding included (the size is computed before any key derivation).
 
-**4. Generation counter and high-water mark: detect rollback.** A `u64`
-generation in the header (so authenticated), increased by one on every save
-under the write lock. A counter inside the file proves nothing on its own: the
-attacker restores a file with a smaller number and it is perfectly valid. The
-check needs a place the attacker cannot write: a small state file outside the
-vault directory, `$XDG_STATE_HOME/cloakenv/<hash of the canonical vault path>`
-(0600), holding the highest generation this machine has seen. Every command
-that opens the vault compares: a smaller generation is refused with a clear
-error (fail closed, nothing spawned), unless the user accepts it explicitly
-(`cloakenv accept-rollback`, after restoring a backup on purpose); an equal or
-larger one raises the mark. What stays true: an attacker who can write the
-state file as well (the same user) defeats it, so this protects against
-attackers confined to the vault directory or its transport (a shared volume, a
-sync service, a restored backup, a repository), not against code running as
-you; a new machine or fresh clone has no mark (trust on first use); losing the
-state file silently re-opens the hole; two machines syncing one vault would
-trip the check on every hand-over and need the explicit accept.
+### Rollback, fork and downgrade detection
 
-**5. Migration.** New binaries read v1 (generation 0, no padding, the
-passphrase-derived key used directly) and write v2 on the next save: automatic
-but **one-way**. Old binaries refuse v2 with the existing "unsupported vault
-format version" error (fail closed, no mis-parse). Before the first upgrade
-write, the v1 file is kept as `vault.bin.bak-<UTC timestamp>` (the mechanism
-`init --force` already uses), so a downgrade is possible by restoring it. `list`
-and `run` do not write, so they never migrate; only `set`, `unset`, `import`,
-`passwd`, `rekey` do. The decoder keeps rejecting duplicate keys, invalid names, NUL
-bytes and trailing data in both versions.
+A vault proves nothing about its own freshness, so every open of a format 2
+vault, after authentication, is compared with a per-user record
+(`src/vault/state.rs`) kept outside every project:
 
-**6. UX for `export` (and why it is separate).** An `export` command (to stdout, as
-`.env` or JSON, never through `--shield`) would let a user recover what they
-stored, and would make a vault portable to a new format without relying on the
-old binary. It is also the single command whose purpose is to emit secrets, so
-it is proposed with guard rails: it refuses when stdout is a terminal unless
-`--tty` is given, prints a warning on stderr, never writes a file itself (use a
-redirect, so the file's mode is the user's decision), and needs the
-passphrase interactively or from the usual sources. There is deliberately no
-`get KEY`: a single value in a shell variable or a pipe is the easiest
-way to leak it into history, process listings and logs, and `run` already
-injects it where it is needed. Whether to build `export` at all is an open
-question: its absence is a protection some users want.
+* **Location.** The state directory: `CLOAKENV_STATE_DIR`, else
+  `$XDG_STATE_HOME/cloakenv` (absolute only) or `~/.local/state/cloakenv` on
+  Unix, `~/Library/Application Support/cloakenv` on macOS, `%LOCALAPPDATA%\cloakenv`
+  on Windows; mode 0700 and the file 0600 (a protected ACL on Windows). The
+  directory is warned about when it is a symlink, group- or world-writable, or
+  owned by someone else.
+* **File.** Plain text, strictly parsed, written atomically under an exclusive
+  lock on a sibling lock file:
 
-### Threat-model impact
+  ```text
+  cloakenv-seen 2
+  vault <vault id, 32 hex> <generation> <tag, 32 hex> <last path, escaped, or ->
+  path <vault id, 32 hex> <path, escaped>
+  v1 <tag, 32 hex> <vault id, 32 hex>
+  end
+  ```
 
-| change | protects against | does not change |
-|--------|------------------|-----------------|
-| wrapped data key + `passwd`/`rekey` | a passphrase that has to be retired without losing the secrets (today: destroy the vault) | an attacker who knows the passphrase; the cost of one Argon2id derivation per unlock |
-| padding buckets | learning the exact total length (and its changes) from the file size | the existence of the vault, its order of magnitude, its modification time |
-| generation counter + state file | a stale vault restored by an attacker confined to the directory or its transport | an attacker who is the same user; a fresh machine |
-| `export` with guard rails | being locked out of one's own secrets | a user who pipes it somewhere unsafe |
+  `vault` lines are the highest generation seen per vault id and the tag of that
+  version; `path` lines are the paths a format 2 vault has been opened under (the
+  absolute path as given and the path with symlinks resolved); `v1` lines are the
+  tags of format 1 files that `upgrade` converted. An unknown line, a duplicate, a
+  bad number, a line over 8 KiB, a file over 4 MiB, data after `end` and a missing
+  `end` are all errors (every truncation is detected); a newer header version is
+  refused. Header `cloakenv-seen 1`, from the first builds, is still read and is
+  rewritten in the current form.
+* **Verdicts** (a pure function, `State::evaluate`): unknown id is trusted and
+  recorded (with a note on stderr); a greater generation is recorded; the same
+  generation and tag is accepted; the same generation with another tag is a
+  **fork**; a lower generation is a **rollback**; a format 1 file whose tag was
+  retired by `upgrade`, or at a path that held a format 2 vault, is a
+  **downgrade**. The three refuse, before anything is spawned and without writing
+  anything. A path taken over by a different vault id warns and is recorded.
+* **Best effort for downgrades.** A format 1 file has no id, so only the two
+  lookups above can recognise one. An older snapshot of a format 1 vault that was
+  never upgraded here, at a path never seen, is not recognised.
+* **Failure handling.** A missing state file is an empty state. If the lock or
+  the write is impossible, the check still runs against what can be read (a
+  rollback is still refused) and a warning says the record was not updated; if
+  there is no state directory at all, one warning and no check. A damaged or
+  newer-version file is an error and is never overwritten. `accept` (the
+  deliberate override, `cloakenv accept-rollback`) fails loudly instead.
+* **Refresh and cap.** At most 1,024 vaults are kept, least recently used first
+  dropped (with their paths and retired tags); opening a vault in the older half
+  moves it to the end, so a vault in use is not the one forgotten, and nothing is
+  rewritten for one in the newer half.
+* **Concurrent reads.** `list`, `run` and `info` read the vault without its write
+  lock, so a save can land between the read and the comparison and leave the
+  reader's copy one generation behind. The writer renames the new file into place
+  *before* it records the generation, so a read that looks refusable is repeated
+  (three reads at most, `SETTLE_ATTEMPTS` in `main.rs`) before it is believed.
+  A copy that is still behind is refused as before; the check is never skipped.
+* **Not defended.** The record is not authenticated: whoever can write the state
+  directory can edit or delete it, and the next open trusts what it finds. A
+  machine that has never opened a vault has nothing to compare with. Each machine
+  keeps its own record, so a vault shared through a synced folder or a repository
+  reports forks and rollbacks that are real.
 
-### Open questions (not decided)
+### Commands and their failure behaviour
 
-* Bucket sizes: a pure power-of-two scheme leaks one bit per boundary; a fixed
-  small number of buckets leaks less but wastes more space on large vaults.
-* Whether the state file location is acceptable on every platform (macOS has no
-  XDG state directory; a path under the user's library directory would be used),
-  and what a read-only home (a container) does: fail closed, or warn.
-* Whether `accept-rollback` is a command or an environment variable (a command is
-  harder to trigger by accident, a variable is easier to script).
-* Whether v2 should move the Argon2 parameters out of the AAD-only header into
-  the wrapped block, so that a stripped file shows less. (They are not secret.)
-* The interplay with `--vault` on a network filesystem, where the lock and the
-  atomic rename have weaker guarantees than the rest of the design assumes.
+* `init` writes format 2 (generation 1) and records it. `set`, `unset`, `import`
+  write the format they read, with the generation raised by one, and record the
+  new version only after the rename succeeded (a failed record is a warning: the
+  next open sees a newer generation than recorded, which is accepted).
+* `upgrade` (under the vault lock): open and check, copy the format 1 file into
+  `<state dir>/backups/`, raise weak key-derivation settings, write format 2 with a
+  new id and generation 1, then record the new vault and the old file's tag. A
+  kill between the copy and the write leaves the vault as it was; between the
+  rename and the record, the next open records it.
+* `passwd` (under the vault lock): open and check with the current passphrase,
+  copy the vault into `backups/`, save under the new passphrase with a fresh salt
+  and nonce. A kill leaves the vault openable with the old or the new passphrase.
+  The new passphrase must differ from the current one.
+* The copies are 0600 in a 0700 directory inside the state directory, never next
+  to the vault, and never overwritten (a name collision adds a counter).
+  cloakenv refuses to open one (a downgrade, or a rollback for a format 2 vault's
+  older generation) until `accept-rollback`.
+* `info` and `accept-rollback` read and settle like the other readers; `info` never
+  writes anything and never prints a name or a value.
+
+### Threat model and what changed
+
+Format 2 closes the exact-size leak (padding), the silent rollback (record) and
+the lack of a passphrase-change command, and leaves a way to add header fields
+without a version bump (the extension area). It does not change what an attacker
+who can read the vault learns about the passphrase (Argon2id and the cipher are
+the same), and it does not protect a format 1 vault at all. It trades a state
+directory (plain text, holding vault paths) for the rollback check.
+
+### Decisions
+
+* **No key wrapping.** Re-wrapping a data key without rotating it would let
+  someone who cracked an old, weak passphrase read every later version; rotating
+  it makes wrapping save nothing, since the cost is the two key derivations.
+* **No automatic migration.** Converting a vault silently would lock every older
+  cloakenv out of it (a shared volume, a team with mixed versions). `upgrade` is
+  explicit and every command on a format 1 vault says it is available.
+* **Rollback blocks every command, `run` included**, with the only way past it a
+  command, never an environment variable (one set in a profile would switch the
+  protection off for good).
+* **No `export` or `get`.** Values are rotated at their source, not recovered.
+* **Library API.** The format 1 `Vault::seal`, `open`, `load` and `save` are
+  unchanged; `vault::file::Loaded` reads and writes either format, `vault::v2`
+  is the codec and `vault::state` the record. `VaultError` has new variants.
+
+### How this was tested
+
+* Golden vaults written by the published 0.1.0 and 0.2.0 binaries
+  (`tests/fixtures/v1`) must keep opening. The published 0.2.0 binary refuses a
+  format 2 vault with "unsupported vault format version 2" and leaves it
+  untouched (checked by hand, since it needs that binary).
+* A known-answer vector for the format 2 bytes (header spelled out by hand,
+  plaintext checked by an independent decryption; the ciphertext and tag are
+  pinned from this implementation), rejection tables for the header, the
+  extensions and the authenticated plaintext, bit-flip and truncation sweeps, and
+  random mutation of valid headers.
+* Real processes, not threads, for the race between readers and a writer, the
+  downgrade cases (a symlink in place of the vault, a renamed directory) and the
+  commands; every one of those fixes was checked by breaking it.
+* Fuzz targets (`fuzz/`, not part of the crate): the header parser, the
+  authenticated-plaintext decoder, the state-file parser, and mutated whole
+  files. The last runs a real key derivation for every input that gets past the
+  header, so it executes few inputs and is weak for the `open` path; the plaintext
+  target is what covers the decoder.
+* An independent review reproduced the format with a separate implementation in
+  Python and checked it against this one in both directions, fed it crafted
+  headers and authenticated but malformed files (all refused, none panicked),
+  and killed `set`, `passwd` and `upgrade` at random points (no refusal and no
+  lockout afterwards).
+* Not verified: behaviour on a real Windows machine (type-checked and run in CI),
+  and how a case-insensitive file system affects path matching on macOS.
 
 ## Invariants and how they are enforced
 

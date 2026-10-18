@@ -1,8 +1,25 @@
 # Vault format v2: design
 
-**Status:** accepted design, not implemented. Target release: **0.3.0**. It supersedes the "Proposed: vault format v2"
-section of ARCHITECTURE.md, which it builds on and in three places corrects. When the implementation lands,
-ARCHITECTURE.md describes the implemented format and this file is kept as the design record.
+**Status:** implemented in **0.3.0**. This file is the design record: it says why each choice was made.
+[ARCHITECTURE.md](../ARCHITECTURE.md#vault-format-2) describes what the code does. Where they differ, the code and
+ARCHITECTURE.md win. The differences, all found after this design was accepted (an independent review of the
+implementation, and the work of writing it):
+
+* The format 1 `Vault::seal/open/load/save` were **kept** and `vault::file::Loaded` was added on top, instead of
+  changing their shape.
+* The downgrade guard is keyed by **two spellings of the path** (absolute as given, and canonical) **and by the tag of
+  a format 1 file that `upgrade` converted** (`v1` lines in the state file), because a path alone is bypassed by a
+  symlink or a renamed directory. It is best effort, as the review pointed out.
+* The kept copies from `init --force`, `upgrade` and `passwd` go to the **state directory** (`backups/`), not next to
+  the vault.
+* The state file has an `end` line (so truncation is detected) and header `cloakenv-seen 2`; opening a vault in the
+  older half of the list counts as use; the state directory is checked and warned about.
+* Reads that look like a rollback are **repeated up to three times** (a reader does not hold the vault lock, so a
+  save can land between its read and its comparison).
+* The format 2 reader is **as strict as the writer** (key-derivation settings not below the writer's minimum, keys in
+  order, the reserved names refused).
+* A format 2 vault with no record on this machine prints a one-line note (trusted on first sight).
+* `CLOAKENV_NEW_PASSPHRASE_FILE` is a reserved name like the other two passphrase variables.
 
 ## Goals
 
