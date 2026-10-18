@@ -505,8 +505,15 @@ directory (plain text, holding vault paths) for the rollback check.
   headers and authenticated but malformed files (all refused, none panicked),
   and killed `set`, `passwd` and `upgrade` at random points (no refusal and no
   lockout afterwards).
-* Not verified: behaviour on a real Windows machine (type-checked and run in CI),
-  and how a case-insensitive file system affects path matching on macOS.
+* Tried by hand on one Windows machine (Windows PowerShell 5.1, classic console,
+  local NTFS): the commands, rollback refusal and override, upgrading a 0.2.0
+  vault, `passwd`, a reader racing a writer, and the downgrade check with a
+  directory junction in place of the vault's directory.
+* Not verified: a symbolic link to a *file* on Windows (needs Developer Mode or
+  an elevated shell; the junction case exercises the same path comparison),
+  Windows Terminal, a state directory in a synced or network folder, anything by
+  hand on macOS, and how a case-insensitive file system affects path matching
+  there.
 
 ## Invariants and how they are enforced
 

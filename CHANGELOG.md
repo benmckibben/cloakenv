@@ -109,9 +109,15 @@ convert them.
   readers and a writer, and a downgrade bypass) were fixed before this release,
   and most of the rest were fixed or are listed here; that is not the same as an
   outside audit.
-- Format 2 was run on Linux, macOS and Windows in CI; it has not been tried by
-  hand on Windows or macOS, and how a case-insensitive file system affects the
-  path matching of the record on macOS has not been verified.
+- Format 2 was run on Linux, macOS and Windows in CI. It was also tried by hand
+  on Windows (Windows PowerShell 5.1 in the classic console, one 64-bit machine,
+  local NTFS): the commands, rollback refusal and `accept-rollback`, upgrading a
+  0.2.0 vault, `passwd`, a reader racing a writer, and the downgrade check with a
+  directory junction. **Not tried by hand:** a symbolic link to a file on Windows
+  (needs Developer Mode or an elevated shell), Windows Terminal, a state
+  directory in a synced or network folder, and anything on macOS. How a
+  case-insensitive file system affects the path matching of the record on macOS
+  has not been verified.
 - The fuzz target that mutates whole files runs few inputs (each one that gets
   past the header costs a key derivation); the targets for the header, the
   decoder and the record file run millions.

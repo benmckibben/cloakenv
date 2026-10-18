@@ -917,7 +917,7 @@ be readable by the same code that could edit the file.
 |----------|--------|
 | Linux | supported; tested in CI (Ubuntu 24.04, stable Rust and the 1.87 MSRV) |
 | macOS | supported; tested in CI (macOS 15, stable Rust) |
-| Windows | supported on **x86_64 (MSVC)** only; built, linted and tested in CI (Windows Server 2025) and tried by hand on one Windows machine. See the limitations below. 32-bit and Arm Windows are not supported |
+| Windows | supported on **x86_64 (MSVC)** only; built, linted and tested in CI (Windows Server 2025) and tried by hand on one Windows machine (0.2.0's Windows support, and again for 0.3.0's vault format 2). See the limitations below. 32-bit and Arm Windows are not supported |
 
 The release workflow ([CONTRIBUTING.md](CONTRIBUTING.md#releasing-maintainer))
 builds static musl binaries for Linux (x86_64 and aarch64) and binaries for
@@ -963,6 +963,19 @@ Several protections described above are implemented with Unix-only APIs
   Dropbox folder, on a network share or on an exFAT drive, a second Windows
   account, domain accounts, and a program that is itself running in another job
   object.
+- **Vault format 2 on Windows (0.3.0), tried by hand** in Windows PowerShell 5.1
+  in the classic console (not Windows Terminal), on one 64-bit machine, not
+  elevated, with the vault and the state directory on local NTFS: `init`, `info`,
+  `set`, `list`, `run`; a rolled-back copy refused and then accepted with
+  `accept-rollback`; upgrading a vault made by the published 0.2.0 build, the old
+  file refused as a downgrade, and 0.2.0 refusing the upgraded vault; `passwd` with a
+  new passphrase from a file with Windows line endings and from the prompt; a
+  second window reading while the first saves, with no spurious refusal; and the
+  downgrade check with a **directory junction** in place of the vault's
+  directory (both for the file that was upgraded and for a different, never
+  upgraded format 1 file). **Not tried:** a symbolic link to a *file* (creating
+  one needs Developer Mode or an elevated shell), Windows Terminal, the state
+  directory in a synced or network folder, and macOS by hand.
 - **Release binaries are not signed**; SmartScreen or antivirus software may
   warn about them.
 
