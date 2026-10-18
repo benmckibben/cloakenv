@@ -52,6 +52,7 @@ impl Env {
         cmd.current_dir(self.path())
             .env_remove("CLOAKENV_PASSPHRASE")
             .env_remove("CLOAKENV_PASSPHRASE_FILE")
+            .env_remove("CLOAKENV_NEW_PASSPHRASE_FILE")
             .env_remove("CLOAKENV_VAULT")
             .env("CLOAKENV_STATE_DIR", self.state_dir())
             .stdin(Stdio::null());
